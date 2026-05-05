@@ -1,0 +1,16 @@
+# Pre-trained TabICL checkpoint (downloaded from HuggingFace hub: jingang/TabICL)
+ckpt: tabicl-regressor-v2-20260212.ckpt
+
+# Low-rank factor dimension r for the JointReadoutLayer covariance parameterisation
+# Sigma(x_i) = diag(D_i) + V_i @ V_i^T  where V_i is (d, r)
+rank: 4
+lora_rank: 16
+
+# JointReadoutLayer architecture
+hidden_dim: 512        # in_proj output size and transformer d_model
+nhead: 8               # number of attention heads
+dim_feedforward: 1024  # transformer FFN width
+num_layers: 16          # number of TransformerEncoder layers
+
+# Whether to fine-tune the frozen TabICL base weights (true) or keep them frozen (false)
+finetune: false

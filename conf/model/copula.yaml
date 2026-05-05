@@ -1,0 +1,15 @@
+# ---------------------------------------------------------------------------
+# AttentionalCopulaModel hyperparameters
+# ---------------------------------------------------------------------------
+
+d_model:  128      # token embedding width
+n_heads:  8        # attention heads (must divide d_model)
+n_layers: 6        # number of alternating encoder blocks
+d_ff:     null     # SwiGLU hidden width; null = auto (8/3 * d_model, rounded to 64)
+dropout:  0.0
+
+# Copula decoder
+n_bins:   100      # discrete bins partitioning [0,1]
+
+# Inference
+n_perm_avg: 5      # permutations averaged per test instance at eval (reduces AR-order variance)

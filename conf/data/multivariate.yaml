@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# Episodic training data generation — multivariate targets
+# Each episode samples fresh random MLPs (f, d_net, V_net) and generates
+# a batch of B independent datasets with multivariate Gaussian targets.
+# ---------------------------------------------------------------------------
+
+# Feature dimension range: x_i ~ tabular_prior, x_i in R^p
+p_range: [20, 20]
+
+# Target dimension range: y_i in R^d
+d_range: [4,4]
+
+# Context (train) and query (test) sizes
+n_train_range: [200, 200]
+n_test_range: [10, 10]
+
+# Low-rank factor r used in DATA generation (ground truth covariance rank)
+# This is independent of model.rank (the readout's approximation rank)
+r_data: 2
+
+# Hidden width of the three random MLPs used to parameterise f, d_net, V_net
+mlp_hidden: 64
+
+# Constant diagonal added to the ground-truth covariance in every episode.
+# Sigma(x) = diag(diag_alpha) + V(x) @ V(x)^T
+# Setting diag_alpha > 0 ensures D_oracle > 0, preventing the model from
+# collapsing to V≈0 (the saddle point where ∂NLL/∂V = 0 when D >> D_oracle).
+diag_alpha: 0.0
+
+# Sanity-check mode: fix mean=0 and a random Sigma = diag(D) + V @ V^T for all episodes.
+# D and V are sampled once at startup and reused every episode (same for all B and all T).
+# When false, random per-episode MLPs define mean and covariance.
+fixed_cov: false
+
+# Covariance generation mode: 'mlp' (random MLP per batch element) or 'anchor'
+# (K prototype matrices interpolated via softmax on x — richer, more structured variation)
+cov_type: anchor
+num_anchors: 4        # K: number of anchor covariance prototypes
+anchor_temp: 1.0      # τ: softmax temperature for x-to-anchor similarity
+
+# ---------------------------------------------------------------------------
+# Validation grid: fixed episodes regenerated each eval call
+# ---------------------------------------------------------------------------
+val_d_list: [4]
+val_n_train_list: [200]
+val_n_test: 10
+val_batch: 4          # B per grid point
