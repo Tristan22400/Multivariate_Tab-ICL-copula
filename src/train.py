@@ -54,7 +54,7 @@ from data_gen import GlobalAnchorCovGen, GlobalFixedNets, build_val_suite
 from dataset import infinite_episode_iter, make_episode_loader
 from loss import energy_score, marginal_nll, woodbury_nll
 from model import build_copula_transformer
-
+from viz import plot_prediction_comparison
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -114,23 +114,23 @@ def run_validation(
     agg: dict[str, list[float]] = {
         "val/woodbury_nll": [],
         "val/marginal_nll": [],
-        "val/nll_ratio":    [],
+        "val/nll_ratio": [],
         "val/energy_score": [],
     }
 
     with torch.no_grad():
         for key, ep in val_suite.items():
-            X_tr = ep["X_train"].to(device)   # (B, n_train, p)
-            Z_tr = ep["Y_train"].to(device)   # (B, n_train, d) — Y_train as Z proxy
-            Z_te = ep["Y_test"].to(device)    # (B, n_test,  d) — Y_test  as Z proxy
+            X_tr = ep["X_train"].to(device)  # (B, n_train, p)
+            Z_tr = ep["Y_train"].to(device)  # (B, n_train, d) — Y_train as Z proxy
+            Z_te = ep["Y_test"].to(device)  # (B, n_test,  d) — Y_test  as Z proxy
 
             B, n_train, _ = Z_tr.shape
-            _, n_test,  d = Z_te.shape
+            _, n_test, d = Z_te.shape
 
             # Full context: n_support = n_train, query = n_test
             # We concatenate X/Z so the model sees [support | query] along T dim,
             # with n_support pointing at the split boundary.
-            X_te = ep["X_test"].to(device)    # (B, n_test, p)
+            X_te = ep["X_test"].to(device)  # (B, n_test, p)
             X_all = torch.cat([X_tr, X_te], dim=1)  # (B, n_train+n_test, p)
             Z_all = torch.cat([Z_tr, torch.zeros_like(Z_te)], dim=1)  # mask query Z
 
@@ -148,10 +148,10 @@ def run_validation(
 
             # Energy score: evaluate on the first instance of the first batch element
             es = energy_score(
-                mu=mu_Z[0, 0],    # (d,)
-                D=d_Z[0, 0],      # (d,)
-                V=V_Z[0, 0],      # (d, r)
-                y_ref=Z_te[0, 0], # (d,)
+                mu=mu_Z[0, 0],  # (d,)
+                D=d_Z[0, 0],  # (d,)
+                V=V_Z[0, 0],  # (d, r)
+                y_ref=Z_te[0, 0],  # (d,)
                 n_samples=200,
             ).item()
             agg["val/energy_score"].append(es)
@@ -171,6 +171,47 @@ def run_validation(
 
     if wandb_run is not None:
         wandb_run.log(metrics, step=step)
+
+    # Optional: log a prediction-vs-oracle figure for the first val episode
+    if plot_every > 0 and step % plot_every == 0:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import wandb as _wandb
+
+            first_key = next(iter(val_suite))
+            ep = val_suite[first_key]
+
+            X_tr = ep["X_train"].to(device)
+            Z_tr = ep["Y_train"].to(device)
+            X_te = ep["X_test"].to(device)
+            Z_te = ep["Y_test"].to(device)
+            oracle_mu = ep["oracle_mu"].to(device)
+            oracle_D  = ep["oracle_D"].to(device)
+            oracle_V  = ep["oracle_V"].to(device)
+
+            n_train = Z_tr.shape[1]
+            X_all = torch.cat([X_tr, X_te], dim=1)
+            Z_all = torch.cat([Z_tr, torch.zeros_like(Z_te)], dim=1)
+
+            with torch.no_grad():
+                mu_Z, d_Z, V_Z = model(X_all, Z_all, n_support=n_train)
+
+            fig = plot_prediction_comparison(
+                mu_pred=mu_Z,
+                D_pred=d_Z,
+                V_pred=V_Z,
+                mu_true=oracle_mu,
+                D_true=oracle_D,
+                V_true=oracle_V,
+                n_instances=min(3, mu_Z.shape[1]),
+            )
+            if wandb_run is not None:
+                wandb_run.log({"val/prediction_comparison": _wandb.Image(fig)}, step=step)
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+        except Exception as exc:
+            print(f"[viz] plot_prediction_comparison skipped: {exc}")
 
     model.train()
     return metrics
@@ -201,11 +242,11 @@ def _save_checkpoint(
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(
         {
-            "step":            step,
-            "model_state":     model.state_dict(),
+            "step": step,
+            "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
-            "cfg":             OmegaConf.to_container(cfg, resolve=True),
+            "cfg": OmegaConf.to_container(cfg, resolve=True),
         },
         path,
     )
@@ -292,8 +333,8 @@ def main(cfg: DictConfig) -> None:
 
     # ---- Validation suite (synthetic, fixed) ----
     # Build covariance generator consistent with the training data
-    fixed_cov  = bool(cfg.data.get("fixed_cov", False))
-    r_data     = int(cfg.data.r_data)
+    fixed_cov = bool(cfg.data.get("fixed_cov", False))
+    r_data = int(cfg.data.r_data)
     mlp_hidden = int(cfg.data.mlp_hidden)
     fixed_nets: GlobalFixedNets | None = None
     anchor_gen: GlobalAnchorCovGen | None = None
@@ -331,12 +372,12 @@ def main(cfg: DictConfig) -> None:
         B, N, d = Z_train.shape
 
         # ---- Random 70/30 support/query split ----
-        perm       = torch.randperm(N, device=device)
-        n_support  = max(1, int(0.7 * N))
+        perm = torch.randperm(N, device=device)
+        n_support = max(1, int(0.7 * N))
         # n_query  = N - n_support  (implicit)
 
-        X_perm = X_train[:, perm, :]   # (B, N, p)
-        Z_perm = Z_train[:, perm, :]   # (B, N, d)
+        X_perm = X_train[:, perm, :]  # (B, N, p)
+        Z_perm = Z_train[:, perm, :]  # (B, N, d)
 
         # ---- Forward pass ----
         model.train()
@@ -362,6 +403,30 @@ def main(cfg: DictConfig) -> None:
         if step % int(cfg.training.log_every) == 0:
             with torch.no_grad():
                 mnll = marginal_nll(Z_query, mu_Z, d_Z).item()
+
+                # Oracle NLL on test instances: lower bound for model NLL.
+                # oracle_mu/D/V: (B, n_test, d) / (B, n_test, d) / (B, n_test, d, r)
+                oracle_mu = episode["oracle_mu"].to(device)
+                oracle_D = episode["oracle_D"].to(device)
+                oracle_V = episode["oracle_V"].to(device)
+                Z_test = episode["Z_test"].to(device)
+                oracle_nll = woodbury_nll(Z_test, oracle_mu, oracle_D, oracle_V).item()
+
+                # Mean absolute off-diagonal covariance of the oracle, averaged over
+                # unique pairs (upper triangular) and then over test points and batch.
+                # Using triu_indices avoids the duplicate (i,j)/(j,i) pairs that
+                # make var(dim=-1) identically zero for d=2 (symmetric matrix bug).
+                Sigma = torch.diag_embed(oracle_D) + oracle_V @ oracle_V.transpose(
+                    -1, -2
+                )  # (B, n_test, d, d)
+                d_dim = Sigma.shape[-1]
+                ri, ci = torch.triu_indices(d_dim, d_dim, offset=1, device=device)
+                off_diag = Sigma[..., ri, ci]  # (B, n_test, d*(d-1)//2)
+                # Variance across test points (unique off-diagonal pairs may be 1 for d=2)
+                off_diag_var = (
+                    off_diag.var(dim=1).mean().item()
+                )  # mean over (B, n_pairs)
+
             wnll = loss.item()
             ratio = wnll / (mnll + 1e-8)
             lr_now = scheduler.get_last_lr()[0]
@@ -369,8 +434,9 @@ def main(cfg: DictConfig) -> None:
 
             print(
                 f"[step {step:>6d}]  loss={wnll:.4f}  marginal_nll={mnll:.4f}  "
-                f"nll_ratio={ratio:.4f}  lr={lr_now:.2e}  "
-                f"elapsed={elapsed:.1f}s"
+                f"oracle_nll={oracle_nll:.4f}  nll_ratio={ratio:.4f}  "
+                f"off_diag_cov_var={off_diag_var:.4e}  "
+                f"lr={lr_now:.2e}  elapsed={elapsed:.1f}s"
             )
 
             if wandb_run is not None:
@@ -378,16 +444,19 @@ def main(cfg: DictConfig) -> None:
                     {
                         "train/woodbury_nll": wnll,
                         "train/marginal_nll": mnll,
-                        "train/nll_ratio":    ratio,
-                        "train/lr":           lr_now,
-                        "step":               step,
+                        "train/oracle_nll": oracle_nll,
+                        "train/nll_ratio": ratio,
+                        "train/off_diag_cov_var": off_diag_var,
+                        "train/lr": lr_now,
+                        "step": step,
                     },
                     step=step,
                 )
 
         # ---- Validation ----
         if step % int(cfg.training.val_every) == 0:
-            run_validation(model, val_suite, step, cfg, wandb_run, device)
+            plot_every = int(cfg.training.get("plot_every", 0))
+            run_validation(model, val_suite, step, cfg, wandb_run, device, plot_every=plot_every)
 
         # ---- Checkpoint ----
         if step % int(cfg.training.save_every) == 0 and step > start_step:
@@ -401,7 +470,7 @@ def main(cfg: DictConfig) -> None:
     _save_checkpoint(ckpt_path, final_step, model, optimizer, scheduler, cfg)
     print(f"Training complete. Final checkpoint → {ckpt_path}")
 
-    run_validation(model, val_suite, final_step, cfg, wandb_run, device)
+    run_validation(model, val_suite, final_step, cfg, wandb_run, device, plot_every=1)
 
     if wandb_run is not None:
         wandb_run.finish()

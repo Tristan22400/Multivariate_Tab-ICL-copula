@@ -13,6 +13,8 @@ cd "$SCRIPT_DIR/.."
 source ~/thoth_storage/miniconda3/bin/activate ~/thoth_storage/miniconda3/envs/multivariate-icl
 export PYTHONNOUSERSITE=1
 export PYTHONPATH=$PYTHONPATH:$(pwd)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 
 echo "Starting Training... (Job ID: $OAR_JOB_ID)"
 python src/train.py "$@"

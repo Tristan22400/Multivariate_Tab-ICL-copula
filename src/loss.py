@@ -469,7 +469,6 @@ def kl_gaussian(
         Scalar KL divergence (nats).
     """
     d = mu_q.shape[0]
-    I = torch.eye(d, device=mu_q.device)
 
     # Build Q covariance (dense) for Cholesky
     Sigma_q = torch.diag(D_q) + V_q @ V_q.T  # (d, d)
