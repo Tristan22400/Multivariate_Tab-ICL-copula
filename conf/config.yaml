@@ -1,7 +1,6 @@
 defaults:
   - model: copula_transformer
   - data: multivariate
-  - experiment: default
   - _self_
 
 seed: 42
@@ -24,10 +23,11 @@ dataset:
   n_episodes: 5000
   output_dir: ./data/pit_episodes
   resume: true
-  batch_size: 8          # B datasets per episode saved to disk
+  batch_size: 32         # B datasets per episode saved to disk
   num_workers: 2
+  k_folds: 5             # K-fold for training PIT (0 or null for LOO)
 
 tabicl:
   ckpt: tabicl-regressor-v2-20260212.ckpt
-  pit_batch_size: 64     # LOO chunk size (reduce if OOM during Phase 1)
+  pit_batch_size: 128     # LOO chunk size (reduce if OOM during Phase 1)
   pit_eps: 1.0e-6        # fixed probit clamping epsilon

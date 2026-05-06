@@ -11,12 +11,12 @@ p_range: [20, 20]
 d_range: [4,4]
 
 # Context (train) and query (test) sizes
-n_train_range: [200, 200]
-n_test_range: [10, 10]
+n_train_range: [100, 100]
+n_test_range: [20, 20]
 
 # Low-rank factor r used in DATA generation (ground truth covariance rank)
 # This is independent of model.rank (the readout's approximation rank)
-r_data: 2
+r_data: 8
 
 # Hidden width of the three random MLPs used to parameterise f, d_net, V_net
 mlp_hidden: 64
@@ -25,7 +25,7 @@ mlp_hidden: 64
 # Sigma(x) = diag(diag_alpha) + V(x) @ V(x)^T
 # Setting diag_alpha > 0 ensures D_oracle > 0, preventing the model from
 # collapsing to V≈0 (the saddle point where ∂NLL/∂V = 0 when D >> D_oracle).
-diag_alpha: 0.0
+diag_alpha: 0.1
 
 # Sanity-check mode: fix mean=0 and a random Sigma = diag(D) + V @ V^T for all episodes.
 # D and V are sampled once at startup and reused every episode (same for all B and all T).
