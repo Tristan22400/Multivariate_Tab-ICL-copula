@@ -1,0 +1,33 @@
+defaults:
+  - model: copula_transformer
+  - data: multivariate
+  - experiment: default
+  - _self_
+
+seed: 42
+
+training:
+  device: auto
+  batch_size: 8          # B datasets per step (unused if dataset_dir is set; stored in episode)
+  steps: 30000
+  lr: 3.0e-4
+  lr_min: 1.0e-6
+  weight_decay: 1.0e-4
+  clip_grad_norm: 1.0
+  log_every: 100
+  val_every: 500
+  save_every: 5000
+  ckpt_dir: ./checkpoints/copula_transformer
+  dataset_dir: null      # path to pre-computed PIT episodes; required for training
+
+dataset:
+  n_episodes: 5000
+  output_dir: ./data/pit_episodes
+  resume: true
+  batch_size: 8          # B datasets per episode saved to disk
+  num_workers: 2
+
+tabicl:
+  ckpt: tabicl-regressor-v2-20260212.ckpt
+  pit_batch_size: 64     # LOO chunk size (reduce if OOM during Phase 1)
+  pit_eps: 1.0e-6        # fixed probit clamping epsilon
