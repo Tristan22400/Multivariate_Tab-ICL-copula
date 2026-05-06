@@ -1,6 +1,6 @@
 #!/bin/bash
 #OAR -n TabICL_Generate
-#OAR -l gpu=1,walltime=02:00:00
+#OAR -l gpu=1,walltime=16:00:00
 
 
 set -e
@@ -9,11 +9,11 @@ set -e
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR/.."
 
-# Setup environment
-source ~/thoth_storage/miniconda3/bin/activate ~/thoth_storage/miniconda3/envs/multivariate-icl
+# Setup environment — use env Python directly to avoid conda init requirements
+PYTHON=~/thoth_storage/miniconda3/envs/multivariate-icl/bin/python
 export PYTHONNOUSERSITE=1
 export PYTHONPATH=$PYTHONPATH:$(pwd)
 
 echo "Starting PIT generation... (Job ID: $OAR_JOB_ID)"
-python src/generate_pit_dataset.py "$@"
+$PYTHON src/generate_pit_dataset.py "$@"
 echo "Generation complete."
