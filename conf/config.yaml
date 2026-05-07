@@ -7,7 +7,7 @@ seed: 42
 
 training:
   device: auto
-  batch_size: 8          # B datasets per step (unused if dataset_dir is set; stored in episode)
+  batch_size: 1          # B datasets per step (unused if dataset_dir is set; stored in episode)
   steps: 30000
   lr: 3.0e-4
   lr_min: 1.0e-6
@@ -15,19 +15,22 @@ training:
   clip_grad_norm: 1.0
   log_every: 100
   val_every: 500
+  plot_every: 500
   save_every: 5000
-  ckpt_dir: ./checkpoints/copula_transformer
-  dataset_dir: null      # path to pre-computed PIT episodes; required for training
+  ckpt_dir: null
+  dataset_dir: ./data/pit_episodes_fixedcov_d8  # path to pre-computed PIT episodes; required for training
 
 dataset:
-  n_episodes: 5000
-  output_dir: ./data/pit_episodes
+  n_episodes: 50000
+  output_dir: ./data/pit_episodes_kernel_d8
   resume: true
-  batch_size: 32         # B datasets per episode saved to disk
+  batch_size: 16         # B datasets per episode saved to disk
+  episodes_per_step: 32   # K episodes produced per GPU step (effective batch = B*K); reduce if OOM
   num_workers: 2
-  k_folds: 5             # K-fold for training PIT (0 or null for LOO)
+  k_folds: 3           # K-fold for training PIT (0 or null for LOO)
 
 tabicl:
   ckpt: tabicl-regressor-v2-20260212.ckpt
-  pit_batch_size: 128     # LOO chunk size (reduce if OOM during Phase 1)
+  pit_batch_size: 256     # LOO chunk size (reduce if OOM during Phase 1)
   pit_eps: 1.0e-6        # fixed probit clamping epsilon
+

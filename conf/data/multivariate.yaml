@@ -8,11 +8,11 @@
 p_range: [20, 20]
 
 # Target dimension range: y_i in R^d
-d_range: [4,4]
+d_range: [8,8]
 
 # Context (train) and query (test) sizes
-n_train_range: [100, 100]
-n_test_range: [20, 20]
+n_train_range: [64, 64]
+n_test_range: [16, 16]
 
 # Low-rank factor r used in DATA generation (ground truth covariance rank)
 # This is independent of model.rank (the readout's approximation rank)
@@ -32,16 +32,28 @@ diag_alpha: 0.1
 # When false, random per-episode MLPs define mean and covariance.
 fixed_cov: false
 
-# Covariance generation mode: 'mlp' (random MLP per batch element) or 'anchor'
-# (K prototype matrices interpolated via softmax on x — richer, more structured variation)
-cov_type: anchor
-num_anchors: 4        # K: number of anchor covariance prototypes
-anchor_temp: 1.0      # τ: softmax temperature for x-to-anchor similarity
+# Covariance generation mode:
+#   mlp    — fresh random MLP per episode, x-dependent low-rank covariance
+#   anchor — K prototype matrices mixed via softmax weights over x (AnchorCovarianceGen)
+#   kernel — x-dependent full-rank covariance via MLP-parameterized GP kernels (KernelCovGen)
+#            The kernel hyperparameters l(x) and σ²(x) come from frozen MLPs; a fresh set of
+#            latent embeddings E ∈ R^(d × kernel_latent_dim) is sampled per episode so each
+#            episode presents a distinct x→Σ mapping for the in-context learner to recover.
+cov_type: kernel
+num_anchors: 2        # K: number of anchor covariance prototypes (cov_type=anchor)
+anchor_temp: 1.0      # τ: softmax temperature for x-to-anchor similarity (cov_type=anchor)
+
+# Kernel covariance settings (used when cov_type: kernel)
+# kernel_type: rbf | exponential | matern32 | rational_quadratic | periodic | random
+#   random picks one kernel per episode uniformly.
+kernel_type: random
+kernel_latent_dim: 1  # dimension of latent embeddings e_j for each output dim
+kernel_nugget: 1.0e-4 # jitter added to diagonal for strict PD
 
 # ---------------------------------------------------------------------------
 # Validation grid: fixed episodes regenerated each eval call
 # ---------------------------------------------------------------------------
-val_d_list: [4]
+val_d_list: [8]
 val_n_train_list: [200]
 val_n_test: 10
 val_batch: 4          # B per grid point
