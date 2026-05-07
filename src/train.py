@@ -281,8 +281,21 @@ def main(cfg: DictConfig) -> None:
     try:
         import wandb
 
+        _data_tag = Path(cfg.training.dataset_dir).name
+        _lr = cfg.training.lr
+        _lr_str = f"{_lr:.0e}".replace("e-0", "e-").replace("e+0", "e")
+        _run_name = (
+            f"lr={_lr_str}"
+            f"_steps={cfg.training.steps}"
+            f"_d={cfg.model.d_model}"
+            f"_L={cfg.model.n_layers}"
+            f"_H={cfg.model.n_heads}"
+            f"_r={cfg.model.rank}"
+            f"_data={_data_tag}"
+        )
         wandb_run = wandb.init(
             project="multivariate-tab-icl",
+            name=_run_name,
             config=OmegaConf.to_container(cfg, resolve=True),
             resume="allow",
         )
