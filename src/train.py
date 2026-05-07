@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 
 import hydra
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -82,6 +83,7 @@ def run_validation(
     cfg: DictConfig,
     wandb_run,
     device: str,
+    do_plot: bool = False,
 ) -> dict[str, float]:
     """Run the model on the fixed validation suite and return a metrics dict.
 
@@ -117,6 +119,7 @@ def run_validation(
         "val/nll_ratio": [],
         "val/energy_score": [],
     }
+    plot_fig = None
 
     with torch.no_grad():
         for key, ep in val_suite.items():
@@ -156,6 +159,18 @@ def run_validation(
             ).item()
             agg["val/energy_score"].append(es)
 
+            # --- Optional Plotting (first episode only) ---
+            if do_plot and plot_fig is None and wandb_run is not None:
+                plot_fig = plot_prediction_comparison(
+                    mu_pred=mu_Z,
+                    D_pred=d_Z,
+                    V_pred=V_Z,
+                    mu_true=ep["oracle_mu"].to(device),
+                    D_true=ep["oracle_D"].to(device),
+                    V_true=ep["oracle_V"].to(device),
+                    n_instances=min(3, n_test),
+                )
+
     # Average across val suite entries
     metrics = {k: float(np.mean(v)) for k, v in agg.items()}
     metrics["step"] = step
@@ -170,48 +185,13 @@ def run_validation(
     )
 
     if wandb_run is not None:
+        if plot_fig is not None:
+            import wandb
+
+            metrics["val/plot"] = wandb.Image(plot_fig)
         wandb_run.log(metrics, step=step)
-
-    # Optional: log a prediction-vs-oracle figure for the first val episode
-    if plot_every > 0 and step % plot_every == 0:
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import wandb as _wandb
-
-            first_key = next(iter(val_suite))
-            ep = val_suite[first_key]
-
-            X_tr = ep["X_train"].to(device)
-            Z_tr = ep["Y_train"].to(device)
-            X_te = ep["X_test"].to(device)
-            Z_te = ep["Y_test"].to(device)
-            oracle_mu = ep["oracle_mu"].to(device)
-            oracle_D  = ep["oracle_D"].to(device)
-            oracle_V  = ep["oracle_V"].to(device)
-
-            n_train = Z_tr.shape[1]
-            X_all = torch.cat([X_tr, X_te], dim=1)
-            Z_all = torch.cat([Z_tr, torch.zeros_like(Z_te)], dim=1)
-
-            with torch.no_grad():
-                mu_Z, d_Z, V_Z = model(X_all, Z_all, n_support=n_train)
-
-            fig = plot_prediction_comparison(
-                mu_pred=mu_Z,
-                D_pred=d_Z,
-                V_pred=V_Z,
-                mu_true=oracle_mu,
-                D_true=oracle_D,
-                V_true=oracle_V,
-                n_instances=min(3, mu_Z.shape[1]),
-            )
-            if wandb_run is not None:
-                wandb_run.log({"val/prediction_comparison": _wandb.Image(fig)}, step=step)
-            import matplotlib.pyplot as plt
-            plt.close(fig)
-        except Exception as exc:
-            print(f"[viz] plot_prediction_comparison skipped: {exc}")
+        if plot_fig is not None:
+            plt.close(plot_fig)
 
     model.train()
     return metrics
@@ -222,8 +202,10 @@ def run_validation(
 # ---------------------------------------------------------------------------
 
 
-def _latest_ckpt(ckpt_dir: str) -> str | None:
+def _latest_ckpt(ckpt_dir: str | None) -> str | None:
     """Return the path of the most recent checkpoint in ckpt_dir, or None."""
+    if ckpt_dir is None:
+        return None
     ckpt_dir_path = Path(ckpt_dir)
     if not ckpt_dir_path.is_dir():
         return None
@@ -412,20 +394,20 @@ def main(cfg: DictConfig) -> None:
                 Z_test = episode["Z_test"].to(device)
                 oracle_nll = woodbury_nll(Z_test, oracle_mu, oracle_D, oracle_V).item()
 
-                # Mean absolute off-diagonal covariance of the oracle, averaged over
-                # unique pairs (upper triangular) and then over test points and batch.
-                # Using triu_indices avoids the duplicate (i,j)/(j,i) pairs that
-                # make var(dim=-1) identically zero for d=2 (symmetric matrix bug).
-                Sigma = torch.diag_embed(oracle_D) + oracle_V @ oracle_V.transpose(
-                    -1, -2
-                )  # (B, n_test, d, d)
-                d_dim = Sigma.shape[-1]
+                # Mean absolute off-diagonal covariance variance across query instances.
+                # Computed for both model predictions and oracle.
+                Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-1, -2)
+                d_dim = Sigma_pred.shape[-1]
                 ri, ci = torch.triu_indices(d_dim, d_dim, offset=1, device=device)
-                off_diag = Sigma[..., ri, ci]  # (B, n_test, d*(d-1)//2)
-                # Variance across test points (unique off-diagonal pairs may be 1 for d=2)
-                off_diag_var = (
-                    off_diag.var(dim=1).mean().item()
-                )  # mean over (B, n_pairs)
+                off_diag_pred = Sigma_pred[..., ri, ci]
+
+                pred_off_diag_var = off_diag_pred.var(dim=1).mean().item()
+
+                Sigma_oracle = torch.diag_embed(
+                    oracle_D
+                ) + oracle_V @ oracle_V.transpose(-1, -2)
+                off_diag_oracle = Sigma_oracle[..., ri, ci]
+                oracle_off_diag_var = off_diag_oracle.var(dim=1).mean().item()
 
             wnll = loss.item()
             ratio = wnll / (mnll + 1e-8)
@@ -435,7 +417,7 @@ def main(cfg: DictConfig) -> None:
             print(
                 f"[step {step:>6d}]  loss={wnll:.4f}  marginal_nll={mnll:.4f}  "
                 f"oracle_nll={oracle_nll:.4f}  nll_ratio={ratio:.4f}  "
-                f"off_diag_cov_var={off_diag_var:.4e}  "
+                f"pred_var={pred_off_diag_var:.4e}  oracle_var={oracle_off_diag_var:.4e}  "
                 f"lr={lr_now:.2e}  elapsed={elapsed:.1f}s"
             )
 
@@ -446,31 +428,42 @@ def main(cfg: DictConfig) -> None:
                         "train/marginal_nll": mnll,
                         "train/oracle_nll": oracle_nll,
                         "train/nll_ratio": ratio,
-                        "train/off_diag_cov_var": off_diag_var,
+                        "train/pred_off_diag_var": pred_off_diag_var,
+                        "train/oracle_off_diag_var": oracle_off_diag_var,
                         "train/lr": lr_now,
                         "step": step,
                     },
                     step=step,
                 )
 
-        # ---- Validation ----
-        if step % int(cfg.training.val_every) == 0:
-            plot_every = int(cfg.training.get("plot_every", 0))
-            run_validation(model, val_suite, step, cfg, wandb_run, device, plot_every=plot_every)
+        # ---- Validation & Plotting ----
+        do_val = step % int(cfg.training.val_every) == 0
+        do_plot = step % int(cfg.training.plot_every) == 0
+        if do_val or do_plot:
+            run_validation(
+                model, val_suite, step, cfg, wandb_run, device, do_plot=do_plot
+            )
 
         # ---- Checkpoint ----
-        if step % int(cfg.training.save_every) == 0 and step > start_step:
+        if (
+            ckpt_dir is not None
+            and step % int(cfg.training.save_every) == 0
+            and step > start_step
+        ):
             ckpt_path = os.path.join(ckpt_dir, f"step_{step:07d}.pt")
             _save_checkpoint(ckpt_path, step, model, optimizer, scheduler, cfg)
             print(f"Saved checkpoint → {ckpt_path}")
 
     # ---- Final checkpoint & validation ----
     final_step = int(cfg.training.steps) - 1
-    ckpt_path = os.path.join(ckpt_dir, f"step_{final_step:07d}_final.pt")
-    _save_checkpoint(ckpt_path, final_step, model, optimizer, scheduler, cfg)
-    print(f"Training complete. Final checkpoint → {ckpt_path}")
+    if ckpt_dir is not None:
+        ckpt_path = os.path.join(ckpt_dir, f"step_{final_step:07d}_final.pt")
+        _save_checkpoint(ckpt_path, final_step, model, optimizer, scheduler, cfg)
+        print(f"Training complete. Final checkpoint → {ckpt_path}")
+    else:
+        print("Training complete. (No checkpoint saved)")
 
-    run_validation(model, val_suite, final_step, cfg, wandb_run, device, plot_every=1)
+    run_validation(model, val_suite, final_step, cfg, wandb_run, device)
 
     if wandb_run is not None:
         wandb_run.finish()

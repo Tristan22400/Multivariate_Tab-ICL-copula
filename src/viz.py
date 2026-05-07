@@ -4,8 +4,8 @@ viz.py — Visualisation utilities for CopulaTransformer predictions.
 
 from __future__ import annotations
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 
 
@@ -63,8 +63,8 @@ def plot_prediction_comparison(
         # ------------------------------------------------------------------ #
         # Covariance matrices                                                  #
         # ------------------------------------------------------------------ #
-        Sp_V = V_pred[batch_idx, inst_idx]                        # (d, r)
-        Sp_D = torch.diag(D_pred[batch_idx, inst_idx])            # (d, d)
+        Sp_V = V_pred[batch_idx, inst_idx]  # (d, r)
+        Sp_D = torch.diag(D_pred[batch_idx, inst_idx])  # (d, d)
         Sigma_pred = (Sp_D + Sp_V @ Sp_V.T).detach().cpu().numpy()
 
         St_V = V_true[batch_idx, inst_idx]
@@ -72,15 +72,26 @@ def plot_prediction_comparison(
         Sigma_true = (St_D + St_V @ St_V.T).detach().cpu().numpy()
 
         cov_max = max(np.abs(Sigma_true).max(), np.abs(Sigma_pred).max())
-        heatmap_kw = dict(cmap="coolwarm", center=0, vmin=-cov_max, vmax=cov_max, square=True)
+        heatmap_kw = dict(
+            cmap="coolwarm", center=0, vmin=-cov_max, vmax=cov_max, square=True
+        )
 
         if sns is not None:
             sns.heatmap(Sigma_true, ax=axes[row, 0], **heatmap_kw)
             sns.heatmap(Sigma_pred, ax=axes[row, 1], **heatmap_kw)
-            sns.heatmap(np.abs(Sigma_true - Sigma_pred), ax=axes[row, 2], cmap="Reds", square=True)
+            sns.heatmap(
+                np.abs(Sigma_true - Sigma_pred),
+                ax=axes[row, 2],
+                cmap="Reds",
+                square=True,
+            )
         else:
-            axes[row, 0].imshow(Sigma_true, cmap="coolwarm", vmin=-cov_max, vmax=cov_max)
-            axes[row, 1].imshow(Sigma_pred, cmap="coolwarm", vmin=-cov_max, vmax=cov_max)
+            axes[row, 0].imshow(
+                Sigma_true, cmap="coolwarm", vmin=-cov_max, vmax=cov_max
+            )
+            axes[row, 1].imshow(
+                Sigma_pred, cmap="coolwarm", vmin=-cov_max, vmax=cov_max
+            )
             axes[row, 2].imshow(np.abs(Sigma_true - Sigma_pred), cmap="Reds")
 
         axes[row, 0].set_title(rf"Oracle $\Sigma^*$ (inst {inst_idx})")
@@ -90,8 +101,8 @@ def plot_prediction_comparison(
         # ------------------------------------------------------------------ #
         # Mean vectors                                                         #
         # ------------------------------------------------------------------ #
-        mu_t = mu_true[batch_idx, inst_idx].detach().cpu().numpy()   # (d,)
-        mu_p = mu_pred[batch_idx, inst_idx].detach().cpu().numpy()   # (d,)
+        mu_t = mu_true[batch_idx, inst_idx].detach().cpu().numpy()  # (d,)
+        mu_p = mu_pred[batch_idx, inst_idx].detach().cpu().numpy()  # (d,)
         d = len(mu_t)
         dims = np.arange(d)
 
@@ -99,13 +110,48 @@ def plot_prediction_comparison(
         if mu_baseline is not None:
             mu_b = mu_baseline[batch_idx, inst_idx].detach().cpu().numpy()
             width = 0.25
-            ax.bar(dims - width, mu_t, width, label=r"Oracle $\mu^*$",   color="#2563EB", alpha=0.8)
-            ax.bar(dims,          mu_p, width, label=r"Predicted $\hat{\mu}$", color="#EA580C", alpha=0.8)
-            ax.bar(dims + width,  mu_b, width, label=baseline_label,     color="#16A34A", alpha=0.8)
+            ax.bar(
+                dims - width,
+                mu_t,
+                width,
+                label=r"Oracle $\mu^*$",
+                color="#2563EB",
+                alpha=0.8,
+            )
+            ax.bar(
+                dims,
+                mu_p,
+                width,
+                label=r"Predicted $\hat{\mu}$",
+                color="#EA580C",
+                alpha=0.8,
+            )
+            ax.bar(
+                dims + width,
+                mu_b,
+                width,
+                label=baseline_label,
+                color="#16A34A",
+                alpha=0.8,
+            )
         else:
             width = 0.35
-            ax.bar(dims - width / 2, mu_t, width, label=r"Oracle $\mu^*$",   color="#2563EB", alpha=0.8)
-            ax.bar(dims + width / 2, mu_p, width, label=r"Predicted $\hat{\mu}$", color="#EA580C", alpha=0.8)
+            ax.bar(
+                dims - width / 2,
+                mu_t,
+                width,
+                label=r"Oracle $\mu^*$",
+                color="#2563EB",
+                alpha=0.8,
+            )
+            ax.bar(
+                dims + width / 2,
+                mu_p,
+                width,
+                label=r"Predicted $\hat{\mu}$",
+                color="#EA580C",
+                alpha=0.8,
+            )
 
         ax.axhline(0, color="gray", lw=0.5)
         ax.set_xticks(dims)
@@ -120,10 +166,22 @@ def plot_prediction_comparison(
         if mu_baseline is not None:
             mu_b = mu_baseline[batch_idx, inst_idx].detach().cpu().numpy()
             width = 0.35
-            ax.bar(dims - width / 2, np.abs(mu_t - mu_p), width,
-                   label=r"$|\mu^*-\hat{\mu}|$", color="#7C3AED", alpha=0.8)
-            ax.bar(dims + width / 2, np.abs(mu_t - mu_b), width,
-                   label=f"|μ*−{baseline_label}|", color="#16A34A", alpha=0.8)
+            ax.bar(
+                dims - width / 2,
+                np.abs(mu_t - mu_p),
+                width,
+                label=r"$|\mu^*-\hat{\mu}|$",
+                color="#7C3AED",
+                alpha=0.8,
+            )
+            ax.bar(
+                dims + width / 2,
+                np.abs(mu_t - mu_b),
+                width,
+                label=f"|μ*−{baseline_label}|",
+                color="#16A34A",
+                alpha=0.8,
+            )
             ax.legend(fontsize=8)
         else:
             ax.bar(dims, np.abs(mu_t - mu_p), color="#7C3AED", alpha=0.8)

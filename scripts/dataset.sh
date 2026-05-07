@@ -9,11 +9,12 @@ set -e
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR/.."
 
-# Setup environment — use env Python directly to avoid conda init requirements
-PYTHON=~/thoth_storage/miniconda3/envs/multivariate-icl/bin/python
+# Setup environment
+source ~/thoth_storage/miniconda3/etc/profile.d/conda.sh
+conda activate multivariate-icl
 export PYTHONNOUSERSITE=1
 export PYTHONPATH=$PYTHONPATH:$(pwd)
 
 echo "Starting PIT generation... (Job ID: $OAR_JOB_ID)"
-$PYTHON src/generate_pit_dataset.py "$@"
+python src/generate_pit_dataset.py "$@"
 echo "Generation complete."
