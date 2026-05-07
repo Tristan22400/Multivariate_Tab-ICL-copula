@@ -107,6 +107,7 @@ def sample_tabular_x(
     T: int,
     p: int,
     device: torch.device | str,
+    n_train: int | None = None,
 ) -> torch.Tensor:
     """Sample x from a tabular-like mixture prior.
 
@@ -117,14 +118,19 @@ def sample_tabular_x(
         - Uniform on [-3, 3]
         - Log-normal (exp of N(0, 0.5)) — positive-valued, skewed
 
-    After sampling the raw values, every feature dimension is z-normalised
-    across T instances within each batch element (mean 0, std ≈ 1).
+    After sampling, every feature dimension is z-normalised using stats
+    computed from the first n_train instances only (train split), then applied
+    to all T instances.  This prevents test-set statistics from leaking into
+    the normalisation.  When n_train is None the full T instances are used
+    (backwards-compatible behaviour).
 
     Args:
-        B      : batch size (number of independent datasets)
-        T      : total number of instances (n_train + n_test)
-        p      : feature dimension
-        device : torch device
+        B       : batch size (number of independent datasets)
+        T       : total number of instances (n_train + n_test)
+        p       : feature dimension
+        device  : torch device
+        n_train : number of training instances used to compute norm stats;
+                  if None, normalise over all T instances.
 
     Returns:
         X : (B, T, p) — z-normalised tabular features
@@ -138,14 +144,14 @@ def sample_tabular_x(
     x_normal = torch.randn(B, T, p, device=device)
     x_uniform = torch.rand(B, T, p, device=device) * 6.0 - 3.0
     x_lognorm = torch.exp(torch.randn(B, T, p, device=device) * 0.5)
-
     # family: (B, p) → (B, 1, p) for broadcasting
     f = family.unsqueeze(1)
     X = torch.where(f == 0, x_normal, torch.where(f == 1, x_uniform, x_lognorm))
 
-    # Z-normalise feature-wise across T instances
-    mu = X.mean(dim=1, keepdim=True)
-    std = X.std(dim=1, keepdim=True) + 1e-8
+    # Z-normalise using train-split stats to avoid test leakage
+    ref = X[:, :n_train, :] if n_train is not None else X
+    mu = ref.mean(dim=1, keepdim=True)
+    std = ref.std(dim=1, keepdim=True) + 1e-8
     return (X - mu) / std
 
 
@@ -246,7 +252,9 @@ class AnchorCovarianceGen:
             B_x = X.shape[0]
             dots = torch.einsum("btp,bkp->btk", X, self.C)  # (B, T, K)
             k_star = dots.argmax(dim=-1)  # (B, T)
-            return self.M[torch.arange(B_x, device=X.device).unsqueeze(1), k_star, :]  # (B, T, d)
+            return self.M[
+                torch.arange(B_x, device=X.device).unsqueeze(1), k_star, :
+            ]  # (B, T, d)
 
 
 class GlobalAnchorCovGen:
@@ -390,8 +398,8 @@ def generate_episode(
     """
     T = n_train + n_test
 
-    # 1. Sample x from the tabular prior (already z-normalised feature-wise)
-    X = sample_tabular_x(B, T, p, device)  # (B, T, p)
+    # 1. Sample x from the tabular prior (z-normalised using train-split stats)
+    X = sample_tabular_x(B, T, p, device, n_train=n_train)  # (B, T, p)
 
     with torch.no_grad():
         if fixed_cov:

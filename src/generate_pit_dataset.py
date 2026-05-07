@@ -123,6 +123,7 @@ def main(cfg: DictConfig) -> None:
         "fixed_cov": fixed_cov,
         "diag_alpha": diag_alpha,
     }
+
     meta_path = os.path.join(out_dir, "meta.json")
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
