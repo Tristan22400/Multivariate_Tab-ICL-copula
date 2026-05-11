@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import argparse
 import math
-import sys
 import os
+import sys
 import warnings
 
 import numpy as np
@@ -35,15 +35,16 @@ sys.path.insert(0, _TABICL_SRC)
 # ---------------------------------------------------------------------------
 # Local imports
 # ---------------------------------------------------------------------------
-from loss import woodbury_nll, marginal_nll, energy_score  # noqa: E402
-from pit import run_pit, load_tabicl  # noqa: E402
-from model import CopulaTransformer, build_copula_transformer  # noqa: E402
+from loss import energy_score, marginal_nll, woodbury_nll  # noqa: E402
+from model import build_copula_transformer  # noqa: E402
+from pit import load_tabicl, run_pit  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Optional dependency — XGBoost for baseline 3
 # ---------------------------------------------------------------------------
 try:
     from xgboost import XGBRegressor  # noqa: F401
+
     _XGBOOST_AVAILABLE = True
 except ImportError:
     _XGBOOST_AVAILABLE = False
@@ -55,6 +56,7 @@ except ImportError:
 
 def set_seed(seed: int = 42) -> None:
     import random
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -105,8 +107,8 @@ def load_enb(device: str):
 
     d=2 targets: Y1 (Heating Load), Y2 (Cooling Load).
     """
-    from ucimlrepo import fetch_ucirepo
     from sklearn.model_selection import train_test_split
+    from ucimlrepo import fetch_ucirepo
 
     ds = fetch_ucirepo(id=242)
     X = ds.data.features.values.astype(np.float32)
@@ -134,7 +136,6 @@ def load_student(device: str):
     """
     import pandas as pd
     from sklearn.model_selection import train_test_split
-
     from ucimlrepo import fetch_ucirepo
 
     ds = fetch_ucirepo(id=320)
@@ -229,7 +230,7 @@ def compute_crps_sum(
     with torch.no_grad():
         for j in range(Y_train.shape[1]):
             y_context = Y_train[:, j].unsqueeze(0)  # (1, N_tr)
-            logits = tabicl(X_concat, y_context)    # (1, N_te, Q)
+            logits = tabicl(X_concat, y_context)  # (1, N_te, Q)
             dist = tabicl.quantile_dist(logits.squeeze(0))  # batch_shape=(N_te,)
             crps_j = dist.crps(Y_test[:, j]).mean().item()
             crps_total += crps_j
@@ -257,7 +258,7 @@ def compute_rmse(
     with torch.no_grad():
         for j in range(Y_train.shape[1]):
             y_context = Y_train[:, j].unsqueeze(0)  # (1, N_tr)
-            logits = tabicl(X_concat, y_context)    # (1, N_te, Q)
+            logits = tabicl(X_concat, y_context)  # (1, N_te, Q)
             dist = tabicl.quantile_dist(logits.squeeze(0))  # batch_shape=(N_te,)
 
             # mu_Z[:, j]: (N_test,) → CDF of standard normal
@@ -346,7 +347,9 @@ def compute_metrics(
     # log P(Y) = log P_copula(Z) + sum_j log p_j(y_j)
     # woodbury_nll returns the *mean* NLL over instances, so:
     #   joint_nll_y = joint_nll_z - mean_j_log_p
-    jacobian = log_p_test.sum(dim=-1).mean()  # mean over test instances of sum over dims
+    jacobian = log_p_test.sum(
+        dim=-1
+    ).mean()  # mean over test instances of sum over dims
     joint_nll_y = joint_nll_z - jacobian
 
     # --- Energy Score (per instance, MC with 200 samples) ---
@@ -397,9 +400,9 @@ def _safe_cholesky_dense(K: torch.Tensor) -> torch.Tensor:
 
 
 def _mvn_nll_cholesky(
-    y: torch.Tensor,   # (N, d)
+    y: torch.Tensor,  # (N, d)
     mu: torch.Tensor,  # (d,) or (N, d)
-    L: torch.Tensor,   # (d, d) lower triangular
+    L: torch.Tensor,  # (d, d) lower triangular
 ) -> float:
     """Mean NLL for MVN with Cholesky factor L (shared across all instances)."""
     d = y.shape[-1]
@@ -526,7 +529,7 @@ def baseline_gbdt_residual(
         resid_test_list.append(Y_te_np[:, j] - reg.predict(X_te_np))
 
     R_train = np.stack(resid_train_list, axis=1)  # (N_train, d)
-    R_test = np.stack(resid_test_list, axis=1)    # (N_test, d)
+    R_test = np.stack(resid_test_list, axis=1)  # (N_test, d)
 
     # Z-score residuals using training stats
     mu_r = R_train.mean(0)
@@ -578,7 +581,7 @@ def baseline_full_covariance(
     N_test = Z_test.shape[0]
     N_tr = Z_train.shape[0]
     mu_mle = Z_train.mean(0)  # (d,)
-    diff = Z_train - mu_mle   # (N_tr, d)
+    diff = Z_train - mu_mle  # (N_tr, d)
     Sigma_mle = (diff.T @ diff) / max(N_tr - 1, 1)  # (d, d)
     Sigma_mle = 0.5 * (Sigma_mle + Sigma_mle.T)
 
@@ -637,10 +640,12 @@ def evaluate_dataset(
 
     Returns a list of result dicts (one per method).
     """
-    print(f"\n{'='*60}")
-    print(f"Dataset: {dataset_name}  "
-          f"(N_train={X_train.shape[0]}, N_test={X_test.shape[0]}, "
-          f"d={Y_train.shape[1]}, p={X_train.shape[1]})")
+    print(f"\n{'=' * 60}")
+    print(
+        f"Dataset: {dataset_name}  "
+        f"(N_train={X_train.shape[0]}, N_test={X_test.shape[0]}, "
+        f"d={Y_train.shape[1]}, p={X_train.shape[1]})"
+    )
     print("=" * 60)
 
     d = Y_train.shape[1]
@@ -672,14 +677,14 @@ def evaluate_dataset(
         # model expects (B, N_context, p) and (B, N_context, d)
         X_ctx = X_train.unsqueeze(0)  # (1, N_tr, p)
         Z_ctx = Z_train.unsqueeze(0)  # (1, N_tr, d)
-        X_q = X_test.unsqueeze(0)    # (1, N_te, p)
+        X_q = X_test.unsqueeze(0)  # (1, N_te, p)
 
         out = model(X_ctx, Z_ctx, X_q)  # dict or (mu, D, V) depending on model API
         # model.py is expected to return (mu_Z, d_Z, V_Z) each (1, N_te, ...)
         if isinstance(out, dict):
-            mu_Z = out["mu"]   # (1, N_te, d)
-            d_Z = out["D"]     # (1, N_te, d)
-            V_Z = out["V"]     # (1, N_te, d, r)
+            mu_Z = out["mu"]  # (1, N_te, d)
+            d_Z = out["D"]  # (1, N_te, d)
+            V_Z = out["V"]  # (1, N_te, d, r)
         elif isinstance(out, (list, tuple)) and len(out) == 3:
             mu_Z, d_Z, V_Z = out
         else:
@@ -688,9 +693,9 @@ def evaluate_dataset(
                 "Expected dict with keys ('mu','D','V') or 3-tuple."
             )
 
-        mu_Z = mu_Z.squeeze(0)   # (N_te, d)
-        d_Z = d_Z.squeeze(0)     # (N_te, d)
-        V_Z = V_Z.squeeze(0)     # (N_te, d, r)
+        mu_Z = mu_Z.squeeze(0)  # (N_te, d)
+        d_Z = d_Z.squeeze(0)  # (N_te, d)
+        V_Z = V_Z.squeeze(0)  # (N_te, d, r)
         d_Z = d_Z.clamp(min=1e-6)
 
     r = V_Z.shape[-1]
@@ -700,8 +705,16 @@ def evaluate_dataset(
     # -----------------------------------------------------------------------
     print("  Computing CopulaTransformer metrics...")
     ct_metrics = compute_metrics(
-        Z_test, mu_Z, d_Z, V_Z, log_p_test,
-        Y_test, tabicl, X_train, Y_train, X_test,
+        Z_test,
+        mu_Z,
+        d_Z,
+        V_Z,
+        log_p_test,
+        Y_test,
+        tabicl,
+        X_train,
+        Y_train,
+        X_test,
         label="CopulaTransformer",
     )
     all_results = [ct_metrics]
@@ -826,10 +839,10 @@ def evaluate_dataset(
 
 
 def _mc_energy_score_batch(
-    mu_Z: torch.Tensor,   # (N, d)
-    d_Z: torch.Tensor,    # (N, d)
-    V_Z: torch.Tensor,    # (N, d, r)
-    Z_test: torch.Tensor, # (N, d)
+    mu_Z: torch.Tensor,  # (N, d)
+    d_Z: torch.Tensor,  # (N, d)
+    V_Z: torch.Tensor,  # (N, d, r)
+    Z_test: torch.Tensor,  # (N, d)
     n_samples: int = 200,
 ) -> float:
     es_vals = []
@@ -847,16 +860,16 @@ def _mc_energy_score_batch(
 
 def print_results_table(dataset_name: str, results: list[dict]) -> None:
     """Print a formatted comparison table for all methods on one dataset."""
-    print(f"\n{'─'*90}")
+    print(f"\n{'─' * 90}")
     print(f"  Results for: {dataset_name}")
-    print(f"{'─'*90}")
+    print(f"{'─' * 90}")
 
     header = (
         f"  {'Method':<28} {'NLL-Z':>9} {'NLL-Y':>9} "
         f"{'ES':>9} {'CRPS-sum':>10} {'Frob-err':>10}  RMSE/target"
     )
     print(header)
-    print(f"  {'─'*28} {'─'*9} {'─'*9} {'─'*9} {'─'*10} {'─'*10}")
+    print(f"  {'─' * 28} {'─' * 9} {'─' * 9} {'─' * 9} {'─' * 10} {'─' * 10}")
 
     for r in results:
         rmse_str = "  ".join(f"{v:.4f}" for v in r["rmse_per_target"])
@@ -871,7 +884,7 @@ def print_results_table(dataset_name: str, results: list[dict]) -> None:
         )
         print(row)
 
-    print(f"{'─'*90}\n")
+    print(f"{'─' * 90}\n")
 
 
 # ===========================================================================
@@ -943,6 +956,7 @@ def main() -> None:
     # build_copula_transformer accepts an OmegaConf DictConfig or plain dict
     try:
         from omegaconf import OmegaConf
+
         if not isinstance(cfg_dict, dict):
             cfg_obj = cfg_dict  # already a DictConfig
         else:

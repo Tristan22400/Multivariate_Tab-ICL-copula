@@ -48,7 +48,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # ---------------------------------------------------------------------------
 # RMSNorm
 # ---------------------------------------------------------------------------
@@ -224,7 +223,7 @@ class TransformerBlock(nn.Module):
         tokens_s = tokens.permute(0, 2, 1, 3)  # (B, S, N, D)
 
         # Feature slots: no masking (query X values are real observations)
-        feat_s = tokens_s[:, : self.p_max, :, :]             # (B, p_max, N, D)
+        feat_s = tokens_s[:, : self.p_max, :, :]  # (B, p_max, N, D)
         feat_flat = feat_s.reshape(B * self.p_max, N, D)
         feat_norm = self.norm2(feat_flat)
         feat_flat = feat_flat + self.inst_attn(feat_norm, feat_norm, feat_norm)[0]
@@ -234,7 +233,7 @@ class TransformerBlock(nn.Module):
         # Target slots: block query key columns (n_support..N-1 are unknown)
         d_slots = S - self.p_max  # number of target token slots
         if d_slots > 0:
-            tgt_s = tokens_s[:, self.p_max :, :, :]          # (B, d_slots, N, D)
+            tgt_s = tokens_s[:, self.p_max :, :, :]  # (B, d_slots, N, D)
             tgt_flat = tgt_s.reshape(B * d_slots, N, D)
             tgt_norm = self.norm2(tgt_flat)
 
@@ -243,9 +242,10 @@ class TransformerBlock(nn.Module):
             if n_support < N:
                 tgt_mask[:, n_support:] = float("-inf")
 
-            tgt_flat = tgt_flat + self.inst_attn(
-                tgt_norm, tgt_norm, tgt_norm, attn_mask=tgt_mask
-            )[0]
+            tgt_flat = (
+                tgt_flat
+                + self.inst_attn(tgt_norm, tgt_norm, tgt_norm, attn_mask=tgt_mask)[0]
+            )
             tokens_s[:, self.p_max :, :, :] = tgt_flat.reshape(B, d_slots, N, D)
 
         tokens = tokens_s.permute(0, 2, 1, 3)  # back to (B, N, S, D)
@@ -324,9 +324,7 @@ class CopulaTransformer(nn.Module):
 
         # Maximum rank used to size the output head; actual rank at forward
         # time may be smaller when rank=None and d < d_max.
-        rank_max: int = (
-            max(1, int(math.sqrt(d_max))) if rank is None else rank
-        )
+        rank_max: int = max(1, int(math.sqrt(d_max))) if rank is None else rank
 
         # ---- Input embeddings ------------------------------------------------
         # Each scalar feature x_{i,k} is embedded independently
@@ -341,7 +339,7 @@ class CopulaTransformer(nn.Module):
         #   feat_enc[k]  adds positional identity to the k-th feature token
         #   dim_enc[j]   adds dimensional identity to the j-th target token
         self.feat_enc = nn.Embedding(p_max, d_model)
-        self.dim_enc  = nn.Embedding(d_max, d_model)
+        self.dim_enc = nn.Embedding(d_max, d_model)
 
         # Learnable mask tokens θ_mask[j] for query target positions
         self.mask_tokens = nn.Parameter(torch.zeros(d_max, d_model))
@@ -355,16 +353,16 @@ class CopulaTransformer(nn.Module):
         )
 
         # ---- Readout heads --------------------------------------------------
-        self.fc_mu = nn.Linear(d_model, 1)           # → mu scalar per (query, dim)
-        self.fc_d  = nn.Linear(d_model, 1)           # → log-variance scalar
-        self.fc_V  = nn.Linear(d_model, rank_max)    # → V factor row per (query, dim)
+        self.fc_mu = nn.Linear(d_model, 1)  # → mu scalar per (query, dim)
+        self.fc_d = nn.Linear(d_model, 1)  # → log-variance scalar
+        self.fc_V = nn.Linear(d_model, rank_max)  # → V factor row per (query, dim)
 
         # ---- Store configuration -------------------------------------------
-        self.p_max    = p_max
-        self.d_max    = d_max
-        self.rank     = rank
+        self.p_max = p_max
+        self.d_max = d_max
+        self.rank = rank
         self.rank_max = rank_max
-        self.d_model  = d_model
+        self.d_model = d_model
 
         # ---- Initialisation -------------------------------------------------
         self._init_weights()
@@ -448,41 +446,39 @@ class CopulaTransformer(nn.Module):
             p_eff = p
 
         # phi_X expects (..., 1) — add feature dimension, embed, then squeeze
-        feat_tok = self.phi_X(X_in.unsqueeze(-1))          # (B, N, p_max, d_model)
+        feat_tok = self.phi_X(X_in.unsqueeze(-1))  # (B, N, p_max, d_model)
 
         feat_idx = torch.arange(self.p_max, device=X_all.device)  # (p_max,)
-        feat_emb = self.feat_enc(feat_idx)                         # (p_max, d_model)
-        type_feat = self.type_enc[0]                               # (d_model,)
+        feat_emb = self.feat_enc(feat_idx)  # (p_max, d_model)
+        type_feat = self.type_enc[0]  # (d_model,)
 
-        feat_tok = feat_tok + type_feat + feat_emb                 # (B, N, p_max, d_model)
+        feat_tok = feat_tok + type_feat + feat_emb  # (B, N, p_max, d_model)
 
         # ------------------------------------------------------------------
         # 2. Target tokens:  (B, N, d, d_model)
         # ------------------------------------------------------------------
-        dim_idx  = torch.arange(d, device=X_all.device)    # (d,)
-        dim_emb  = self.dim_enc(dim_idx)                    # (d, d_model)
-        type_tgt = self.type_enc[1]                         # (d_model,)
+        dim_idx = torch.arange(d, device=X_all.device)  # (d,)
+        dim_emb = self.dim_enc(dim_idx)  # (d, d_model)
+        type_tgt = self.type_enc[1]  # (d_model,)
 
         # Support instances: embed their observed Z values
-        Z_sup    = Z_all[:, :n_support, :]                  # (B, n_support, d)
-        tgt_sup  = self.phi_Z(Z_sup.unsqueeze(-1))          # (B, n_support, d, d_model)
-        tgt_sup  = tgt_sup + type_tgt + dim_emb             # broadcast over B, n_support
+        Z_sup = Z_all[:, :n_support, :]  # (B, n_support, d)
+        tgt_sup = self.phi_Z(Z_sup.unsqueeze(-1))  # (B, n_support, d, d_model)
+        tgt_sup = tgt_sup + type_tgt + dim_emb  # broadcast over B, n_support
 
         # Query instances: replace Z values with learnable mask tokens
-        mask_tok = self.mask_tokens[:d]                     # (d, d_model)
-        tgt_qry  = mask_tok + type_tgt + dim_emb            # (d, d_model)
-        tgt_qry  = (
-            tgt_qry.unsqueeze(0)
-            .unsqueeze(0)
-            .expand(B, n_query, d, -1)
-        )                                                    # (B, n_query, d, d_model)
+        mask_tok = self.mask_tokens[:d]  # (d, d_model)
+        tgt_qry = mask_tok + type_tgt + dim_emb  # (d, d_model)
+        tgt_qry = (
+            tgt_qry.unsqueeze(0).unsqueeze(0).expand(B, n_query, d, -1)
+        )  # (B, n_query, d, d_model)
 
-        tgt_tok = torch.cat([tgt_sup, tgt_qry], dim=1)      # (B, N, d, d_model)
+        tgt_tok = torch.cat([tgt_sup, tgt_qry], dim=1)  # (B, N, d, d_model)
 
         # ------------------------------------------------------------------
         # 3. Assemble full token sequence:  (B, N, p_max+d, d_model)
         # ------------------------------------------------------------------
-        tokens = torch.cat([feat_tok, tgt_tok], dim=2)      # (B, N, S, d_model)
+        tokens = torch.cat([feat_tok, tgt_tok], dim=2)  # (B, N, S, d_model)
 
         # ------------------------------------------------------------------
         # 4. Transformer blocks
@@ -497,11 +493,9 @@ class CopulaTransformer(nn.Module):
         # Query instances are at rows n_support .. N-1
         query_tgt = tokens[:, n_support:, self.p_max :, :]  # (B, n_query, d, d_model)
 
-        mu_Z = self.fc_mu(query_tgt).squeeze(-1)             # (B, n_query, d)
-        d_Z  = (
-            F.softplus(self.fc_d(query_tgt).squeeze(-1)) + 1e-6
-        )                                                     # (B, n_query, d)
-        V_Z  = self.fc_V(query_tgt)[..., :r]                 # (B, n_query, d, r)
+        mu_Z = self.fc_mu(query_tgt).squeeze(-1)  # (B, n_query, d)
+        d_Z = F.softplus(self.fc_d(query_tgt).squeeze(-1)) + 1e-6  # (B, n_query, d)
+        V_Z = self.fc_V(query_tgt)[..., :r]  # (B, n_query, d, r)
 
         return mu_Z, d_Z, V_Z
 
