@@ -18,7 +18,7 @@ training:
   plot_every: 500
   save_every: 5000
   ckpt_dir: null
-  dataset_dir: ./data/pit_episodes_fixedcov_d8  # path to pre-computed PIT episodes; required for training
+  dataset_dir: ./data/pit_episodes_kernel_d8  # path to pre-computed PIT episodes; required for training
 
 dataset:
   n_episodes: 50000

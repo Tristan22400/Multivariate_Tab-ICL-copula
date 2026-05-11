@@ -51,6 +51,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _HERE)
 
+from sklearn.covariance import OAS
+
 from data_gen import GlobalAnchorCovGen, GlobalFixedNets, build_val_suite
 from dataset import infinite_episode_iter, make_episode_loader
 from loss import energy_score, marginal_nll, woodbury_nll
@@ -69,6 +71,38 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _cov_to_woodbury_params(
+    Sigma: torch.Tensor,
+    mu: torch.Tensor | None,
+    n_test: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Decompose a dense (d, d) covariance into (mu, D, V) for woodbury_nll.
+
+    Keeps ALL d eigenvectors so the decomposition exactly recovers Sigma
+    (modulo clamping of numerically negative eigenvalues on the off-diagonal
+    part). V has shape (d, d), giving the true full-covariance NLL rather
+    than a low-rank approximation.
+    """
+    d = Sigma.shape[0]
+    diag_vals = Sigma.diagonal().clamp(min=1e-6)
+    off_diag = Sigma - torch.diag(diag_vals)
+    eigvals, eigvecs = torch.linalg.eigh(off_diag)
+    eigvals = eigvals.clamp(min=0.0)
+    V_flat = eigvecs * eigvals.sqrt()  # (d, d)
+    mu_out = mu if mu is not None else torch.zeros(d, device=device)
+    return (
+        mu_out.unsqueeze(0).expand(n_test, -1),
+        diag_vals.unsqueeze(0).expand(n_test, -1),
+        V_flat.unsqueeze(0).expand(n_test, -1, -1),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +128,35 @@ def run_validation(
     For each (key, episode), the model is conditioned on the full X_train /
     Z_train context (100% support), and evaluated on X_test / Y_test (as Z_test).
 
-    Metrics reported per episode and averaged across the val suite:
-        woodbury_nll   — primary loss (full covariance)
-        marginal_nll   — diagonal-only baseline
-        nll_ratio      — woodbury_nll / marginal_nll  (< 1 means model helps)
-        energy_score   — MC energy score on the first val instance
+    Metrics are grouped into three categories:
+
+    Model:
+        woodbury_nll        — primary loss (full covariance, per-instance)
+        marginal_nll        — model diagonal only (V ignored)
+        nll_ratio           — woodbury_nll / marginal_nll (< 1 means correlation helps)
+        energy_score        — MC energy score on the first val instance
+
+    Global baselines (misspecified — do not condition on x_i, floor references):
+        prior_nll           — standard normal, zero in-context learning
+        mean_only_nll       — empirical mean + identity covariance
+        independent_nll     — zero mean + per-dim variance from Z_train
+        independent_mean_nll — empirical mean + per-dim variance (no correlation)
+        full_mle_nll        — sample covariance MLE from Z_train
+        oas_nll             — OAS shrinkage covariance from Z_train
+
+    Heteroskedastic baselines (condition on x_i, genuine competitors):
+        knn5_cov_nll        — k=5 nearest-neighbor covariance
+        knn20_cov_nll       — k=20 nearest-neighbor covariance
+        kernel_cov_nll      — kernel-weighted covariance (median bandwidth)
+        linear_factor_nll   — linear x→mean + global residual covariance
+
+    Oracle:
+        oracle_nll          — ground-truth per-instance parameters (lower bound)
+
+    Diagnostic gaps:
+        heteroskedastic_gain — oas_nll - oracle_nll (how much x_i matters)
+        model_vs_knn5_gap    — woodbury_nll - knn5_cov_nll (< 0 means model wins)
+        oracle_gap_fraction  — (model - oracle) / (prior - oracle), 0=oracle, 1=prior
 
     Args:
         model     : CopulaTransformer in eval mode.
@@ -114,10 +172,29 @@ def run_validation(
     """
     model.eval()
     agg: dict[str, list[float]] = {
+        # model
         "val/woodbury_nll": [],
         "val/marginal_nll": [],
         "val/nll_ratio": [],
         "val/energy_score": [],
+        # global baselines
+        "val/prior_nll": [],
+        "val/mean_only_nll": [],
+        "val/independent_nll": [],
+        "val/independent_mean_nll": [],
+        "val/full_mle_nll": [],
+        "val/oas_nll": [],
+        # heteroskedastic baselines
+        "val/knn5_cov_nll": [],
+        "val/knn20_cov_nll": [],
+        "val/kernel_cov_nll": [],
+        "val/linear_factor_nll": [],
+        # oracle
+        "val/oracle_nll": [],
+        # diagnostic gaps
+        "val/heteroskedastic_gain": [],
+        "val/model_vs_knn5_gap": [],
+        "val/oracle_gap_fraction": [],
     }
     plot_fig = None
 
@@ -125,39 +202,175 @@ def run_validation(
         for key, ep in val_suite.items():
             X_tr = ep["X_train"].to(device)  # (B, n_train, p)
             Z_tr = ep["Y_train"].to(device)  # (B, n_train, d) — Y_train as Z proxy
-            Z_te = ep["Y_test"].to(device)  # (B, n_test,  d) — Y_test  as Z proxy
+            Z_te = ep["Y_test"].to(device)  # (B, n_test,  d)
 
             B, n_train, _ = Z_tr.shape
             _, n_test, d = Z_te.shape
 
-            # Full context: n_support = n_train, query = n_test
-            # We concatenate X/Z so the model sees [support | query] along T dim,
-            # with n_support pointing at the split boundary.
             X_te = ep["X_test"].to(device)  # (B, n_test, p)
-            X_all = torch.cat([X_tr, X_te], dim=1)  # (B, n_train+n_test, p)
-            Z_all = torch.cat([Z_tr, torch.zeros_like(Z_te)], dim=1)  # mask query Z
+            X_all = torch.cat([X_tr, X_te], dim=1)
+            Z_all = torch.cat([Z_tr, torch.zeros_like(Z_te)], dim=1)
 
-            # Forward: use full train set as context, predict over test positions
+            # ---- Model forward ----
             mu_Z, d_Z, V_Z = model(X_all, Z_all, n_support=n_train)
 
-            # Woodbury NLL on query (test) portion
             wnll = woodbury_nll(Z_te, mu_Z, d_Z, V_Z).item()
             mnll = marginal_nll(Z_te, mu_Z, d_Z).item()
-            ratio = wnll / (mnll + 1e-8)
-
             agg["val/woodbury_nll"].append(wnll)
             agg["val/marginal_nll"].append(mnll)
-            agg["val/nll_ratio"].append(ratio)
+            agg["val/nll_ratio"].append(wnll / (mnll + 1e-8))
 
-            # Energy score: evaluate on the first instance of the first batch element
             es = energy_score(
-                mu=mu_Z[0, 0],  # (d,)
-                D=d_Z[0, 0],  # (d,)
-                V=V_Z[0, 0],  # (d, r)
-                y_ref=Z_te[0, 0],  # (d,)
-                n_samples=200,
+                mu=mu_Z[0, 0], D=d_Z[0, 0], V=V_Z[0, 0], y_ref=Z_te[0, 0], n_samples=200
             ).item()
             agg["val/energy_score"].append(es)
+
+            # ---- Global baselines ----
+            # Prior: N(0, I)
+            prior_nll = marginal_nll(
+                Z_te, torch.zeros_like(mu_Z), torch.ones_like(d_Z)
+            ).item()
+            agg["val/prior_nll"].append(prior_nll)
+
+            # Empirical mean + identity covariance (isolates mean estimation)
+            mu_emp = Z_tr.mean(dim=1, keepdim=True).expand(
+                -1, n_test, -1
+            )  # (B, n_test, d)
+            mean_only_nll = marginal_nll(Z_te, mu_emp, torch.ones_like(d_Z)).item()
+            agg["val/mean_only_nll"].append(mean_only_nll)
+
+            # Independent: zero mean + per-dim variance
+            var_train = Z_tr.var(dim=1, unbiased=True).clamp(min=1e-6)  # (B, d)
+            d_ind = var_train.unsqueeze(1).expand(-1, n_test, -1)
+            independent_nll = marginal_nll(Z_te, torch.zeros_like(mu_Z), d_ind).item()
+            agg["val/independent_nll"].append(independent_nll)
+
+            # Independent with empirical mean (separates mean calibration from covariance)
+            independent_mean_nll = marginal_nll(Z_te, mu_emp, d_ind).item()
+            agg["val/independent_mean_nll"].append(independent_mean_nll)
+
+            # Full MLE covariance + OAS — loop over batch elements (sklearn works on 2-D)
+            full_mle_nlls, oas_nlls = [], []
+            for b in range(B):
+                Z_tr_b_np = Z_tr[b].cpu().numpy()  # (n_train, d)
+                Z_te_b = Z_te[b]  # (n_test, d)
+
+                # MLE covariance
+                mu_mle = Z_tr[b].mean(0)
+                diff = Z_tr[b] - mu_mle
+                Sigma_mle = (diff.T @ diff) / max(n_train - 1, 1)
+                Sigma_mle = 0.5 * (Sigma_mle + Sigma_mle.T)
+                mu_p, d_p, V_p = _cov_to_woodbury_params(
+                    Sigma_mle, mu_mle, n_test, device
+                )
+                full_mle_nlls.append(woodbury_nll(Z_te_b, mu_p, d_p, V_p).item())
+
+                # OAS shrinkage covariance
+                oas = OAS().fit(Z_tr_b_np)
+                Sigma_oas = torch.tensor(
+                    oas.covariance_, dtype=torch.float32, device=device
+                )
+                mu_oas = torch.tensor(oas.location_, dtype=torch.float32, device=device)
+                mu_p, d_p, V_p = _cov_to_woodbury_params(
+                    Sigma_oas, mu_oas, n_test, device
+                )
+                oas_nlls.append(woodbury_nll(Z_te_b, mu_p, d_p, V_p).item())
+
+            agg["val/full_mle_nll"].append(float(np.mean(full_mle_nlls)))
+            agg["val/oas_nll"].append(float(np.mean(oas_nlls)))
+
+            # ---- Heteroskedastic baselines ----
+            knn5_nlls, knn20_nlls, kernel_nlls, linear_nlls = [], [], [], []
+            for b in range(B):
+                Z_tr_b = Z_tr[b]  # (n_train, d)
+                Z_te_b = Z_te[b]  # (n_test, d)
+                X_tr_b = X_tr[b]  # (n_train, p)
+                X_te_b = X_te[b]  # (n_test, p)
+
+                dists = torch.cdist(X_te_b, X_tr_b)  # (n_test, n_train)
+
+                # kNN covariance (k=5 and k=20)
+                for k, nlls_list in ((5, knn5_nlls), (20, knn20_nlls)):
+                    k_eff = min(k, n_train)
+                    nlls_i = []
+                    for i in range(n_test):
+                        idx = dists[i].topk(k_eff, largest=False).indices
+                        Z_nb = Z_tr_b[idx]  # (k_eff, d)
+                        if k_eff > d:
+                            Sigma_i = torch.cov(Z_nb.T)
+                        else:
+                            # Too few neighbors for full cov — fall back to diagonal
+                            Sigma_i = torch.diag(
+                                Z_nb.var(0, unbiased=False).clamp(min=1e-6)
+                            )
+                        Sigma_i = 0.5 * (Sigma_i + Sigma_i.T)
+                        mu_nb = Z_nb.mean(0)
+                        mu_p, d_p, V_p = _cov_to_woodbury_params(
+                            Sigma_i, mu_nb, 1, device
+                        )
+                        nlls_i.append(
+                            woodbury_nll(Z_te_b[i : i + 1], mu_p, d_p, V_p).item()
+                        )
+                    nlls_list.append(float(np.mean(nlls_i)))
+
+                # Kernel-weighted covariance (median bandwidth)
+                dists_sq = dists**2  # (n_test, n_train)
+                tau = torch.median(torch.cdist(X_tr_b, X_tr_b)).clamp(min=1e-6)
+                kernel_nlls_i = []
+                for i in range(n_test):
+                    w = torch.softmax(-dists_sq[i] / tau, dim=0)  # (n_train,)
+                    mu_w = (w[:, None] * Z_tr_b).sum(0)
+                    Z_c = Z_tr_b - mu_w
+                    Sigma_w = (w[:, None] * Z_c).T @ Z_c
+                    Sigma_w = 0.5 * (Sigma_w + Sigma_w.T)
+                    mu_p, d_p, V_p = _cov_to_woodbury_params(Sigma_w, mu_w, 1, device)
+                    kernel_nlls_i.append(
+                        woodbury_nll(Z_te_b[i : i + 1], mu_p, d_p, V_p).item()
+                    )
+                kernel_nlls.append(float(np.mean(kernel_nlls_i)))
+
+                # Linear factor: OLS x → Z mean + global residual covariance
+                W = torch.linalg.lstsq(X_tr_b, Z_tr_b).solution  # (p, d)
+                mu_lin = X_te_b @ W  # (n_test, d)
+                resid = Z_tr_b - X_tr_b @ W  # (n_train, d)
+                Sigma_resid = (
+                    torch.cov(resid.T)
+                    if n_train > d
+                    else torch.diag(resid.var(0, unbiased=False).clamp(min=1e-6))
+                )
+                Sigma_resid = 0.5 * (Sigma_resid + Sigma_resid.T)
+                lin_nlls_i = []
+                for i in range(n_test):
+                    mu_p, d_p, V_p = _cov_to_woodbury_params(
+                        Sigma_resid, mu_lin[i], 1, device
+                    )
+                    lin_nlls_i.append(
+                        woodbury_nll(Z_te_b[i : i + 1], mu_p, d_p, V_p).item()
+                    )
+                linear_nlls.append(float(np.mean(lin_nlls_i)))
+
+            agg["val/knn5_cov_nll"].append(float(np.mean(knn5_nlls)))
+            agg["val/knn20_cov_nll"].append(float(np.mean(knn20_nlls)))
+            agg["val/kernel_cov_nll"].append(float(np.mean(kernel_nlls)))
+            agg["val/linear_factor_nll"].append(float(np.mean(linear_nlls)))
+
+            # ---- Oracle ----
+            oracle_nll = woodbury_nll(
+                Z_te,
+                ep["oracle_mu"].to(device),
+                ep["oracle_D"].to(device),
+                ep["oracle_V"].to(device),
+            ).item()
+            agg["val/oracle_nll"].append(oracle_nll)
+
+            # ---- Diagnostic gaps ----
+            oas_nll_ep = float(np.mean(oas_nlls))
+            agg["val/heteroskedastic_gain"].append(oas_nll_ep - oracle_nll)
+            agg["val/model_vs_knn5_gap"].append(wnll - float(np.mean(knn5_nlls)))
+            denom = prior_nll - oracle_nll
+            agg["val/oracle_gap_fraction"].append(
+                (wnll - oracle_nll) / denom if abs(denom) > 1e-8 else float("nan")
+            )
 
             # --- Optional Plotting (first episode only) ---
             if do_plot and plot_fig is None and wandb_run is not None:
@@ -178,10 +391,15 @@ def run_validation(
     # Console output
     print(
         f"[val step={step:>6d}]  "
-        f"woodbury_nll={metrics['val/woodbury_nll']:.4f}  "
-        f"marginal_nll={metrics['val/marginal_nll']:.4f}  "
-        f"nll_ratio={metrics['val/nll_ratio']:.4f}  "
-        f"energy_score={metrics['val/energy_score']:.4f}"
+        f"woodbury={metrics['val/woodbury_nll']:.4f}  "
+        f"oracle={metrics['val/oracle_nll']:.4f}  "
+        f"knn5={metrics['val/knn5_cov_nll']:.4f}  "
+        f"linear={metrics['val/linear_factor_nll']:.4f}  "
+        f"oas={metrics['val/oas_nll']:.4f}  "
+        f"prior={metrics['val/prior_nll']:.4f}  "
+        f"hetero_gain={metrics['val/heteroskedastic_gain']:.4f}  "
+        f"vs_knn5={metrics['val/model_vs_knn5_gap']:.4f}  "
+        f"oracle_frac={metrics['val/oracle_gap_fraction']:.4f}"
     )
 
     if wandb_run is not None:
