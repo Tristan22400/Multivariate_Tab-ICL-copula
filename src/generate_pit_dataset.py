@@ -36,7 +36,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _HERE)
 
-from data_gen import GlobalAnchorCovGen, GlobalFixedNets, generate_episode
+from data_gen import GlobalAnchorCovGen, GlobalFixedNets, KernelCovGen, generate_episode
 from pit import load_tabicl, run_pit_batched
 
 # ---------------------------------------------------------------------------
@@ -96,6 +96,7 @@ def main(cfg: DictConfig) -> None:
     # ---- Covariance generator (persistent across episodes for stability) ----
     fixed_nets: GlobalFixedNets | None = None
     anchor_gen: GlobalAnchorCovGen | None = None
+    kernel_cov_gen: KernelCovGen | None = None
     if not fixed_cov:
         cov_type = str(cfg.data.get("cov_type", "mlp"))
         if cov_type == "anchor":
@@ -105,6 +106,20 @@ def main(cfg: DictConfig) -> None:
                 K=num_anchors, r=r_data, tau=anchor_temp, device=device
             )
             print(f"GlobalAnchorCovGen: K={num_anchors}, τ={anchor_temp}")
+        elif cov_type == "kernel":
+            kernel_type = str(cfg.data.get("kernel_type", "random"))
+            kernel_latent_dim = int(cfg.data.get("kernel_latent_dim", 1))
+            kernel_nugget = float(cfg.data.get("kernel_nugget", 1e-4))
+            kernel_cov_gen = KernelCovGen(
+                kernel_type=kernel_type,
+                latent_dim=kernel_latent_dim,
+                mlp_hidden=mlp_hidden,
+                nugget=kernel_nugget,
+            )
+            print(
+                f"KernelCovGen: kernel={kernel_type}, latent_dim={kernel_latent_dim}, "
+                f"nugget={kernel_nugget}"
+            )
         else:
             fixed_nets = GlobalFixedNets(r=r_data, hidden=mlp_hidden, device=device)
             print("GlobalFixedNets: mlp covariance generator")
@@ -225,6 +240,7 @@ def main(cfg: DictConfig) -> None:
                 fixed_cov_rho=fixed_cov_rho,
                 fixed_nets=fixed_nets,
                 anchor_gen=anchor_gen,
+                kernel_cov_gen=kernel_cov_gen,
                 diag_alpha=diag_alpha,
             )
             t1 = time.perf_counter()

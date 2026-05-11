@@ -156,6 +156,124 @@ def sample_tabular_x(
 
 
 # ---------------------------------------------------------------------------
+# Kernel-based x-dependent covariance generator
+# ---------------------------------------------------------------------------
+
+_KERNEL_NAMES = ["rbf", "exponential", "matern32", "rational_quadratic", "periodic"]
+
+
+class KernelCovGen:
+    """Per-instance x-dependent covariance via MLP-parameterized GP kernels.
+
+    Each call samples fresh latent embeddings E ∈ R^(d × latent_dim) for the d
+    output dimensions plus two frozen random MLPs that map each input x_i to
+    scalar kernel hyperparameters:
+
+        l(x_i)  = Softplus(MLP_l(x_i))   — lengthscale
+        σ²(x_i) = Softplus(MLP_σ(x_i))   — signal variance
+
+    The d×d covariance at x_i is:
+
+        Σ(x_i)_jk = σ²(x_i) · kernel(e_j, e_k ; l(x_i)) + nugget · δ_jk
+
+    Cholesky decomposition gives L(x_i) so Y|x_i ~ N(0, L L^T) exactly.
+    Everything is re-sampled per call → every episode has a distinct x→Σ mapping.
+
+    Supported kernels
+    -----------------
+    rbf               : σ² exp(−‖eⱼ−eₖ‖²/(2l²))
+    exponential       : σ² exp(−‖eⱼ−eₖ‖/l)
+    matern32          : σ²(1+√3 r/l) exp(−√3 r/l)
+    rational_quadratic: σ²(1+r²/(2αl²))^(−α),  α ~ LogU(0.1, 10)
+    periodic          : σ² exp(−2 sin²(πr/p)/l²), p ~ LogU(0.5, 5)
+    random            : one of the above, chosen uniformly per call
+    """
+
+    KERNELS = _KERNEL_NAMES
+
+    def __init__(
+        self,
+        kernel_type: str,
+        latent_dim: int,
+        mlp_hidden: int,
+        nugget: float,
+    ) -> None:
+        if kernel_type not in self.KERNELS + ["random"]:
+            raise ValueError(
+                f"Unknown kernel_type {kernel_type!r}. "
+                f"Choose from {self.KERNELS + ['random']}"
+            )
+        self.kernel_type = kernel_type
+        self.latent_dim = latent_dim
+        self.mlp_hidden = mlp_hidden
+        self.nugget = nugget
+
+    def __call__(self, X: torch.Tensor, d: int) -> torch.Tensor:
+        """Build per-instance Cholesky factors L(x_i) for one episode.
+
+        Args:
+            X : (B, T, p) — input features
+            d : target dimension
+
+        Returns:
+            L_x : (B, T, d, d) — lower-triangular Cholesky factor of Σ(x_i)
+        """
+        B, T, p = X.shape
+        device = X.device
+
+        kernel = (
+            _KERNEL_NAMES[torch.randint(len(_KERNEL_NAMES), (1,)).item()]
+            if self.kernel_type == "random"
+            else self.kernel_type
+        )
+
+        # Fixed latent embeddings for output dims — fresh per episode
+        E = torch.randn(d, self.latent_dim, device=device)  # (d, k)
+        diff_E = E.unsqueeze(1) - E.unsqueeze(0)            # (d, d, k)
+        sq_dist = (diff_E ** 2).sum(-1)                     # (d, d)
+        dist = sq_dist.clamp(min=0).sqrt()                  # (d, d)
+
+        # Per-instance kernel hyperparameters from frozen random MLPs
+        l_net = BatchedRandomMLP(B, p_in=p, p_out=1, hidden=self.mlp_hidden, device=device)
+        s_net = BatchedRandomMLP(B, p_in=p, p_out=1, hidden=self.mlp_hidden, device=device)
+        l_x = F.softplus(l_net(X)) + 1e-3   # (B, T, 1)  — lengthscale
+        s_x = F.softplus(s_net(X)) + 1e-3   # (B, T, 1)  — signal variance
+
+        # Broadcast: (d,d) → (1,1,d,d) and (B,T,1) → (B,T,1,1)
+        sq_d = sq_dist.view(1, 1, d, d)
+        r_d  = dist.view(1, 1, d, d)
+        l    = l_x.unsqueeze(-1)   # (B, T, 1, 1)
+        s    = s_x.unsqueeze(-1)   # (B, T, 1, 1)
+
+        if kernel == "rbf":
+            K = s * torch.exp(-sq_d / (2 * l ** 2))
+        elif kernel == "exponential":
+            K = s * torch.exp(-r_d / l)
+        elif kernel == "matern32":
+            rs = math.sqrt(3) * r_d / l
+            K = s * (1.0 + rs) * torch.exp(-rs)
+        elif kernel == "rational_quadratic":
+            alpha = math.exp(
+                math.log(0.1) + (math.log(10.0) - math.log(0.1)) * torch.rand(1).item()
+            )
+            K = s * (1.0 + sq_d / (2 * alpha * l ** 2)).pow(-alpha)
+        elif kernel == "periodic":
+            p_period = math.exp(
+                math.log(0.5) + (math.log(5.0) - math.log(0.5)) * torch.rand(1).item()
+            )
+            K = s * torch.exp(-2.0 * torch.sin(math.pi * r_d / p_period).pow(2) / l ** 2)
+        else:
+            raise ValueError(kernel)
+
+        # Nugget for strict positive-definiteness
+        K = K + self.nugget * torch.eye(d, device=device).view(1, 1, d, d)  # (B, T, d, d)
+
+        # Batched Cholesky over all instances
+        L_x = torch.linalg.cholesky(K.reshape(B * T, d, d)).reshape(B, T, d, d)
+        return L_x
+
+
+# ---------------------------------------------------------------------------
 # Anchor-based covariance generator
 # ---------------------------------------------------------------------------
 
@@ -348,6 +466,7 @@ def generate_episode(
     fixed_cov_params: tuple | None = None,
     fixed_nets: GlobalFixedNets | None = None,
     anchor_gen: GlobalAnchorCovGen | None = None,
+    kernel_cov_gen: KernelCovGen | None = None,
     diag_alpha: float = 0.0,
     return_norm_stats: bool = False,
 ) -> tuple:
@@ -417,6 +536,16 @@ def generate_episode(
                 V_fixed = torch.randn(1, 1, d, r, device=device) / math.sqrt(r)
             diag_x = D_fixed.expand(B, T, d)
             V_x = V_fixed.expand(B, T, d, r)
+            _r = r
+        elif kernel_cov_gen is not None:
+            # Kernel-based: full x-dependent distribution (mean, diagonal, and full-rank covariance
+            # all vary per instance via frozen random MLPs sampled fresh each episode).
+            mu_net   = BatchedRandomMLP(B, p_in=p, p_out=d, hidden=mlp_hidden, device=device)
+            diag_net = BatchedRandomMLP(B, p_in=p, p_out=d, hidden=mlp_hidden, device=device)
+            mu_x   = mu_net(X)                                       # (B, T, d)
+            diag_x = F.softplus(diag_net(X)) * diag_alpha + 1e-6    # (B, T, d)
+            V_x    = kernel_cov_gen(X, d)                            # (B, T, d, d)
+            _r = d
         else:
             # 2. Frozen covariance function — anchor-based, globally-fixed MLP, or fresh MLP.
             #    Priority: anchor_gen > fixed_nets > fresh BatchedRandomMLP per episode.
@@ -437,10 +566,11 @@ def generate_episode(
                 mu_x = torch.zeros(B, T, d, device=device)  # (B, T, d)
             diag_x = torch.full((B, T, d), diag_alpha, device=device)  # (B, T, d)
             V_x = v_net(X).reshape(B, T, d, r)  # (B, T, d, r)
+            _r = r
 
         # 3. Sample Y via reparameterisation
         eps_diag = torch.randn(B, T, d, device=device)
-        eps_low = torch.randn(B, T, r, device=device)
+        eps_low  = torch.randn(B, T, _r, device=device)
 
         Y = (
             mu_x
@@ -494,6 +624,7 @@ def build_val_suite(
     device: torch.device | str,
     fixed_nets: GlobalFixedNets | None = None,
     anchor_gen: GlobalAnchorCovGen | None = None,
+    kernel_cov_gen: KernelCovGen | None = None,
     fixed_cov_params: tuple | None = None,
 ) -> dict[str, dict]:
     """Pre-generate a fixed validation suite.
@@ -540,6 +671,7 @@ def build_val_suite(
                 fixed_cov_params=fixed_cov_params,
                 fixed_nets=fixed_nets,
                 anchor_gen=anchor_gen,
+                kernel_cov_gen=kernel_cov_gen,
                 diag_alpha=diag_alpha,
             )
             suite[key] = {
