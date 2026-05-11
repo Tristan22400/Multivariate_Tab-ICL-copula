@@ -391,7 +391,7 @@ class CopulaTransformer(nn.Module):
         nn.init.normal_(self.fc_d.weight, std=0.01)
         nn.init.zeros_(self.fc_d.bias)
 
-        nn.init.normal_(self.fc_V.weight, std=0.1)
+        nn.init.zeros_(self.fc_V.weight)
         nn.init.zeros_(self.fc_V.bias)
 
     # ------------------------------------------------------------------
@@ -494,8 +494,15 @@ class CopulaTransformer(nn.Module):
         query_tgt = tokens[:, n_support:, self.p_max :, :]  # (B, n_query, d, d_model)
 
         mu_Z = self.fc_mu(query_tgt).squeeze(-1)  # (B, n_query, d)
-        d_Z = F.softplus(self.fc_d(query_tgt).squeeze(-1)) + 1e-6  # (B, n_query, d)
-        V_Z = self.fc_V(query_tgt)[..., :r]  # (B, n_query, d, r)
+        s_Z = F.softplus(self.fc_d(query_tgt).squeeze(-1)) + 1e-4  # (B, n_query, d)
+        U = self.fc_V(query_tgt)[..., :r]  # (B, n_query, d, r)
+
+        U_sq_norm = (U**2).sum(dim=-1)  # (B, n_query, d)
+        C_diag = 1.0 / (1.0 + U_sq_norm)  # (B, n_query, d)
+        W = U / torch.sqrt(1.0 + U_sq_norm.unsqueeze(-1))  # (B, n_query, d, r)
+
+        d_Z = (s_Z**2) * C_diag  # (B, n_query, d)
+        V_Z = s_Z.unsqueeze(-1) * W  # (B, n_query, d, r)
 
         return mu_Z, d_Z, V_Z
 
