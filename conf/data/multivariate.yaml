@@ -27,10 +27,12 @@ mlp_hidden: 64
 # collapsing to V≈0 (the saddle point where ∂NLL/∂V = 0 when D >> D_oracle).
 diag_alpha: 0.1
 
-# Sanity-check mode: fix mean=0 and a random Sigma = diag(D) + V @ V^T for all episodes.
-# D and V are sampled once at startup and reused every episode (same for all B and all T).
+# Per-dataset fixed covariance: sample a piecewise-constant mean (fixed_cov_n_anchors Voronoi                                                                                
+# regions) and a random Sigma = diag(D) + V @ V^T independently for each of the B datasets.                                                                                  
+# Both are held constant across all T instances within a dataset.                                                                                                            
 # When false, random per-episode MLPs define mean and covariance.
 fixed_cov: false
+fixed_cov_n_anchors: 4   # K Voronoi regions for the piecewise-constant mean (fixed_cov=true)    
 
 # Covariance generation mode:
 #   mlp    — fresh random MLP per episode, x-dependent low-rank covariance
@@ -39,7 +41,7 @@ fixed_cov: false
 #            The kernel hyperparameters l(x) and σ²(x) come from frozen MLPs; a fresh set of
 #            latent embeddings E ∈ R^(d × kernel_latent_dim) is sampled per episode so each
 #            episode presents a distinct x→Σ mapping for the in-context learner to recover.
-cov_type: kernel
+cov_type: anchor
 num_anchors: 2        # K: number of anchor covariance prototypes (cov_type=anchor)
 anchor_temp: 1.0      # τ: softmax temperature for x-to-anchor similarity (cov_type=anchor)
 

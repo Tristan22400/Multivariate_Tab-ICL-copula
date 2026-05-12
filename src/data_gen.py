@@ -470,6 +470,7 @@ def generate_episode(
     fixed_cov: bool = False,
     fixed_cov_rho: float = 0.8,
     fixed_cov_params: tuple | None = None,
+    fixed_cov_n_anchors: int = 4,
     fixed_nets: GlobalFixedNets | None = None,
     anchor_gen: GlobalAnchorCovGen | None = None,
     kernel_cov_gen: KernelCovGen | None = None,
@@ -516,10 +517,11 @@ def generate_episode(
             "V"  : (B, n_test, d, r) — ground-truth low-rank factor (normalised space)
 
     fixed_cov : bool
-        When True, use a fixed zero mean and identity covariance (D=1, V=0) for
-        all datasets in all episodes.  Y is still z-normalised so the empirical
-        mean is exactly zero.  This is a sanity-check mode: the model only needs
-        to output mu=0, D≈1, V≈0 regardless of X.
+        When True, each of the B datasets gets an independently sampled
+        covariance Sigma = diag(D) + V @ V^T and a piecewise-constant mean
+        defined by fixed_cov_n_anchors Voronoi regions.  Both are constant
+        across all T instances within one dataset.  Y is still z-normalised.
+        fixed_cov_params, if supplied, must have shapes (B, 1, d) and (B, 1, d, r).
     """
     T = n_train + n_test
 
@@ -528,21 +530,28 @@ def generate_episode(
 
     with torch.no_grad():
         if fixed_cov:
-            # Fixed zero mean + random covariance (same for all instances, batches, and episodes).
-            # fixed_cov_params must be pre-generated once and passed in to guarantee consistency
-            # across episodes: (D_fixed, V_fixed) with shapes (1, 1, d) and (1, 1, d, r).
-            mu_x = torch.zeros(B, T, d, device=device)
+            # Per-dataset fixed covariance + piecewise-constant mean.
+            # D and V are sampled independently per batch element (B, 1, d) / (B, 1, d, r)
+            # and broadcast to all T instances within each dataset.
+            # fixed_cov_params, if supplied, must have matching shapes (B, 1, d) and (B, 1, d, r).
             if fixed_cov_params is not None:
                 D_fixed, V_fixed = fixed_cov_params
             else:
                 D_fixed = (
-                    torch.nn.functional.softplus(torch.randn(1, 1, d, device=device))
+                    torch.nn.functional.softplus(torch.randn(B, 1, d, device=device))
                     + 1e-6
                 )
-                V_fixed = torch.randn(1, 1, d, r, device=device) / math.sqrt(r)
+                V_fixed = torch.randn(B, 1, d, r, device=device) / math.sqrt(r)
             diag_x = D_fixed.expand(B, T, d)
             V_x = V_fixed.expand(B, T, d, r)
             _r = r
+            # Piecewise-constant mean: fixed_cov_n_anchors Voronoi regions per dataset,
+            # hard nearest-anchor assignment (same pattern as AnchorCovarianceGen.get_mean).
+            K_mu = fixed_cov_n_anchors
+            C = F.normalize(torch.randn(B, K_mu, p, device=device), dim=-1)  # (B, K, p)
+            M = torch.randn(B, K_mu, d, device=device)                        # (B, K, d)
+            k_star = torch.einsum("btp,bkp->btk", X, C).argmax(dim=-1)        # (B, T)
+            mu_x = M[torch.arange(B, device=device).unsqueeze(1), k_star]     # (B, T, d)
         elif kernel_cov_gen is not None:
             # Kernel-based: full x-dependent distribution (mean, diagonal, and full-rank covariance
             # all vary per instance via frozen random MLPs sampled fresh each episode).
@@ -657,6 +666,7 @@ def build_val_suite(
     hidden = int(cfg.data.mlp_hidden)
     fixed_cov = bool(cfg.data.get("fixed_cov", False))
     fixed_cov_rho = float(cfg.data.get("fixed_cov_rho", 0.8))
+    fixed_cov_n_anchors = int(cfg.data.get("fixed_cov_n_anchors", 4))
     diag_alpha = float(cfg.data.get("diag_alpha", 0.0))
 
     for d in cfg.data.val_d_list:
@@ -679,6 +689,7 @@ def build_val_suite(
                 fixed_cov=fixed_cov,
                 fixed_cov_rho=fixed_cov_rho,
                 fixed_cov_params=fixed_cov_params,
+                fixed_cov_n_anchors=fixed_cov_n_anchors,
                 fixed_nets=fixed_nets,
                 anchor_gen=anchor_gen,
                 kernel_cov_gen=kernel_cov_gen,

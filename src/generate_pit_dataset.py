@@ -91,6 +91,7 @@ def main(cfg: DictConfig) -> None:
     mlp_hidden = int(cfg.data.mlp_hidden)
     fixed_cov = bool(cfg.data.get("fixed_cov", False))
     fixed_cov_rho = float(cfg.data.get("fixed_cov_rho", 0.8))
+    fixed_cov_n_anchors = int(cfg.data.get("fixed_cov_n_anchors", 4))
     diag_alpha = float(cfg.data.get("diag_alpha", 0.0))
 
     # ---- Covariance generator (persistent across episodes for stability) ----
@@ -238,6 +239,7 @@ def main(cfg: DictConfig) -> None:
                 return_oracle=True,
                 fixed_cov=fixed_cov,
                 fixed_cov_rho=fixed_cov_rho,
+                fixed_cov_n_anchors=fixed_cov_n_anchors,
                 fixed_nets=fixed_nets,
                 anchor_gen=anchor_gen,
                 kernel_cov_gen=kernel_cov_gen,
