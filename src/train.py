@@ -622,8 +622,8 @@ def main(cfg: DictConfig) -> None:
                 oracle_mu = episode["oracle_mu"].to(device)
                 oracle_D = episode["oracle_D"].to(device)
                 oracle_V = episode["oracle_V"].to(device)
-                Z_test = episode["Z_test"].to(device)
-                oracle_nll = woodbury_nll(Z_test, oracle_mu, oracle_D, oracle_V).item()
+                Y_test = episode["Y_test"].to(device)
+                oracle_nll = woodbury_nll(Y_test, oracle_mu, oracle_D, oracle_V).item()
 
                 # Mean absolute off-diagonal covariance variance across query instances.
                 # Computed for both model predictions and oracle.
