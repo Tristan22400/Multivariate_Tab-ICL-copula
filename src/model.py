@@ -335,12 +335,6 @@ class CopulaTransformer(nn.Module):
         # Type encoding: index 0 → feature token, 1 → target token
         self.type_enc = nn.Parameter(torch.zeros(2, d_model))
 
-        # Per-slot index embeddings:
-        #   feat_enc[k]  adds positional identity to the k-th feature token
-        #   dim_enc[j]   adds dimensional identity to the j-th target token
-        self.feat_enc = nn.Embedding(p_max, d_model)
-        self.dim_enc = nn.Embedding(d_max, d_model)
-
         # Learnable mask tokens θ_mask[j] for query target positions
         self.mask_tokens = nn.Parameter(torch.zeros(d_max, d_model))
 
@@ -379,8 +373,12 @@ class CopulaTransformer(nn.Module):
         • type_enc     : zero-init — will be learned from gradient signal.
         • fc_mu, fc_d  : small weight init (std=0.01) — keeps initial
                          predictions near zero / unit variance.
-        • fc_V         : moderate init (std=0.1) — prevents V≈0 saddle
-                         where the low-rank component has zero gradient.
+        • fc_V         : small non-zero init (std=0.02) — V=0 is a saddle of the
+                         Woodbury NLL (both gradient terms vanish: d/dV[log|D+VV^T|]
+                         = 2 D^{-1} V = 0, and the quadratic Woodbury correction
+                         also vanishes). Zero-init traps the model at this saddle
+                         indefinitely. Non-zero init places V in a region where
+                         gradients are non-zero from the first step.
         """
         nn.init.normal_(self.mask_tokens, std=0.01)
         nn.init.zeros_(self.type_enc)
@@ -391,7 +389,7 @@ class CopulaTransformer(nn.Module):
         nn.init.normal_(self.fc_d.weight, std=0.01)
         nn.init.zeros_(self.fc_d.bias)
 
-        nn.init.zeros_(self.fc_V.weight)
+        nn.init.normal_(self.fc_V.weight, std=0.02)
         nn.init.zeros_(self.fc_V.bias)
 
     # ------------------------------------------------------------------
@@ -447,28 +445,23 @@ class CopulaTransformer(nn.Module):
 
         # phi_X expects (..., 1) — add feature dimension, embed, then squeeze
         feat_tok = self.phi_X(X_in.unsqueeze(-1))  # (B, N, p_max, d_model)
-
-        feat_idx = torch.arange(self.p_max, device=X_all.device)  # (p_max,)
-        feat_emb = self.feat_enc(feat_idx)  # (p_max, d_model)
         type_feat = self.type_enc[0]  # (d_model,)
 
-        feat_tok = feat_tok + type_feat + feat_emb  # (B, N, p_max, d_model)
+        feat_tok = feat_tok + type_feat  # (B, N, p_max, d_model)
 
         # ------------------------------------------------------------------
         # 2. Target tokens:  (B, N, d, d_model)
         # ------------------------------------------------------------------
-        dim_idx = torch.arange(d, device=X_all.device)  # (d,)
-        dim_emb = self.dim_enc(dim_idx)  # (d, d_model)
         type_tgt = self.type_enc[1]  # (d_model,)
 
         # Support instances: embed their observed Z values
         Z_sup = Z_all[:, :n_support, :]  # (B, n_support, d)
         tgt_sup = self.phi_Z(Z_sup.unsqueeze(-1))  # (B, n_support, d, d_model)
-        tgt_sup = tgt_sup + type_tgt + dim_emb  # broadcast over B, n_support
+        tgt_sup = tgt_sup + type_tgt  # broadcast over B, n_support
 
         # Query instances: replace Z values with learnable mask tokens
         mask_tok = self.mask_tokens[:d]  # (d, d_model)
-        tgt_qry = mask_tok + type_tgt + dim_emb  # (d, d_model)
+        tgt_qry = mask_tok + type_tgt  # (d, d_model)
         tgt_qry = (
             tgt_qry.unsqueeze(0).unsqueeze(0).expand(B, n_query, d, -1)
         )  # (B, n_query, d, d_model)
