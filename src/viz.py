@@ -20,6 +20,7 @@ def plot_prediction_comparison(
     n_instances: int = 3,
     mu_baseline: torch.Tensor | None = None,
     baseline_label: str = "Baseline",
+    sigma_oas: np.ndarray | None = None,
 ) -> plt.Figure:
     """Compare predicted vs oracle mean and covariance for multiple query instances.
 
@@ -28,7 +29,7 @@ def plot_prediction_comparison(
       1 — Predicted Sigma   heatmap
       2 — |Sigma* - Sigma|  heatmap
       3 — mu* vs mu hat (+ optional baseline) bar chart
-      4 — |mu* - mu hat| vs |mu* - baseline| bar chart
+      4 — OAS Sigma heatmap (if sigma_oas provided) or |mu* - mu hat| bar chart
 
     Args:
         mu_pred      : (B, N, d)    — predicted conditional means
@@ -42,10 +43,12 @@ def plot_prediction_comparison(
         mu_baseline  : (B, N, d) optional — baseline scalar predictions
                        (e.g. marginal-only or independent-TabICL means)
         baseline_label : legend label for the baseline bars
+        sigma_oas    : (d, d) optional — OAS shrinkage covariance matrix
 
     Returns:
         matplotlib Figure with n_instances × 5 subplots.
     """
+
     try:
         import seaborn as sns
     except ImportError:
@@ -160,35 +163,45 @@ def plot_prediction_comparison(
         ax.legend(fontsize=8)
 
         # ------------------------------------------------------------------ #
-        # Absolute mean error                                                  #
+        # Column 4: OAS covariance heatmap or absolute mean error             #
         # ------------------------------------------------------------------ #
         ax = axes[row, 4]
-        if mu_baseline is not None:
-            mu_b = mu_baseline[batch_idx, inst_idx].detach().cpu().numpy()
-            width = 0.35
-            ax.bar(
-                dims - width / 2,
-                np.abs(mu_t - mu_p),
-                width,
-                label=r"$|\mu^*-\hat{\mu}|$",
-                color="#7C3AED",
-                alpha=0.8,
+        if sigma_oas is not None:
+            oas_max = max(np.abs(sigma_oas).max(), cov_max)
+            oas_heatmap_kw = dict(
+                cmap="coolwarm", center=0, vmin=-oas_max, vmax=oas_max, square=True
             )
-            ax.bar(
-                dims + width / 2,
-                np.abs(mu_t - mu_b),
-                width,
-                label=f"|μ*−{baseline_label}|",
-                color="#16A34A",
-                alpha=0.8,
-            )
-            ax.legend(fontsize=8)
+            if sns is not None:
+                sns.heatmap(sigma_oas, ax=ax, **oas_heatmap_kw)
+            else:
+                ax.imshow(sigma_oas, cmap="coolwarm", vmin=-oas_max, vmax=oas_max)
+            ax.set_title(r"OAS $\hat{\Sigma}_{OAS}$")
         else:
-            ax.bar(dims, np.abs(mu_t - mu_p), color="#7C3AED", alpha=0.8)
-
-        ax.set_xticks(dims)
-        ax.set_xlabel("dim")
-        ax.set_title(rf"$|\mu^* - \hat{{\mu}}|$ (inst {inst_idx})")
+            if mu_baseline is not None:
+                mu_b = mu_baseline[batch_idx, inst_idx].detach().cpu().numpy()
+                width = 0.35
+                ax.bar(
+                    dims - width / 2,
+                    np.abs(mu_t - mu_p),
+                    width,
+                    label=r"$|\mu^*-\hat{\mu}|$",
+                    color="#7C3AED",
+                    alpha=0.8,
+                )
+                ax.bar(
+                    dims + width / 2,
+                    np.abs(mu_t - mu_b),
+                    width,
+                    label=f"|μ*−{baseline_label}|",
+                    color="#16A34A",
+                    alpha=0.8,
+                )
+                ax.legend(fontsize=8)
+            else:
+                ax.bar(dims, np.abs(mu_t - mu_p), color="#7C3AED", alpha=0.8)
+            ax.set_xticks(dims)
+            ax.set_xlabel("dim")
+            ax.set_title(rf"$|\mu^* - \hat{{\mu}}|$ (inst {inst_idx})")
 
     plt.tight_layout()
     return fig

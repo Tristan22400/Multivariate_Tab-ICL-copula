@@ -197,6 +197,7 @@ def run_validation(
         "val/oracle_gap_fraction": [],
     }
     plot_fig = None
+    plot_sigma_oas = None
 
     with torch.no_grad():
         for key, ep in val_suite.items():
@@ -275,6 +276,8 @@ def run_validation(
                     Sigma_oas, mu_oas, n_test, device
                 )
                 oas_nlls.append(woodbury_nll(Z_te_b, mu_p, d_p, V_p).item())
+                if b == 0 and do_plot and plot_sigma_oas is None:
+                    plot_sigma_oas = oas.covariance_
 
             agg["val/full_mle_nll"].append(float(np.mean(full_mle_nlls)))
             agg["val/oas_nll"].append(float(np.mean(oas_nlls)))
@@ -382,6 +385,7 @@ def run_validation(
                     D_true=ep["oracle_D"].to(device),
                     V_true=ep["oracle_V"].to(device),
                     n_instances=min(3, n_test),
+                    sigma_oas=plot_sigma_oas,
                 )
 
     # Average across val suite entries
