@@ -162,9 +162,11 @@ class TransformerBlock(nn.Module):
         d_ff: int,
         dropout: float = 0.0,
         p_max: int = 1,
+        num_cls: int = 0,
     ) -> None:
         super().__init__()
         self.p_max = p_max
+        self.num_cls = num_cls
         self.norm1 = RMSNorm(d_model)
         self.feat_attn = nn.MultiheadAttention(
             d_model, n_heads, dropout=dropout, batch_first=True
@@ -181,7 +183,8 @@ class TransformerBlock(nn.Module):
         tokens: torch.Tensor,
         n_support: int,
         p: int,
-    ) -> torch.Tensor:
+        cls: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Apply one transformer block.
 
         Args:
@@ -191,9 +194,11 @@ class TransformerBlock(nn.Module):
             p         : actual number of feature columns in this batch
                         (may be less than p_max if input was padded; used
                         to determine the feature/target split in the mask).
+            cls       : (B, num_cls, d, d_model) CLS tokens for target slots,
+                        or None if not used.
 
         Returns:
-            Updated tokens tensor of the same shape.
+            Updated tokens tensor and updated cls tensor (or None).
         """
         B, N, S, D = tokens.shape
 
@@ -235,17 +240,48 @@ class TransformerBlock(nn.Module):
         if d_slots > 0:
             tgt_s = tokens_s[:, self.p_max :, :, :]  # (B, d_slots, N, D)
             tgt_flat = tgt_s.reshape(B * d_slots, N, D)
-            tgt_norm = self.norm2(tgt_flat)
 
-            # 2D (N, N) additive mask — broadcast over B*d_slots and n_heads
-            tgt_mask = torch.zeros(N, N, dtype=tokens.dtype, device=tokens.device)
-            if n_support < N:
-                tgt_mask[:, n_support:] = float("-inf")
+            if cls is not None and self.num_cls > 0:
+                # Prepend CLS rows: cls is (B, num_cls, d_slots, D)
+                cls_flat = cls.permute(0, 2, 1, 3).reshape(B * d_slots, self.num_cls, D)
+                tgt_kv = torch.cat(
+                    [cls_flat, tgt_flat], dim=1
+                )  # (B*d_slots, num_cls+N, D)
+                N_total = self.num_cls + N
 
-            tgt_flat = (
-                tgt_flat
-                + self.inst_attn(tgt_norm, tgt_norm, tgt_norm, attn_mask=tgt_mask)[0]
-            )
+                # All rows block query Z columns (num_cls+n_support..num_cls+N-1)
+                tgt_mask = torch.zeros(
+                    N_total, N_total, dtype=tokens.dtype, device=tokens.device
+                )
+                if n_support < N:
+                    tgt_mask[:, self.num_cls + n_support :] = float("-inf")
+
+                tgt_kv_norm = self.norm2(tgt_kv)
+                # Q=K=V all normed — pre-norm residual convention
+                out = self.inst_attn(
+                    tgt_kv_norm, tgt_kv_norm, tgt_kv_norm, attn_mask=tgt_mask
+                )[0]
+
+                cls_out = (
+                    cls_flat + out[:, : self.num_cls, :]
+                )  # (B*d_slots, num_cls, D)
+                tgt_flat = tgt_flat + out[:, self.num_cls :, :]  # (B*d_slots, N, D)
+
+                cls = cls_out.reshape(B, d_slots, self.num_cls, D).permute(0, 2, 1, 3)
+                # (B, num_cls, d_slots, D)
+            else:
+                tgt_norm = self.norm2(tgt_flat)
+                # 2D (N, N) additive mask — broadcast over B*d_slots and n_heads
+                tgt_mask = torch.zeros(N, N, dtype=tokens.dtype, device=tokens.device)
+                if n_support < N:
+                    tgt_mask[:, n_support:] = float("-inf")
+                tgt_flat = (
+                    tgt_flat
+                    + self.inst_attn(tgt_norm, tgt_norm, tgt_norm, attn_mask=tgt_mask)[
+                        0
+                    ]
+                )
+
             tokens_s[:, self.p_max :, :, :] = tgt_flat.reshape(B, d_slots, N, D)
 
         tokens = tokens_s.permute(0, 2, 1, 3)  # back to (B, N, S, D)
@@ -257,7 +293,7 @@ class TransformerBlock(nn.Module):
         t = t + self.ffn(self.norm3(t))
         tokens = t.reshape(B, N, S, D)
 
-        return tokens
+        return tokens, cls
 
 
 # ---------------------------------------------------------------------------
@@ -338,10 +374,17 @@ class CopulaTransformer(nn.Module):
         # Learnable mask tokens θ_mask[j] for query target positions
         self.mask_tokens = nn.Parameter(torch.zeros(d_max, d_model))
 
+        # ---- CLS tokens for dataset-level covariance context ----------------
+        self.num_cls = 4
+        # (num_cls, d_max, d_model) — per (CLS token, target slot) learned start
+        self.cls_tokens = nn.Parameter(torch.empty(self.num_cls, d_max, d_model))
+
         # ---- Transformer body -----------------------------------------------
         self.blocks = nn.ModuleList(
             [
-                TransformerBlock(d_model, n_heads, d_ff, dropout, p_max=p_max)
+                TransformerBlock(
+                    d_model, n_heads, d_ff, dropout, p_max=p_max, num_cls=self.num_cls
+                )
                 for _ in range(n_layers)
             ]
         )
@@ -349,7 +392,9 @@ class CopulaTransformer(nn.Module):
         # ---- Readout heads --------------------------------------------------
         self.fc_mu = nn.Linear(d_model, 1)  # → mu scalar per (query, dim)
         self.fc_d = nn.Linear(d_model, 1)  # → log-variance scalar
-        self.fc_V = nn.Linear(d_model, rank_max)  # → V factor row per (query, dim)
+        # V head conditioned on [query_tgt || cls_concat]: (1 + num_cls) * d_model → rank_max
+        # Single linear (no intermediate projection — avoids redundant linear composition)
+        self.fc_V = nn.Linear((1 + self.num_cls) * d_model, rank_max)
 
         # ---- Store configuration -------------------------------------------
         self.p_max = p_max
@@ -383,12 +428,17 @@ class CopulaTransformer(nn.Module):
         nn.init.normal_(self.mask_tokens, std=0.01)
         nn.init.zeros_(self.type_enc)
 
+        # CLS tokens: trunc_normal breaks 4-token symmetry at init
+        nn.init.trunc_normal_(self.cls_tokens, std=0.02)
+
         nn.init.normal_(self.fc_mu.weight, std=0.01)
         nn.init.zeros_(self.fc_mu.bias)
 
         nn.init.normal_(self.fc_d.weight, std=0.01)
         nn.init.zeros_(self.fc_d.bias)
 
+        # fc_V is now wider ((1+num_cls)*D → rank_max): same non-zero init to
+        # avoid the Woodbury saddle where V=0 kills both gradient terms
         nn.init.normal_(self.fc_V.weight, std=0.02)
         nn.init.zeros_(self.fc_V.bias)
 
@@ -476,8 +526,13 @@ class CopulaTransformer(nn.Module):
         # ------------------------------------------------------------------
         # 4. Transformer blocks
         # ------------------------------------------------------------------
+        # CLS tokens are sliced to actual d and expanded to batch size.
+        # clone() is needed because blocks update cls in-place via residual adds.
+        cls = self.cls_tokens[:, :d, :].unsqueeze(0).expand(B, -1, -1, -1).clone()
+        # (B, num_cls, d, d_model)
+
         for block in self.blocks:
-            tokens = block(tokens, n_support, p=p_eff)
+            tokens, cls = block(tokens, n_support, p=p_eff, cls=cls)
 
         # ------------------------------------------------------------------
         # 5. Readout from query target tokens
@@ -488,7 +543,21 @@ class CopulaTransformer(nn.Module):
 
         mu_Z = self.fc_mu(query_tgt).squeeze(-1)  # (B, n_query, d)
         s_Z = F.softplus(self.fc_d(query_tgt).squeeze(-1)) + 1e-4  # (B, n_query, d)
-        U = self.fc_V(query_tgt)[..., :r]  # (B, n_query, d, r)
+
+        # CLS: (B, num_cls, d, D) → concatenate num_cls tokens per slot → (B, 1, d, num_cls*D)
+        cls_concat = cls.permute(0, 2, 1, 3).reshape(
+            B, 1, d, self.num_cls * self.d_model
+        )
+        cls_expanded = cls_concat.expand(
+            B, n_query, d, -1
+        )  # (B, n_query, d, num_cls*D)
+
+        # Single linear head over [query_tgt || cls] — no intermediate projection
+        U = self.fc_V(
+            torch.cat(
+                [query_tgt, cls_expanded], dim=-1
+            )  # (B, n_query, d, (1+num_cls)*D)
+        )[..., :r]  # (B, n_query, d, r)
 
         U_sq_norm = (U**2).sum(dim=-1)  # (B, n_query, d)
         C_diag = 1.0 / (1.0 + U_sq_norm)  # (B, n_query, d)
