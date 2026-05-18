@@ -409,23 +409,45 @@ def run_validation(
         f"oracle_frac={metrics['val/oracle_gap_fraction']:.4f}"
     )
 
-    # Build one figure per collected episode and log as a list of images
+    # Build one figure per collected episode and log as a list of images.
+    # If only one episode was collected (single-entry val_suite), produce two
+    # figures from different batch indices so the comparison is still visible.
     plot_figs = []
     if do_plot and plot_episodes and wandb_run is not None:
         n_inst = min(3, plot_episodes[0]["n_test"])
-        for ep_data in plot_episodes:
-            fig = plot_prediction_comparison(
-                mu_pred=ep_data["mu_pred"],
-                D_pred=ep_data["D_pred"],
-                V_pred=ep_data["V_pred"],
-                mu_true=ep_data["mu_true"],
-                D_true=ep_data["D_true"],
-                V_true=ep_data["V_true"],
-                n_instances=n_inst,
-                sigma_oas=ep_data["sigma_oas"],
-                dataset_label=f"Dataset: {ep_data['key']}",
-            )
-            plot_figs.append(fig)
+        ep0 = plot_episodes[0]
+        B0 = ep0["mu_pred"].shape[0]
+
+        if len(plot_episodes) == 1 and B0 >= 2:
+            # Single episode: compare batch element 0 vs 1
+            for b_idx in range(2):
+                fig = plot_prediction_comparison(
+                    mu_pred=ep0["mu_pred"],
+                    D_pred=ep0["D_pred"],
+                    V_pred=ep0["V_pred"],
+                    mu_true=ep0["mu_true"],
+                    D_true=ep0["D_true"],
+                    V_true=ep0["V_true"],
+                    batch_idx=b_idx,
+                    n_instances=n_inst,
+                    sigma_oas=ep0["sigma_oas"],
+                    dataset_label=f"{ep0['key']} — batch {b_idx}",
+                )
+                plot_figs.append(fig)
+        else:
+            for ep_data in plot_episodes:
+                fig = plot_prediction_comparison(
+                    mu_pred=ep_data["mu_pred"],
+                    D_pred=ep_data["D_pred"],
+                    V_pred=ep_data["V_pred"],
+                    mu_true=ep_data["mu_true"],
+                    D_true=ep_data["D_true"],
+                    V_true=ep_data["V_true"],
+                    n_instances=n_inst,
+                    sigma_oas=ep_data["sigma_oas"],
+                    dataset_label=f"Dataset: {ep_data['key']}",
+                )
+                plot_figs.append(fig)
 
     if wandb_run is not None:
         if plot_figs:
