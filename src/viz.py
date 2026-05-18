@@ -21,6 +21,8 @@ def plot_prediction_comparison(
     mu_baseline: torch.Tensor | None = None,
     baseline_label: str = "Baseline",
     sigma_oas: np.ndarray | None = None,
+    fig: plt.Figure | None = None,
+    dataset_label: str = "",
 ) -> plt.Figure:
     """Compare predicted vs oracle mean and covariance for multiple query instances.
 
@@ -44,6 +46,9 @@ def plot_prediction_comparison(
                        (e.g. marginal-only or independent-TabICL means)
         baseline_label : legend label for the baseline bars
         sigma_oas    : (d, d) optional — OAS shrinkage covariance matrix
+        fig          : optional existing Figure (or SubFigure) to draw into;
+                       if None a new Figure is created.
+        dataset_label: if non-empty, added as a suptitle to identify the dataset.
 
     Returns:
         matplotlib Figure with n_instances × 5 subplots.
@@ -58,7 +63,12 @@ def plot_prediction_comparison(
     n_instances = min(n_instances, N)
     indices = np.linspace(0, N - 1, n_instances, dtype=int)
 
-    fig, axes = plt.subplots(n_instances, 5, figsize=(26, 5 * n_instances))
+    created_fig = fig is None
+    if created_fig:
+        fig = plt.figure(figsize=(26, 5 * n_instances))
+    axes = fig.subplots(n_instances, 5)
+    if dataset_label:
+        fig.suptitle(dataset_label, fontsize=13, fontweight="bold", y=1.01)
     if n_instances == 1:
         axes = axes[np.newaxis, :]
 

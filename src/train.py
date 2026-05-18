@@ -196,8 +196,7 @@ def run_validation(
         "val/model_vs_knn5_gap": [],
         "val/oracle_gap_fraction": [],
     }
-    plot_fig = None
-    plot_sigma_oas = None
+    plot_episodes: list[dict] = []
 
     with torch.no_grad():
         for key, ep in val_suite.items():
@@ -252,6 +251,7 @@ def run_validation(
 
             # Full MLE covariance + OAS — loop over batch elements (sklearn works on 2-D)
             full_mle_nlls, oas_nlls = [], []
+            ep_sigma_oas = None
             for b in range(B):
                 Z_tr_b_np = Z_tr[b].cpu().numpy()  # (n_train, d)
                 Z_te_b = Z_te[b]  # (n_test, d)
@@ -276,8 +276,8 @@ def run_validation(
                     Sigma_oas, mu_oas, n_test, device
                 )
                 oas_nlls.append(woodbury_nll(Z_te_b, mu_p, d_p, V_p).item())
-                if b == 0 and do_plot and plot_sigma_oas is None:
-                    plot_sigma_oas = oas.covariance_
+                if b == 0 and do_plot and ep_sigma_oas is None:
+                    ep_sigma_oas = oas.covariance_
 
             agg["val/full_mle_nll"].append(float(np.mean(full_mle_nlls)))
             agg["val/oas_nll"].append(float(np.mean(oas_nlls)))
@@ -375,18 +375,19 @@ def run_validation(
                 (wnll - oracle_nll) / denom if abs(denom) > 1e-8 else float("nan")
             )
 
-            # --- Optional Plotting (first episode only) ---
-            if do_plot and plot_fig is None and wandb_run is not None:
-                plot_fig = plot_prediction_comparison(
-                    mu_pred=mu_Z,
-                    D_pred=d_Z,
-                    V_pred=V_Z,
-                    mu_true=ep["oracle_mu"].to(device),
-                    D_true=ep["oracle_D"].to(device),
-                    V_true=ep["oracle_V"].to(device),
-                    n_instances=min(3, n_test),
-                    sigma_oas=plot_sigma_oas,
-                )
+            # --- Collect up to 2 episodes for the comparison plot ---
+            if do_plot and len(plot_episodes) < 2:
+                plot_episodes.append({
+                    "key": key,
+                    "mu_pred": mu_Z,
+                    "D_pred": d_Z,
+                    "V_pred": V_Z,
+                    "mu_true": ep["oracle_mu"].to(device),
+                    "D_true": ep["oracle_D"].to(device),
+                    "V_true": ep["oracle_V"].to(device),
+                    "sigma_oas": ep_sigma_oas,
+                    "n_test": n_test,
+                })
 
     # Average across val suite entries
     metrics = {k: float(np.mean(v)) for k, v in agg.items()}
@@ -405,6 +406,30 @@ def run_validation(
         f"vs_knn5={metrics['val/model_vs_knn5_gap']:.4f}  "
         f"oracle_frac={metrics['val/oracle_gap_fraction']:.4f}"
     )
+
+    # Build combined comparison figure from up to 2 collected episodes
+    plot_fig = None
+    if do_plot and plot_episodes and wandb_run is not None:
+        n_ep = len(plot_episodes)
+        n_inst = min(3, plot_episodes[0]["n_test"])
+        master_fig = plt.figure(figsize=(26, 5 * n_inst * n_ep + 1.5 * n_ep))
+        subfigs = master_fig.subfigures(n_ep, 1, hspace=0.08)
+        if n_ep == 1:
+            subfigs = [subfigs]
+        for sf, ep_data in zip(subfigs, plot_episodes):
+            plot_prediction_comparison(
+                mu_pred=ep_data["mu_pred"],
+                D_pred=ep_data["D_pred"],
+                V_pred=ep_data["V_pred"],
+                mu_true=ep_data["mu_true"],
+                D_true=ep_data["D_true"],
+                V_true=ep_data["V_true"],
+                n_instances=n_inst,
+                sigma_oas=ep_data["sigma_oas"],
+                fig=sf,
+                dataset_label=f"Dataset: {ep_data['key']}",
+            )
+        plot_fig = master_fig
 
     if wandb_run is not None:
         if plot_fig is not None:
