@@ -213,5 +213,5 @@ def plot_prediction_comparison(
             ax.set_xlabel("dim")
             ax.set_title(rf"$|\mu^* - \hat{{\mu}}|$ (inst {inst_idx})")
 
-    plt.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.97] if dataset_label else None)
     return fig

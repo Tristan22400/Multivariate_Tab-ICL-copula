@@ -377,17 +377,19 @@ def run_validation(
 
             # --- Collect up to 2 episodes for the comparison plot ---
             if do_plot and len(plot_episodes) < 2:
-                plot_episodes.append({
-                    "key": key,
-                    "mu_pred": mu_Z,
-                    "D_pred": d_Z,
-                    "V_pred": V_Z,
-                    "mu_true": ep["oracle_mu"].to(device),
-                    "D_true": ep["oracle_D"].to(device),
-                    "V_true": ep["oracle_V"].to(device),
-                    "sigma_oas": ep_sigma_oas,
-                    "n_test": n_test,
-                })
+                plot_episodes.append(
+                    {
+                        "key": key,
+                        "mu_pred": mu_Z,
+                        "D_pred": d_Z,
+                        "V_pred": V_Z,
+                        "mu_true": ep["oracle_mu"].to(device),
+                        "D_true": ep["oracle_D"].to(device),
+                        "V_true": ep["oracle_V"].to(device),
+                        "sigma_oas": ep_sigma_oas,
+                        "n_test": n_test,
+                    }
+                )
 
     # Average across val suite entries
     metrics = {k: float(np.mean(v)) for k, v in agg.items()}
@@ -407,17 +409,12 @@ def run_validation(
         f"oracle_frac={metrics['val/oracle_gap_fraction']:.4f}"
     )
 
-    # Build combined comparison figure from up to 2 collected episodes
-    plot_fig = None
+    # Build one figure per collected episode and log as a list of images
+    plot_figs = []
     if do_plot and plot_episodes and wandb_run is not None:
-        n_ep = len(plot_episodes)
         n_inst = min(3, plot_episodes[0]["n_test"])
-        master_fig = plt.figure(figsize=(26, 5 * n_inst * n_ep + 1.5 * n_ep))
-        subfigs = master_fig.subfigures(n_ep, 1, hspace=0.08)
-        if n_ep == 1:
-            subfigs = [subfigs]
-        for sf, ep_data in zip(subfigs, plot_episodes):
-            plot_prediction_comparison(
+        for ep_data in plot_episodes:
+            fig = plot_prediction_comparison(
                 mu_pred=ep_data["mu_pred"],
                 D_pred=ep_data["D_pred"],
                 V_pred=ep_data["V_pred"],
@@ -426,19 +423,18 @@ def run_validation(
                 V_true=ep_data["V_true"],
                 n_instances=n_inst,
                 sigma_oas=ep_data["sigma_oas"],
-                fig=sf,
                 dataset_label=f"Dataset: {ep_data['key']}",
             )
-        plot_fig = master_fig
+            plot_figs.append(fig)
 
     if wandb_run is not None:
-        if plot_fig is not None:
+        if plot_figs:
             import wandb
 
-            metrics["val/plot"] = wandb.Image(plot_fig)
+            metrics["val/plot"] = [wandb.Image(f) for f in plot_figs]
         wandb_run.log(metrics, step=step)
-        if plot_fig is not None:
-            plt.close(plot_fig)
+        for f in plot_figs:
+            plt.close(f)
 
     model.train()
     return metrics
