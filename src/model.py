@@ -183,22 +183,18 @@ class TransformerBlock(nn.Module):
         tokens: torch.Tensor,
         n_support: int,
         p: int,
-        cls: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> torch.Tensor:
         """Apply one transformer block.
 
         Args:
             tokens    : (B, N, S, d_model) — all instance tokens.
-                        S = p + d  (p feature tokens + d target tokens).
+                        S = num_cls + p_max + d  (CLS + feature + target tokens).
             n_support : number of support instances (leading rows of dim-1).
             p         : actual number of feature columns in this batch
-                        (may be less than p_max if input was padded; used
-                        to determine the feature/target split in the mask).
-            cls       : (B, num_cls, d, d_model) CLS tokens for target slots,
-                        or None if not used.
+                        (may be less than p_max if input was padded).
 
         Returns:
-            Updated tokens tensor and updated cls tensor (or None).
+            Updated tokens tensor of the same shape.
         """
         B, N, S, D = tokens.shape
 
@@ -213,76 +209,50 @@ class TransformerBlock(nn.Module):
         # ------------------------------------------------------------------
         # 2. Instance attention: across N instances, per token slot
         # ------------------------------------------------------------------
-        # We process feature slots and target slots separately because they
-        # require different (N, N) key-side masks.  PyTorch MHA with
-        # batch_first=True accepts a 2D (N, N) additive float mask that is
-        # broadcast over both the batch and head dimensions — this is the
-        # only safe way to specify a per-slot policy without fighting the
-        # (B*n_heads, N, N) 3D interpretation.
+        # CLS slots (0..num_cls-1) are NOT updated here — they are summary
+        # tokens updated only by feature attention.  Feature and target slots
+        # both use a (N, N) additive mask that blocks test key columns to
+        # prevent train→test and test→test information flow.
         #
-        # Slot layout in tokens dim-2:
-        #   0 .. p_max-1           : feature tokens  → no masking
-        #   p_max .. p_max+d-1     : target tokens   → block query key columns
+        # Slot layout in tokens dim-2 (after CLS prepend in CopulaTransformer):
+        #   0 .. num_cls-1               : CLS tokens        → skip (no update)
+        #   num_cls .. num_cls+p_max-1   : feature tokens    → block test keys
+        #   num_cls+p_max .. S-1         : target tokens     → block test keys
 
         # Reshape to (B, S, N, D) for per-slot access
         tokens_s = tokens.permute(0, 2, 1, 3)  # (B, S, N, D)
+        tokens_s = tokens_s.clone()
 
-        # Feature slots: no masking (query X values are real observations)
-        feat_s = tokens_s[:, : self.p_max, :, :]  # (B, p_max, N, D)
+        # Shared instance-attention mask: block query instances as keys
+        inst_mask = torch.zeros(N, N, dtype=tokens.dtype, device=tokens.device)
+        if n_support < N:
+            inst_mask[:, n_support:] = float("-inf")
+
+        # Feature slots
+        feat_s = tokens_s[:, self.num_cls : self.num_cls + self.p_max, :, :]
         feat_flat = feat_s.reshape(B * self.p_max, N, D)
         feat_norm = self.norm2(feat_flat)
-        feat_flat = feat_flat + self.inst_attn(feat_norm, feat_norm, feat_norm)[0]
-        tokens_s = tokens_s.clone()
-        tokens_s[:, : self.p_max, :, :] = feat_flat.reshape(B, self.p_max, N, D)
+        feat_flat = (
+            feat_flat
+            + self.inst_attn(feat_norm, feat_norm, feat_norm, attn_mask=inst_mask)[0]
+        )
+        tokens_s[:, self.num_cls : self.num_cls + self.p_max, :, :] = feat_flat.reshape(
+            B, self.p_max, N, D
+        )
 
-        # Target slots: block query key columns (n_support..N-1 are unknown)
-        d_slots = S - self.p_max  # number of target token slots
+        # Target slots
+        d_slots = S - self.p_max - self.num_cls
         if d_slots > 0:
-            tgt_s = tokens_s[:, self.p_max :, :, :]  # (B, d_slots, N, D)
+            tgt_s = tokens_s[:, self.num_cls + self.p_max :, :, :]
             tgt_flat = tgt_s.reshape(B * d_slots, N, D)
-
-            if cls is not None and self.num_cls > 0:
-                # Prepend CLS rows: cls is (B, num_cls, d_slots, D)
-                cls_flat = cls.permute(0, 2, 1, 3).reshape(B * d_slots, self.num_cls, D)
-                tgt_kv = torch.cat(
-                    [cls_flat, tgt_flat], dim=1
-                )  # (B*d_slots, num_cls+N, D)
-                N_total = self.num_cls + N
-
-                # All rows block query Z columns (num_cls+n_support..num_cls+N-1)
-                tgt_mask = torch.zeros(
-                    N_total, N_total, dtype=tokens.dtype, device=tokens.device
-                )
-                if n_support < N:
-                    tgt_mask[:, self.num_cls + n_support :] = float("-inf")
-
-                tgt_kv_norm = self.norm2(tgt_kv)
-                # Q=K=V all normed — pre-norm residual convention
-                out = self.inst_attn(
-                    tgt_kv_norm, tgt_kv_norm, tgt_kv_norm, attn_mask=tgt_mask
-                )[0]
-
-                cls_out = (
-                    cls_flat + out[:, : self.num_cls, :]
-                )  # (B*d_slots, num_cls, D)
-                tgt_flat = tgt_flat + out[:, self.num_cls :, :]  # (B*d_slots, N, D)
-
-                cls = cls_out.reshape(B, d_slots, self.num_cls, D).permute(0, 2, 1, 3)
-                # (B, num_cls, d_slots, D)
-            else:
-                tgt_norm = self.norm2(tgt_flat)
-                # 2D (N, N) additive mask — broadcast over B*d_slots and n_heads
-                tgt_mask = torch.zeros(N, N, dtype=tokens.dtype, device=tokens.device)
-                if n_support < N:
-                    tgt_mask[:, n_support:] = float("-inf")
-                tgt_flat = (
-                    tgt_flat
-                    + self.inst_attn(tgt_norm, tgt_norm, tgt_norm, attn_mask=tgt_mask)[
-                        0
-                    ]
-                )
-
-            tokens_s[:, self.p_max :, :, :] = tgt_flat.reshape(B, d_slots, N, D)
+            tgt_norm = self.norm2(tgt_flat)
+            tgt_flat = (
+                tgt_flat
+                + self.inst_attn(tgt_norm, tgt_norm, tgt_norm, attn_mask=inst_mask)[0]
+            )
+            tokens_s[:, self.num_cls + self.p_max :, :, :] = tgt_flat.reshape(
+                B, d_slots, N, D
+            )
 
         tokens = tokens_s.permute(0, 2, 1, 3)  # back to (B, N, S, D)
 
@@ -293,7 +263,7 @@ class TransformerBlock(nn.Module):
         t = t + self.ffn(self.norm3(t))
         tokens = t.reshape(B, N, S, D)
 
-        return tokens, cls
+        return tokens
 
 
 # ---------------------------------------------------------------------------
@@ -374,10 +344,10 @@ class CopulaTransformer(nn.Module):
         # Learnable mask tokens θ_mask[j] for query target positions
         self.mask_tokens = nn.Parameter(torch.zeros(d_max, d_model))
 
-        # ---- CLS tokens for dataset-level covariance context ----------------
+        # ---- CLS tokens: per-instance summary tokens prepended to S dimension -
         self.num_cls = 4
-        # (num_cls, d_max, d_model) — per (CLS token, target slot) learned start
-        self.cls_tokens = nn.Parameter(torch.empty(self.num_cls, d_max, d_model))
+        # (num_cls, d_model) — same initialization broadcast to all instances/batch
+        self.cls_tokens = nn.Parameter(torch.empty(self.num_cls, d_model))
 
         # ---- Transformer body -----------------------------------------------
         self.blocks = nn.ModuleList(
@@ -390,11 +360,11 @@ class CopulaTransformer(nn.Module):
         )
 
         # ---- Readout heads --------------------------------------------------
-        self.fc_mu = nn.Linear(d_model, 1)  # → mu scalar per (query, dim)
-        self.fc_d = nn.Linear(d_model, 1)  # → log-variance scalar
-        # V head conditioned on [query_tgt || cls_concat]: (1 + num_cls) * d_model → rank_max
-        # Single linear (no intermediate projection — avoids redundant linear composition)
-        self.fc_V = nn.Linear((1 + self.num_cls) * d_model, rank_max)
+        # All three heads conditioned on [query_tgt || cls_tiled]: (1 + num_cls) * d_model
+        head_in = (1 + self.num_cls) * d_model
+        self.fc_mu = nn.Linear(head_in, 1)
+        self.fc_d = nn.Linear(head_in, 1)
+        self.fc_V = nn.Linear(head_in, rank_max)
 
         # ---- Store configuration -------------------------------------------
         self.p_max = p_max
@@ -428,7 +398,7 @@ class CopulaTransformer(nn.Module):
         nn.init.normal_(self.mask_tokens, std=0.01)
         nn.init.zeros_(self.type_enc)
 
-        # CLS tokens: trunc_normal breaks 4-token symmetry at init
+        # CLS tokens: trunc_normal breaks num_cls-token symmetry; same for all rows/batches
         nn.init.trunc_normal_(self.cls_tokens, std=0.02)
 
         nn.init.normal_(self.fc_mu.weight, std=0.01)
@@ -437,8 +407,7 @@ class CopulaTransformer(nn.Module):
         nn.init.normal_(self.fc_d.weight, std=0.01)
         nn.init.zeros_(self.fc_d.bias)
 
-        # fc_V is now wider ((1+num_cls)*D → rank_max): same non-zero init to
-        # avoid the Woodbury saddle where V=0 kills both gradient terms
+        # fc_V: non-zero init avoids the Woodbury saddle where V=0 kills both gradient terms
         nn.init.normal_(self.fc_V.weight, std=0.02)
         nn.init.zeros_(self.fc_V.bias)
 
@@ -524,40 +493,39 @@ class CopulaTransformer(nn.Module):
         tokens = torch.cat([feat_tok, tgt_tok], dim=2)  # (B, N, S, d_model)
 
         # ------------------------------------------------------------------
-        # 4. Transformer blocks
+        # 4. Prepend CLS tokens and run transformer blocks
         # ------------------------------------------------------------------
-        # CLS tokens are sliced to actual d and expanded to batch size.
-        # clone() is needed because blocks update cls in-place via residual adds.
-        cls = self.cls_tokens[:, :d, :].unsqueeze(0).expand(B, -1, -1, -1).clone()
-        # (B, num_cls, d, d_model)
+        # CLS tokens: (num_cls, D) → (B, N, num_cls, D) via expand.
+        # expand (not repeat/clone) ensures gradients sum over B×N back to the
+        # shared (num_cls, D) parameter automatically.
+        cls_exp = self.cls_tokens.unsqueeze(0).unsqueeze(0).expand(B, N, -1, -1)
+        tokens = torch.cat([cls_exp, tokens], dim=2)  # (B, N, num_cls+S, D)
 
         for block in self.blocks:
-            tokens, cls = block(tokens, n_support, p=p_eff, cls=cls)
+            tokens = block(tokens, n_support, p=p_eff)
 
         # ------------------------------------------------------------------
-        # 5. Readout from query target tokens
+        # 5. Readout from query target tokens + per-instance CLS tokens
         # ------------------------------------------------------------------
-        # Target tokens occupy slots p_max .. p_max+d-1
+        # Token layout after prepend: [cls_0..cls_{k-1}, feat_0..feat_{p-1}, tgt_0..tgt_{d-1}]
         # Query instances are at rows n_support .. N-1
-        query_tgt = tokens[:, n_support:, self.p_max :, :]  # (B, n_query, d, d_model)
+        query_tgt = tokens[
+            :, n_support:, self.num_cls + self.p_max :, :
+        ]  # (B, n_query, d, D)
+        query_cls = tokens[:, n_support:, : self.num_cls, :]  # (B, n_query, num_cls, D)
 
-        mu_Z = self.fc_mu(query_tgt).squeeze(-1)  # (B, n_query, d)
-        s_Z = F.softplus(self.fc_d(query_tgt).squeeze(-1)) + 1e-4  # (B, n_query, d)
-
-        # CLS: (B, num_cls, d, D) → concatenate num_cls tokens per slot → (B, 1, d, num_cls*D)
-        cls_concat = cls.permute(0, 2, 1, 3).reshape(
-            B, 1, d, self.num_cls * self.d_model
-        )
-        cls_expanded = cls_concat.expand(
+        # Tile CLS over d target dimensions for the shared readout input
+        cls_concat = query_cls.reshape(B, n_query, self.num_cls * self.d_model)
+        cls_tiled = cls_concat.unsqueeze(2).expand(
             B, n_query, d, -1
         )  # (B, n_query, d, num_cls*D)
+        head_in = torch.cat(
+            [query_tgt, cls_tiled], dim=-1
+        )  # (B, n_query, d, (1+num_cls)*D)
 
-        # Single linear head over [query_tgt || cls] — no intermediate projection
-        U = self.fc_V(
-            torch.cat(
-                [query_tgt, cls_expanded], dim=-1
-            )  # (B, n_query, d, (1+num_cls)*D)
-        )[..., :r]  # (B, n_query, d, r)
+        mu_Z = self.fc_mu(head_in).squeeze(-1)  # (B, n_query, d)
+        s_Z = F.softplus(self.fc_d(head_in).squeeze(-1)) + 1e-4  # (B, n_query, d)
+        U = self.fc_V(head_in)[..., :r]  # (B, n_query, d, r)
 
         U_sq_norm = (U**2).sum(dim=-1)  # (B, n_query, d)
         C_diag = 1.0 / (1.0 + U_sq_norm)  # (B, n_query, d)
