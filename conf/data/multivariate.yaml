@@ -8,7 +8,7 @@
 p_range: [20, 20]
 
 # Target dimension range: y_i in R^d
-d_range: [4,4]
+d_range: [8,8]
 
 # Context (train) and query (test) sizes
 n_train_range: [64, 64]
@@ -55,7 +55,7 @@ kernel_nugget: 1.0e-4 # jitter added to diagonal for strict PD
 # ---------------------------------------------------------------------------
 # Validation grid: fixed episodes regenerated each eval call
 # ---------------------------------------------------------------------------
-val_d_list: [4]
-val_n_train_list: [200]
-val_n_test: 10
-val_batch: 4          # B per grid point
+val_d_list: [8]
+val_n_train_list: [64]
+val_n_test: 16
+val_batch: 8          # B per grid point

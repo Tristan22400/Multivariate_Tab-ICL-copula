@@ -597,3 +597,469 @@ def build_copula_transformer(cfg) -> CopulaTransformer:
     )
 
     return model
+
+
+# ---------------------------------------------------------------------------
+# CopulaTabICLv2 — 3-stage architecture faithful to TabICLv2 (Qu et al., 2026)
+# ---------------------------------------------------------------------------
+
+
+class InducingPointBlock(nn.Module):
+    """Stage 1 (TF_col) block: two-phase cross-attention through M inducing points.
+
+    Each block owns its own ``inducing_points`` parameter of shape (M, d_model).
+    In ``forward`` these are expanded to (B_cols, M, d_model) where
+    B_cols = B × n_cols, so each (batch, column) pair gets an independent copy
+    that evolves within the block without cross-block state.
+
+    Phase 1 aggregates N row representations into M inducing vectors.
+    Phase 2 broadcasts the updated inducing state back to data.
+    A SwiGLU FFN is applied to the updated data.
+
+    Complexity per column: O(N·M) instead of O(N²).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_inducing: int,
+        d_ff: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.inducing_points = nn.Parameter(torch.empty(n_inducing, d_model))
+        # Phase 1: inducing ← data
+        self.norm_d1 = RMSNorm(d_model)
+        self.norm_i1 = RMSNorm(d_model)
+        self.ca_i_from_d = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True
+        )
+        # Phase 2: data ← inducing
+        self.norm_d2 = RMSNorm(d_model)
+        self.norm_i2 = RMSNorm(d_model)
+        self.ca_d_from_i = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True
+        )
+        # FFN on data
+        self.norm_ffn = RMSNorm(d_model)
+        self.ffn = SwiGLUFFN(d_model, d_ff, dropout=dropout)
+
+    def forward(self, data: torch.Tensor) -> torch.Tensor:
+        """Apply one inducing-point block.
+
+        Args:
+            data : (B_cols, N, d_model) — B_cols = B × n_cols.
+
+        Returns:
+            Updated data of the same shape.
+        """
+        B_cols = data.shape[0]
+        # Expand own inducing points to cover every (batch, column) independently
+        ind = self.inducing_points.unsqueeze(0).expand(B_cols, -1, -1)
+
+        # Phase 1: inducing reads from data
+        ind_out, _ = self.ca_i_from_d(
+            self.norm_i1(ind), self.norm_d1(data), self.norm_d1(data)
+        )
+        ind = ind + ind_out
+
+        # Phase 2: data reads from updated inducing
+        data_out, _ = self.ca_d_from_i(
+            self.norm_d2(data), self.norm_i2(ind), self.norm_i2(ind)
+        )
+        data = data + data_out
+
+        # FFN on data
+        data = data + self.ffn(self.norm_ffn(data))
+        return data
+
+
+class RowAggregatorBlock(nn.Module):
+    """Stage 2 (TF_row) block: standard non-causal pre-norm transformer.
+
+    Processes per-row token sequences of shape (B*N, S, d_model) where
+    S = n_cls + p_max. All tokens within a row attend freely (no masking).
+    """
+
+    def __init__(
+        self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.0
+    ) -> None:
+        super().__init__()
+        self.norm1 = RMSNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True
+        )
+        self.norm2 = RMSNorm(d_model)
+        self.ffn = SwiGLUFFN(d_model, d_ff, dropout=dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Args:
+        x : (B_N, S, d_model) — flattened batch×instance token sequences.
+        """
+        x_n = self.norm1(x)
+        x = x + self.attn(x_n, x_n, x_n)[0]
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class ICLBlock(nn.Module):
+    """Stage 3 (TF_icl) block: row-level ICL with instance-awareness masking.
+
+    Operates on row embeddings (B, N, d_icl) where d_icl = n_cls * d_model.
+    Test rows (n_support..N-1) are blocked as keys so they are never attended to.
+    The (N, N) attn_mask broadcasts over B automatically with batch_first=True.
+    """
+
+    def __init__(
+        self, d_icl: int, n_heads: int, d_ff: int, dropout: float = 0.0
+    ) -> None:
+        super().__init__()
+        self.norm1 = RMSNorm(d_icl)
+        self.attn = nn.MultiheadAttention(
+            d_icl, n_heads, dropout=dropout, batch_first=True
+        )
+        self.norm2 = RMSNorm(d_icl)
+        self.ffn = SwiGLUFFN(d_icl, d_ff, dropout=dropout)
+
+    def forward(self, x: torch.Tensor, n_support: int) -> torch.Tensor:
+        """Args:
+        x         : (B, N, d_icl).
+        n_support : number of support instances.
+        """
+        N = x.shape[1]
+        mask = torch.zeros(N, N, dtype=x.dtype, device=x.device)
+        if n_support < N:
+            mask[:, n_support:] = float("-inf")
+
+        x_n = self.norm1(x)
+        x = x + self.attn(x_n, x_n, x_n, attn_mask=mask)[0]
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class _MLP2(nn.Module):
+    """Two-layer MLP with GELU activation: Linear → GELU → Linear."""
+
+    def __init__(self, d_in: int, d_hidden: int, d_out: int) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(d_in, d_hidden)
+        self.fc2 = nn.Linear(d_hidden, d_out)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(F.gelu(self.fc1(x)))
+
+
+class CopulaTabICLv2(nn.Module):
+    """CopulaTabICLv2 — 3-stage architecture adapted from TabICLv2 for copula modelling.
+
+    Adapts the TabICLv2 architecture (Qu et al., 2026) to the Phase-2 copula learning
+    setting: given support (X, Z) pairs and query X vectors, predict per-query low-rank
+    Gaussian parameters in Z-space.
+
+        p(Z_q | X_all, Z_support) = N(mu_Z, diag(d_Z) + V_Z V_Z^T)
+
+    **Stage 1 — TF_col** (column-wise, N rows per column):
+      The Z target of each support row is embedded first (Embed_TAE(Z_i) → d_model)
+      and added to all p_max feature token positions before Stage 1.  Then each of
+      the p_max feature columns is processed independently via inducing-point
+      cross-attention (Perceiver/Set-Transformer style, O(N·M) per column).
+      Each InducingPointBlock owns its own inducing points expanded to (B*p_max, M, D).
+
+    **Stage 2 — TF_row** (row-wise, n_cls + p_max tokens):
+      Four learnable [CLS] tokens are prepended to each row's p_max column embeddings
+      and processed by a non-causal transformer.  Concatenated CLS outputs form a
+      fixed d_icl = n_cls * d_model = 512-dimensional row embedding.
+
+    **Stage 3 — TF_icl** (instance-level ICL, d_icl-dim row embeddings):
+      Support row embeddings receive Embed_ICL(Z_i) injection.  An ICL transformer
+      with instance-awareness masking processes all N row embeddings; test instances
+      attend only to support instances.
+
+    Readout: a 2-layer MLP (d_icl → 1024 → d_max) for each of mu/d/V.
+
+    Args:
+        d_model    : TF_col / TF_row model dimension (default 128).
+        n_heads    : attention heads for all stages (default 8).
+        n_layers_s1: Stage 1 InducingPointBlock layers (default 3).
+        n_layers_s2: Stage 2 RowAggregatorBlock layers (default 3).
+        n_layers_s3: Stage 3 ICLBlock layers (default 6).
+        n_inducing : inducing vectors per InducingPointBlock (default 128).
+        n_cls      : [CLS] tokens; d_icl = n_cls * d_model (default 4).
+        p_max      : maximum number of input feature columns (default 20).
+        d_max      : maximum number of target dimensions (default 8).
+        rank       : low-rank factor size r; None → max(1, floor(sqrt(d))).
+        d_ff       : SwiGLU hidden size for Stage 1/2; None → nearest 64 above 8/3*d.
+        dropout    : dropout probability (default 0.0).
+    """
+
+    def __init__(
+        self,
+        d_model: int = 128,
+        n_heads: int = 8,
+        n_layers_s1: int = 3,
+        n_layers_s2: int = 3,
+        n_layers_s3: int = 6,
+        n_inducing: int = 128,
+        n_cls: int = 4,
+        p_max: int = 20,
+        d_max: int = 8,
+        rank: Optional[int] = None,
+        d_ff: Optional[int] = None,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        if d_ff is None:
+            d_ff = max(round(8 / 3 * d_model / 64) * 64, 64)
+
+        d_icl: int = n_cls * d_model  # Stage 3 dim (e.g. 512)
+        d_ff_icl: int = max(round(8 / 3 * d_icl / 64) * 64, 64)
+        d_ff_head: int = 1024
+        rank_max: int = max(1, int(math.sqrt(d_max))) if rank is None else rank
+
+        # ---- Target-aware embeddings (computed before feature embedding) ------
+        # Embed_TAE: Z_sup → d_model (added to X feature tokens before Stage 1)
+        self.embed_tae = nn.Linear(d_max, d_model)
+        # Embed_ICL: Z_sup → d_icl (added to support row embeddings before Stage 3)
+        self.embed_icl = nn.Linear(d_max, d_icl)
+
+        # ---- Feature embedding -----------------------------------------------
+        self.phi_X = nn.Linear(1, d_model, bias=False)
+
+        # ---- Stage 1: TF_col — per-column inducing-point blocks ---------------
+        # Each block owns its own inducing_points; no shared state across blocks
+        self.s1_blocks = nn.ModuleList(
+            [
+                InducingPointBlock(d_model, n_heads, n_inducing, d_ff, dropout)
+                for _ in range(n_layers_s1)
+            ]
+        )
+
+        # ---- Stage 2: TF_row — row-wise aggregation via CLS tokens ------------
+        self.cls_tokens = nn.Parameter(torch.empty(n_cls, d_model))
+        self.s2_blocks = nn.ModuleList(
+            [
+                RowAggregatorBlock(d_model, n_heads, d_ff, dropout)
+                for _ in range(n_layers_s2)
+            ]
+        )
+        self.s2_norm = RMSNorm(d_model)
+
+        # ---- Stage 3: TF_icl — ICL over d_icl-dim row embeddings -------------
+        self.s3_blocks = nn.ModuleList(
+            [ICLBlock(d_icl, n_heads, d_ff_icl, dropout) for _ in range(n_layers_s3)]
+        )
+        self.s3_norm = RMSNorm(d_icl)
+
+        # ---- Readout heads (2-layer MLPs) ------------------------------------
+        self.fc_mu = _MLP2(d_icl, d_ff_head, d_max)
+        self.fc_d = _MLP2(d_icl, d_ff_head, d_max)
+        self.fc_V = _MLP2(d_icl, d_ff_head, d_max * rank_max)
+
+        # ---- Config ----------------------------------------------------------
+        self.p_max = p_max
+        self.d_max = d_max
+        self.n_cls = n_cls
+        self.d_icl = d_icl
+        self.rank = rank
+        self.rank_max = rank_max
+        self.d_model = d_model
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.trunc_normal_(self.cls_tokens, std=0.02)
+        for block in self.s1_blocks:
+            nn.init.trunc_normal_(block.inducing_points, std=0.02)
+        nn.init.normal_(self.embed_tae.weight, std=0.02)
+        nn.init.zeros_(self.embed_tae.bias)
+        nn.init.normal_(self.embed_icl.weight, std=0.02)
+        nn.init.zeros_(self.embed_icl.bias)
+        for mlp in (self.fc_mu, self.fc_d):
+            nn.init.normal_(mlp.fc1.weight, std=0.01)
+            nn.init.zeros_(mlp.fc1.bias)
+            nn.init.normal_(mlp.fc2.weight, std=0.01)
+            nn.init.zeros_(mlp.fc2.bias)
+        # fc_V: non-zero init avoids V=0 saddle in Woodbury NLL
+        nn.init.normal_(self.fc_V.fc1.weight, std=0.02)
+        nn.init.zeros_(self.fc_V.fc1.bias)
+        nn.init.normal_(self.fc_V.fc2.weight, std=0.02)
+        nn.init.zeros_(self.fc_V.fc2.bias)
+
+    def forward(
+        self,
+        X_all: torch.Tensor,
+        Z_all: torch.Tensor,
+        n_support: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict conditional low-rank Gaussian parameters for query instances.
+
+        Args:
+            X_all     : (B, N, p) — feature vectors for all N instances.
+            Z_all     : (B, N, d) — Z values; only first n_support rows observed.
+            n_support : number of support instances.
+
+        Returns:
+            mu_Z : (B, n_query, d)    — conditional mean.
+            d_Z  : (B, n_query, d)    — diagonal variance.
+            V_Z  : (B, n_query, d, r) — low-rank factor.
+        """
+        B, N, p = X_all.shape
+        d = Z_all.shape[-1]
+        n_query = N - n_support
+
+        if self.rank is None:
+            r = max(1, int(math.sqrt(d)))
+        else:
+            r = self.rank
+        r = min(r, self.rank_max)
+
+        # ------------------------------------------------------------------
+        # 0. Target-aware embedding: computed BEFORE feature embedding
+        # ------------------------------------------------------------------
+        Z_sup = Z_all[:, :n_support, :]
+        if d < self.d_max:
+            Z_sup_pad = F.pad(Z_sup, (0, self.d_max - d))  # (B, n_sup, d_max)
+        else:
+            Z_sup_pad = Z_sup
+
+        tae = self.embed_tae(Z_sup_pad)  # (B, n_sup, d_model)
+        icl_emb = self.embed_icl(Z_sup_pad)  # (B, n_sup, d_icl)
+
+        # ------------------------------------------------------------------
+        # 1. Feature embedding
+        # ------------------------------------------------------------------
+        if p > self.p_max:
+            X_in = X_all[..., : self.p_max]
+        elif p < self.p_max:
+            X_in = F.pad(X_all, (0, self.p_max - p))
+        else:
+            X_in = X_all
+
+        E1 = self.phi_X(X_in.unsqueeze(-1))  # (B, N, p_max, d_model)
+
+        # Add target-aware embedding to all feature tokens of support rows
+        E2 = E1.clone()
+        E2[:, :n_support, :, :] = E2[:, :n_support, :, :] + tae.unsqueeze(2)
+
+        # ------------------------------------------------------------------
+        # 2. Stage 1: TF_col — column-wise inducing-point attention
+        # ------------------------------------------------------------------
+        # Each column processed independently: (B, N, p_max, D) → (B*p_max, N, D)
+        B_cols = B * self.p_max
+        data = E2.permute(0, 2, 1, 3).reshape(B_cols, N, self.d_model)
+
+        for block in self.s1_blocks:
+            data = block(data)  # inducing points are internal to each block
+
+        # (B*p_max, N, D) → (B, N, p_max, D)
+        feat_emb = data.reshape(B, self.p_max, N, self.d_model).permute(0, 2, 1, 3)
+
+        # ------------------------------------------------------------------
+        # 3. Stage 2: TF_row — row-wise aggregation via CLS tokens
+        # ------------------------------------------------------------------
+        cls_exp = self.cls_tokens.unsqueeze(0).unsqueeze(0).expand(B, N, -1, -1)
+        row_tok = torch.cat([cls_exp, feat_emb], dim=2)  # (B, N, n_cls+p_max, D)
+        S = row_tok.shape[2]
+        row_tok = row_tok.reshape(B * N, S, self.d_model)
+
+        for block in self.s2_blocks:
+            row_tok = block(row_tok)
+
+        row_tok = row_tok.reshape(B, N, S, self.d_model)
+        cls_out = self.s2_norm(row_tok[:, :, : self.n_cls, :])  # (B, N, n_cls, D)
+        row_emb = cls_out.reshape(B, N, self.d_icl)  # (B, N, d_icl)
+
+        # ------------------------------------------------------------------
+        # 4. Stage 3: TF_icl — ICL over row embeddings
+        # ------------------------------------------------------------------
+        row_emb = row_emb.clone()
+        row_emb[:, :n_support, :] = row_emb[:, :n_support, :] + icl_emb
+
+        for block in self.s3_blocks:
+            row_emb = block(row_emb, n_support)
+
+        row_emb = self.s3_norm(row_emb)
+
+        # ------------------------------------------------------------------
+        # 5. Readout: 2-layer MLP on query row embeddings
+        # ------------------------------------------------------------------
+        query_emb = row_emb[:, n_support:, :]  # (B, n_query, d_icl)
+
+        mu_Z_all = self.fc_mu(query_emb)  # (B, n_query, d_max)
+        s_Z_all = F.softplus(self.fc_d(query_emb)) + 1e-4  # (B, n_query, d_max)
+        U_all = self.fc_V(query_emb).reshape(
+            B, n_query, self.d_max, self.rank_max
+        )  # (B, n_query, d_max, r_max)
+
+        # Slice to actual (d, r) and apply Woodbury reparameterisation
+        mu_Z = mu_Z_all[..., :d]
+        s_Z = s_Z_all[..., :d]
+        U = U_all[..., :d, :r]
+
+        U_sq_norm = (U**2).sum(dim=-1)
+        C_diag = 1.0 / (1.0 + U_sq_norm)
+        W = U / torch.sqrt(1.0 + U_sq_norm.unsqueeze(-1))
+        d_Z = (s_Z**2) * C_diag
+        V_Z = s_Z.unsqueeze(-1) * W
+
+        return mu_Z, d_Z, V_Z
+
+
+def build_copula_tabicl_v2(cfg) -> CopulaTabICLv2:
+    """Instantiate a CopulaTabICLv2 from a Hydra DictConfig.
+
+    Expected config keys under ``cfg.model``:
+
+    ==================  ======================================================
+    Key                 Description
+    ==================  ======================================================
+    d_model             TF_col / TF_row embedding dimension.
+    n_heads             Attention heads for all stages.
+    n_layers_s1         Stage 1 InducingPointBlock layers.
+    n_layers_s2         Stage 2 RowAggregatorBlock layers.
+    n_layers_s3         Stage 3 ICLBlock layers.
+    n_inducing          Number of inducing vectors per InducingPointBlock.
+    n_cls               Number of [CLS] tokens; d_icl = n_cls * d_model.
+    p_max               Maximum number of input features.
+    d_max               Maximum number of target dimensions.
+    rank                Low-rank factor size r. Pass *null* for sqrt(d) auto.
+    d_ff                (optional) SwiGLU hidden size for Stage 1/2; None=auto.
+    dropout             (optional, default 0.0) Dropout probability.
+    ==================  ======================================================
+    """
+    mcfg = cfg.model
+
+    rank: Optional[int] = None if mcfg.rank is None else int(mcfg.rank)
+    d_ff: Optional[int] = (
+        int(mcfg.d_ff) if getattr(mcfg, "d_ff", None) is not None else None
+    )
+    dropout: float = float(getattr(mcfg, "dropout", 0.0))
+
+    model = CopulaTabICLv2(
+        d_model=int(mcfg.d_model),
+        n_heads=int(mcfg.n_heads),
+        n_layers_s1=int(mcfg.n_layers_s1),
+        n_layers_s2=int(mcfg.n_layers_s2),
+        n_layers_s3=int(mcfg.n_layers_s3),
+        n_inducing=int(mcfg.n_inducing),
+        n_cls=int(mcfg.n_cls),
+        p_max=int(mcfg.p_max),
+        d_max=int(mcfg.d_max),
+        rank=rank,
+        d_ff=d_ff,
+        dropout=dropout,
+    )
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(
+        f"[CopulaTabICLv2] d_model={mcfg.d_model}  d_icl={model.d_icl}  "
+        f"n_heads={mcfg.n_heads}  "
+        f"s1={mcfg.n_layers_s1}/s2={mcfg.n_layers_s2}/s3={mcfg.n_layers_s3}  "
+        f"n_inducing={mcfg.n_inducing}  n_cls={mcfg.n_cls}  "
+        f"p_max={mcfg.p_max}  d_max={mcfg.d_max}  rank={rank}  "
+        f"|  params={n_params:,}"
+    )
+
+    return model

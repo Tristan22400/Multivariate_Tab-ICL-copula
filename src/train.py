@@ -53,10 +53,10 @@ sys.path.insert(0, _HERE)
 
 from sklearn.covariance import OAS
 
-from data_gen import GlobalAnchorCovGen, GlobalFixedNets, build_val_suite
+from data_gen import GlobalAnchorCovGen, GlobalFixedNets, KernelCovGen, build_val_suite
 from dataset import infinite_episode_iter, make_episode_loader
 from loss import energy_score, marginal_nll, woodbury_nll
-from model import build_copula_transformer
+from model import build_copula_tabicl_v2
 from viz import plot_prediction_comparison
 
 # ---------------------------------------------------------------------------
@@ -251,7 +251,7 @@ def run_validation(
 
             # Full MLE covariance + OAS — loop over batch elements (sklearn works on 2-D)
             full_mle_nlls, oas_nlls = [], []
-            ep_sigma_oas = None
+            ep_sigma_oas_list: list[np.ndarray] = []
             for b in range(B):
                 Z_tr_b_np = Z_tr[b].cpu().numpy()  # (n_train, d)
                 Z_te_b = Z_te[b]  # (n_test, d)
@@ -276,8 +276,8 @@ def run_validation(
                     Sigma_oas, mu_oas, n_test, device
                 )
                 oas_nlls.append(woodbury_nll(Z_te_b, mu_p, d_p, V_p).item())
-                if b == 0 and do_plot and ep_sigma_oas is None:
-                    ep_sigma_oas = oas.covariance_
+                if do_plot:
+                    ep_sigma_oas_list.append(oas.covariance_.copy())
 
             agg["val/full_mle_nll"].append(float(np.mean(full_mle_nlls)))
             agg["val/oas_nll"].append(float(np.mean(oas_nlls)))
@@ -386,7 +386,7 @@ def run_validation(
                         "mu_true": ep["oracle_mu"].to(device),
                         "D_true": ep["oracle_D"].to(device),
                         "V_true": ep["oracle_V"].to(device),
-                        "sigma_oas": ep_sigma_oas,
+                        "sigma_oas_list": ep_sigma_oas_list,
                         "n_test": n_test,
                     }
                 )
@@ -421,6 +421,11 @@ def run_validation(
         if len(plot_episodes) == 1 and B0 >= 2:
             # Single episode: compare batch element 0 vs 1
             for b_idx in range(2):
+                sigma_oas_b = (
+                    ep0["sigma_oas_list"][b_idx]
+                    if b_idx < len(ep0["sigma_oas_list"])
+                    else None
+                )
                 fig = plot_prediction_comparison(
                     mu_pred=ep0["mu_pred"],
                     D_pred=ep0["D_pred"],
@@ -430,12 +435,15 @@ def run_validation(
                     V_true=ep0["V_true"],
                     batch_idx=b_idx,
                     n_instances=n_inst,
-                    sigma_oas=ep0["sigma_oas"],
+                    sigma_oas=sigma_oas_b,
                     dataset_label=f"{ep0['key']} — batch {b_idx}",
                 )
                 plot_figs.append(fig)
         else:
             for ep_data in plot_episodes:
+                sigma_oas_b = (
+                    ep_data["sigma_oas_list"][0] if ep_data["sigma_oas_list"] else None
+                )
                 fig = plot_prediction_comparison(
                     mu_pred=ep_data["mu_pred"],
                     D_pred=ep_data["D_pred"],
@@ -444,7 +452,7 @@ def run_validation(
                     D_true=ep_data["D_true"],
                     V_true=ep_data["V_true"],
                     n_instances=n_inst,
-                    sigma_oas=ep_data["sigma_oas"],
+                    sigma_oas=sigma_oas_b,
                     dataset_label=f"Dataset: {ep_data['key']}",
                 )
                 plot_figs.append(fig)
@@ -525,7 +533,7 @@ def main(cfg: DictConfig) -> None:
         )
 
     # ---- Model ----
-    model: nn.Module = build_copula_transformer(cfg).to(device)
+    model: nn.Module = build_copula_tabicl_v2(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters : {n_params:,}")
 
@@ -549,11 +557,18 @@ def main(cfg: DictConfig) -> None:
         _data_tag = Path(cfg.training.dataset_dir).name
         _lr = cfg.training.lr
         _lr_str = f"{_lr:.0e}".replace("e-0", "e-").replace("e+0", "e")
+        _n_layers = getattr(
+            cfg.model,
+            "n_layers",
+            f"s1={getattr(cfg.model, 'n_layers_s1', '?')}"
+            f"s2={getattr(cfg.model, 'n_layers_s2', '?')}"
+            f"s3={getattr(cfg.model, 'n_layers_s3', '?')}",
+        )
         _run_name = (
             f"lr={_lr_str}"
             f"_steps={cfg.training.steps}"
             f"_d={cfg.model.d_model}"
-            f"_L={cfg.model.n_layers}"
+            f"_L={_n_layers}"
             f"_H={cfg.model.n_heads}"
             f"_r={cfg.model.rank}"
             f"_data={_data_tag}"
@@ -598,6 +613,7 @@ def main(cfg: DictConfig) -> None:
     mlp_hidden = int(cfg.data.mlp_hidden)
     fixed_nets: GlobalFixedNets | None = None
     anchor_gen: GlobalAnchorCovGen | None = None
+    kernel_cov_gen: KernelCovGen | None = None
     if not fixed_cov:
         cov_type = str(cfg.data.get("cov_type", "mlp"))
         if cov_type == "anchor":
@@ -606,6 +622,13 @@ def main(cfg: DictConfig) -> None:
                 r=r_data,
                 tau=float(cfg.data.get("anchor_temp", 1.0)),
                 device=device,
+            )
+        elif cov_type == "kernel":
+            kernel_cov_gen = KernelCovGen(
+                kernel_type=str(cfg.data.get("kernel_type", "random")),
+                latent_dim=int(cfg.data.get("kernel_latent_dim", 1)),
+                mlp_hidden=mlp_hidden,
+                nugget=float(cfg.data.get("kernel_nugget", 1e-4)),
             )
         else:
             fixed_nets = GlobalFixedNets(r=r_data, hidden=mlp_hidden, device=device)
@@ -616,6 +639,7 @@ def main(cfg: DictConfig) -> None:
         device,
         fixed_nets=fixed_nets,
         anchor_gen=anchor_gen,
+        kernel_cov_gen=kernel_cov_gen,
     )
     print(f"Validation suite: {len(val_suite)} episodes  ({list(val_suite.keys())})")
 

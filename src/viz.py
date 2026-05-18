@@ -173,10 +173,10 @@ def plot_prediction_comparison(
         ax.legend(fontsize=8)
 
         # ------------------------------------------------------------------ #
-        # Column 4: OAS covariance heatmap or absolute mean error             #
+        # Column 4: OAS covariance heatmap (first row only) or mean error    #
         # ------------------------------------------------------------------ #
         ax = axes[row, 4]
-        if sigma_oas is not None:
+        if sigma_oas is not None and row == 0:
             oas_max = max(np.abs(sigma_oas).max(), cov_max)
             oas_heatmap_kw = dict(
                 cmap="coolwarm", center=0, vmin=-oas_max, vmax=oas_max, square=True
@@ -185,7 +185,7 @@ def plot_prediction_comparison(
                 sns.heatmap(sigma_oas, ax=ax, **oas_heatmap_kw)
             else:
                 ax.imshow(sigma_oas, cmap="coolwarm", vmin=-oas_max, vmax=oas_max)
-            ax.set_title(r"OAS $\hat{\Sigma}_{OAS}$")
+            ax.set_title(r"OAS $\hat{\Sigma}_{OAS}$ (global baseline)")
         else:
             if mu_baseline is not None:
                 mu_b = mu_baseline[batch_idx, inst_idx].detach().cpu().numpy()
