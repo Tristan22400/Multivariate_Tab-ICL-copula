@@ -301,9 +301,11 @@ def run_val_pit(
             # copula NLLs, but the Jacobian correction makes them comparable to val/copula_nll
             # under the reasonable approximation that Z marginals are approximately N(0,1).
             oas_copula_ep = float(np.mean(oas_nlls)) - indep_z
+            knn5_copula_ep = float(np.mean(knn5_nlls)) - indep_z
+            linear_copula_ep = float(np.mean(linear_nlls)) - indep_z
             agg["val/oas_nll"].append(oas_copula_ep)
-            agg["val/knn5_cov_nll"].append(float(np.mean(knn5_nlls)) - indep_z)
-            agg["val/linear_factor_nll"].append(float(np.mean(linear_nlls)) - indep_z)
+            agg["val/knn5_cov_nll"].append(knn5_copula_ep)
+            agg["val/linear_factor_nll"].append(linear_copula_ep)
 
             # ---- Oracle copula NLL in Z-space: 1/2 log|ρ| + 1/2 z^T(ρ^{-1}-I)z ----
             # ρ = corr(Σ_Y) is the correlation matrix derived from the oracle Y-space covariance.
@@ -329,7 +331,7 @@ def run_val_pit(
             # hetero_gain: I_z cancels in this difference — same numerical value as before
             agg["val/hetero_gain"].append(oas_copula_ep - oracle_copula_z)
             # vs_knn5: I_z cancels — same numerical value as before
-            agg["val/vs_knn5"].append(cnll - (float(np.mean(knn5_nlls)) - indep_z))
+            agg["val/vs_knn5"].append(cnll - knn5_copula_ep)
             # oracle_frac: 0 = model at oracle copula NLL,  1 = model at N(0,I) prior (copula NLL = 0)
             # prior copula NLL = 0 since R=I gives 1/2 log|I| + 1/2 z^T(I-I)z = 0
             denom = (
@@ -627,13 +629,15 @@ def main(cfg: DictConfig) -> None:
                 wnll = loss.item()
                 mnll = marginal_nll(Z_query, mu_Z, d_Z).item()
                 cnll_train = wnll - indep_normal_nll(Z_query).item()  # copula NLL
-                copula_gain = mnll - wnll   # gain from V over diagonal; I_z cancels
+                copula_gain = mnll - wnll  # gain from V over diagonal; I_z cancels
 
                 oracle_mu = episode["oracle_mu"].to(device)
                 oracle_D = episode["oracle_D"].to(device)
                 oracle_V = episode["oracle_V"].to(device)
                 Y_test = episode["Y_test"].to(device)
-                oracle_nll_y = woodbury_nll(Y_test, oracle_mu, oracle_D, oracle_V).item()
+                oracle_nll_y = woodbury_nll(
+                    Y_test, oracle_mu, oracle_D, oracle_V
+                ).item()
 
                 Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-1, -2)
                 d_dim = Sigma_pred.shape[-1]

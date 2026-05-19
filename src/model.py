@@ -36,7 +36,8 @@ Instance attention masking:
     target tokens carry mask tokens, not observed Z values.  The corresponding
     columns are blocked with -inf.
 
-Readout (query target tokens only) → (mu_Z, d_Z, V_Z) via three linear heads.
+Readout (query target tokens only) → (mu_Z=0, d_Z, V_Z) via a single linear head fc_V.
+mu_Z is fixed at zero and Sigma_ii = 1 (correlation matrix) to satisfy copula constraints.
 """
 
 from __future__ import annotations
