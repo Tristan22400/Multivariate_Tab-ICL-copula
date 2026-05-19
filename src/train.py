@@ -604,9 +604,9 @@ def main(cfg: DictConfig) -> None:
         # ---- Forward pass ----
         model.train()
         mu_Z, d_Z, V_Z = model(X_perm, Z_perm, n_support)
-        # mu_Z: (B, n_query, d)
-        # d_Z:  (B, n_query, d)  — diagonal variance (must be > 0; model applies softplus)
-        # V_Z:  (B, n_query, d, r)
+        # mu_Z: (B, n_query, d)     — zeros (copula: mu = 0)
+        # d_Z:  (B, n_query, d)     — C_diag = 1/(1+||U||^2), ensuring Sigma_ii = 1
+        # V_Z:  (B, n_query, d, r)  — W = U/sqrt(1+||U||^2)
 
         # ---- Loss: Woodbury NLL on query instances ----
         Z_query = Z_perm[:, n_support:, :]  # (B, n_query, d)
@@ -624,23 +624,21 @@ def main(cfg: DictConfig) -> None:
         # ---- Logging ----
         if step % int(cfg.training.log_every) == 0:
             with torch.no_grad():
+                wnll = loss.item()
                 mnll = marginal_nll(Z_query, mu_Z, d_Z).item()
+                cnll_train = wnll - indep_normal_nll(Z_query).item()  # copula NLL
+                copula_gain = mnll - wnll   # gain from V over diagonal; I_z cancels
 
-                # Oracle NLL on test instances: lower bound for model NLL.
-                # oracle_mu/D/V: (B, n_test, d) / (B, n_test, d) / (B, n_test, d, r)
                 oracle_mu = episode["oracle_mu"].to(device)
                 oracle_D = episode["oracle_D"].to(device)
                 oracle_V = episode["oracle_V"].to(device)
                 Y_test = episode["Y_test"].to(device)
-                oracle_nll = woodbury_nll(Y_test, oracle_mu, oracle_D, oracle_V).item()
+                oracle_nll_y = woodbury_nll(Y_test, oracle_mu, oracle_D, oracle_V).item()
 
-                # Mean absolute off-diagonal covariance variance across query instances.
-                # Computed for both model predictions and oracle.
                 Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-1, -2)
                 d_dim = Sigma_pred.shape[-1]
                 ri, ci = torch.triu_indices(d_dim, d_dim, offset=1, device=device)
                 off_diag_pred = Sigma_pred[..., ri, ci]
-
                 pred_off_diag_var = off_diag_pred.var(dim=1).mean().item()
 
                 Sigma_oracle = torch.diag_embed(
@@ -649,14 +647,12 @@ def main(cfg: DictConfig) -> None:
                 off_diag_oracle = Sigma_oracle[..., ri, ci]
                 oracle_off_diag_var = off_diag_oracle.var(dim=1).mean().item()
 
-            wnll = loss.item()
-            ratio = wnll / (mnll + 1e-8)
             lr_now = scheduler.get_last_lr()[0]
             elapsed = time.perf_counter() - t0
 
             print(
-                f"[step {step:>6d}]  loss={wnll:.4f}  marginal_nll={mnll:.4f}  "
-                f"oracle_nll={oracle_nll:.4f}  nll_ratio={ratio:.4f}  "
+                f"[step {step:>6d}]  copula_nll={cnll_train:.4f}  "
+                f"copula_gain={copula_gain:.4f}  oracle_y={oracle_nll_y:.4f}  "
                 f"pred_var={pred_off_diag_var:.4e}  oracle_var={oracle_off_diag_var:.4e}  "
                 f"lr={lr_now:.2e}  elapsed={elapsed:.1f}s"
             )
@@ -664,10 +660,9 @@ def main(cfg: DictConfig) -> None:
             if wandb_run is not None:
                 wandb_run.log(
                     {
-                        "train/woodbury_nll": wnll,
-                        "train/marginal_nll": mnll,
-                        "train/oracle_nll": oracle_nll,
-                        "train/nll_ratio": ratio,
+                        "train/copula_nll": cnll_train,
+                        "train/copula_gain": copula_gain,
+                        "train/oracle_nll_y": oracle_nll_y,
                         "train/pred_off_diag_var": pred_off_diag_var,
                         "train/oracle_off_diag_var": oracle_off_diag_var,
                         "train/lr": lr_now,
