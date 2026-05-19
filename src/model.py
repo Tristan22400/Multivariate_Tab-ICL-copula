@@ -44,6 +44,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -524,7 +525,7 @@ class CopulaTransformer(nn.Module):
         )  # (B, n_query, d, (1+num_cls)*D)
 
         mu_Z = self.fc_mu(head_in).squeeze(-1)  # (B, n_query, d)
-        s_Z = F.softplus(self.fc_d(head_in).squeeze(-1)) + 1e-4  # (B, n_query, d)
+        s_Z = torch.ones(B, n_query, d, dtype=head_in.dtype, device=head_in.device)  # (B, n_query, d)
         U = self.fc_V(head_in)[..., :r]  # (B, n_query, d, r)
 
         U_sq_norm = (U**2).sum(dim=-1)  # (B, n_query, d)
