@@ -11,7 +11,7 @@ p_range: [20, 20]
 d_range: [8,8]
 
 # Context (train) and query (test) sizes
-n_train_range: [64, 64]
+n_train_range: [256,256]
 n_test_range: [16, 16]
 
 # Low-rank factor r used in DATA generation (ground truth covariance rank)
@@ -52,10 +52,3 @@ kernel_type: random
 kernel_latent_dim: 1  # dimension of latent embeddings e_j for each output dim
 kernel_nugget: 1.0e-4 # jitter added to diagonal for strict PD
 
-# ---------------------------------------------------------------------------
-# Validation grid: fixed episodes regenerated each eval call
-# ---------------------------------------------------------------------------
-val_d_list: [8]
-val_n_train_list: [64]
-val_n_test: 16
-val_batch: 8          # B per grid point
