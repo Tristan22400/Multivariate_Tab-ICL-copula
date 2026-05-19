@@ -38,10 +38,13 @@ from torch.utils.data import DataLoader, Dataset
 class EpisodeDataset(Dataset):
     """Maps episode index → loaded dict from a pre-generated .pt file."""
 
-    def __init__(self, dataset_dir: str) -> None:
-        self.files = sorted(glob.glob(os.path.join(dataset_dir, "episode_*.pt")))
+    def __init__(self, dataset_dir: str | None = None, files: list[str] | None = None) -> None:
+        if files is not None:
+            self.files = files
+        else:
+            self.files = sorted(glob.glob(os.path.join(dataset_dir, "episode_*.pt")))
         if not self.files:
-            raise FileNotFoundError(f"No episode_*.pt files found in {dataset_dir!r}")
+            raise FileNotFoundError(f"No episode_*.pt files found")
 
     def __len__(self) -> int:
         return len(self.files)
@@ -57,13 +60,27 @@ def _collate_episode(batch: list[dict]) -> dict:
     return batch[0]
 
 
+def split_episode_files(dataset_dir: str, val_n_episodes: int) -> tuple[list[str], list[str]]:
+    """Split episode files into (train_files, val_files).
+
+    Holds out the last val_n_episodes files for validation so they are never
+    seen during training, ensuring no distribution shift.
+    """
+    files = sorted(glob.glob(os.path.join(dataset_dir, "episode_*.pt")))
+    if not files:
+        raise FileNotFoundError(f"No episode_*.pt files found in {dataset_dir!r}")
+    n_val = min(val_n_episodes, len(files) - 1)
+    return files[:-n_val], files[-n_val:]
+
+
 def make_episode_loader(
-    dataset_dir: str,
+    dataset_dir: str | None = None,
     shuffle: bool = True,
     num_workers: int = 2,
+    files: list[str] | None = None,
 ) -> DataLoader:
     """Return a DataLoader that yields one pre-generated episode dict per iteration."""
-    dataset = EpisodeDataset(dataset_dir)
+    dataset = EpisodeDataset(dataset_dir=dataset_dir, files=files)
     return DataLoader(
         dataset,
         batch_size=1,
