@@ -178,6 +178,39 @@ def woodbury_nll(
 
 
 # ---------------------------------------------------------------------------
+# Independent standard-normal NLL — Jacobian correction for copula reporting
+# ---------------------------------------------------------------------------
+
+
+def indep_normal_nll(z: torch.Tensor) -> torch.Tensor:
+    """Mean NLL of i.i.d. N(0,1) at z.  Subtract from woodbury_nll to get the
+    true Gaussian copula NLL as derived from Sklar's theorem:
+
+        copula_nll = woodbury_nll(z; mu=0, R) - indep_normal_nll(z)
+
+    Derivation: the Gaussian copula density is
+
+        c(u) = phi_R(z) / prod_j phi(z_j)
+
+    so  -log c(u) = -log phi_R(z) + sum_j log phi(z_j)
+                  = woodbury_nll(z; 0, R) - d/2 log(2pi) - 1/2 ||z||^2.
+
+    The subtracted term equals indep_normal_nll(z) = d/2 log(2pi) + 1/2 ||z||^2.
+    It is constant w.r.t. model parameters (z is fixed after the PIT), so
+    woodbury_nll and copula_nll yield identical gradients — this function is
+    for reporting only.
+
+    Args:
+        z : (B, N, d) or (B, d) — Z-space observations (probit-PIT outputs).
+
+    Returns:
+        Scalar averaged over all instances.
+    """
+    d_size = z.shape[-1]
+    return 0.5 * (d_size * math.log(2.0 * math.pi) + (z**2).sum(-1)).mean()
+
+
+# ---------------------------------------------------------------------------
 # Marginal NLL  (diagonal-only baseline, V ignored)
 # ---------------------------------------------------------------------------
 

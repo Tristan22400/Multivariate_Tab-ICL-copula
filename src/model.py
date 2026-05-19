@@ -44,7 +44,6 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -360,11 +359,10 @@ class CopulaTransformer(nn.Module):
             ]
         )
 
-        # ---- Readout heads --------------------------------------------------
-        # All three heads conditioned on [query_tgt || cls_tiled]: (1 + num_cls) * d_model
+        # ---- Readout head ---------------------------------------------------
+        # Only fc_V is needed: mu_Z = 0 and Sigma_ii = 1 (copula constraints).
+        # head_in = (1 + num_cls) * d_model
         head_in = (1 + self.num_cls) * d_model
-        self.fc_mu = nn.Linear(head_in, 1)
-        self.fc_d = nn.Linear(head_in, 1)
         self.fc_V = nn.Linear(head_in, rank_max)
 
         # ---- Store configuration -------------------------------------------
@@ -384,31 +382,17 @@ class CopulaTransformer(nn.Module):
     def _init_weights(self) -> None:
         """Apply custom weight initialisations.
 
-        • mask_tokens  : small random noise — avoids a symmetric saddle
-                         point while keeping initial queries nearly neutral.
-        • type_enc     : zero-init — will be learned from gradient signal.
-        • fc_mu, fc_d  : small weight init (std=0.01) — keeps initial
-                         predictions near zero / unit variance.
-        • fc_V         : small non-zero init (std=0.02) — V=0 is a saddle of the
-                         Woodbury NLL (both gradient terms vanish: d/dV[log|D+VV^T|]
-                         = 2 D^{-1} V = 0, and the quadratic Woodbury correction
-                         also vanishes). Zero-init traps the model at this saddle
-                         indefinitely. Non-zero init places V in a region where
-                         gradients are non-zero from the first step.
+        • mask_tokens : small random noise — avoids symmetric saddle point.
+        • type_enc    : zero-init — learned from gradient signal.
+        • fc_V        : non-zero init (std=0.02) — V=0 is a saddle of the copula
+                        NLL; gradients vanish at V=0 for both the log-det and
+                        quadratic terms. Non-zero init escapes this saddle.
         """
         nn.init.normal_(self.mask_tokens, std=0.01)
         nn.init.zeros_(self.type_enc)
 
-        # CLS tokens: trunc_normal breaks num_cls-token symmetry; same for all rows/batches
         nn.init.trunc_normal_(self.cls_tokens, std=0.02)
 
-        nn.init.normal_(self.fc_mu.weight, std=0.01)
-        nn.init.zeros_(self.fc_mu.bias)
-
-        nn.init.normal_(self.fc_d.weight, std=0.01)
-        nn.init.zeros_(self.fc_d.bias)
-
-        # fc_V: non-zero init avoids the Woodbury saddle where V=0 kills both gradient terms
         nn.init.normal_(self.fc_V.weight, std=0.02)
         nn.init.zeros_(self.fc_V.bias)
 
@@ -432,10 +416,10 @@ class CopulaTransformer(nn.Module):
             n_support : number of support instances (leading rows of dim-1).
 
         Returns:
-            mu_Z : (B, n_query, d)     — conditional mean.
-            d_Z  : (B, n_query, d)     — diagonal variance (strictly positive,
-                                         parameterised via softplus + eps).
-            V_Z  : (B, n_query, d, r)  — low-rank factor rows.
+            mu_Z : (B, n_query, d)     — zero (copula mean is fixed at 0).
+            d_Z  : (B, n_query, d)     — diagonal of correlation matrix; equals
+                                         1/(1 + ||U_i||^2), ensuring Sigma_ii = 1.
+            V_Z  : (B, n_query, d, r)  — low-rank factor; W_i = U_i/sqrt(1+||U_i||^2).
         """
         B, N, p = X_all.shape
         d = Z_all.shape[-1]
@@ -524,16 +508,33 @@ class CopulaTransformer(nn.Module):
             [query_tgt, cls_tiled], dim=-1
         )  # (B, n_query, d, (1+num_cls)*D)
 
-        mu_Z = self.fc_mu(head_in).squeeze(-1)  # (B, n_query, d)
-        s_Z = torch.ones(B, n_query, d, dtype=head_in.dtype, device=head_in.device)  # (B, n_query, d)
+        # ---- Copula constraint: mu_Z = 0, Sigma_ii = 1 ----------------------
+        # After the probit-PIT, z_{i,j} = Phi^{-1}(F_j(y_{i,j}|x_i)) has
+        # standard-normal marginals by construction: E[z_j|x_i] = 0 and
+        # Var[z_j|x_i] = 1.  The Gaussian copula density
+        #
+        #   -log c(u) = 1/2 log|R| + 1/2 z^T (R^{-1} - I) z
+        #
+        # requires R to be a correlation matrix (R_{ii} = 1, mu = 0).
+        # Fixing s_Z = 1 enforces this: Sigma_ii = s_Z^2 * (C_diag + ||W_i||^2)
+        #                                         = 1 * 1 = 1.
+        # mu_Z = 0 because the marginals are already perfectly standardised.
+
+        mu_Z = torch.zeros(B, n_query, d, dtype=X_all.dtype, device=X_all.device)
+
+        # s_Z = 1 (correlation matrix constraint)
+        s_Z = torch.ones(B, n_query, d, dtype=head_in.dtype, device=head_in.device)
         U = self.fc_V(head_in)[..., :r]  # (B, n_query, d, r)
 
+        # Woodbury decomposition of the correlation matrix R = diag(C_diag) + W W^T
+        # C_diag_i = 1/(1+||U_i||^2),  W_i = U_i/sqrt(1+||U_i||^2)
+        # => R_{ii} = C_diag_i + ||W_i||^2 = 1  (verified by construction)
         U_sq_norm = (U**2).sum(dim=-1)  # (B, n_query, d)
         C_diag = 1.0 / (1.0 + U_sq_norm)  # (B, n_query, d)
         W = U / torch.sqrt(1.0 + U_sq_norm.unsqueeze(-1))  # (B, n_query, d, r)
 
-        d_Z = (s_Z**2) * C_diag  # (B, n_query, d)
-        V_Z = s_Z.unsqueeze(-1) * W  # (B, n_query, d, r)
+        d_Z = (s_Z**2) * C_diag  # (B, n_query, d)  = C_diag since s_Z = 1
+        V_Z = s_Z.unsqueeze(-1) * W  # (B, n_query, d, r)  = W since s_Z = 1
 
         return mu_Z, d_Z, V_Z
 
@@ -853,9 +854,8 @@ class CopulaTabICLv2(nn.Module):
         )
         self.s3_norm = RMSNorm(d_icl)
 
-        # ---- Readout heads (2-layer MLPs) ------------------------------------
-        self.fc_mu = _MLP2(d_icl, d_ff_head, d_max)
-        self.fc_d = _MLP2(d_icl, d_ff_head, d_max)
+        # ---- Readout head (2-layer MLP) --------------------------------------
+        # Only fc_V is needed: mu_Z = 0 and Sigma_ii = 1 (copula constraints).
         self.fc_V = _MLP2(d_icl, d_ff_head, d_max * rank_max)
 
         # ---- Config ----------------------------------------------------------
@@ -877,12 +877,8 @@ class CopulaTabICLv2(nn.Module):
         nn.init.zeros_(self.embed_tae.bias)
         nn.init.normal_(self.embed_icl.weight, std=0.02)
         nn.init.zeros_(self.embed_icl.bias)
-        for mlp in (self.fc_mu, self.fc_d):
-            nn.init.normal_(mlp.fc1.weight, std=0.01)
-            nn.init.zeros_(mlp.fc1.bias)
-            nn.init.normal_(mlp.fc2.weight, std=0.01)
-            nn.init.zeros_(mlp.fc2.bias)
-        # fc_V: non-zero init avoids V=0 saddle in Woodbury NLL
+        # fc_V: non-zero init avoids V=0 saddle in the copula NLL (gradients
+        # vanish at V=0 for both the log-det and quadratic Woodbury terms)
         nn.init.normal_(self.fc_V.fc1.weight, std=0.02)
         nn.init.zeros_(self.fc_V.fc1.bias)
         nn.init.normal_(self.fc_V.fc2.weight, std=0.02)
@@ -988,22 +984,40 @@ class CopulaTabICLv2(nn.Module):
         # ------------------------------------------------------------------
         query_emb = row_emb[:, n_support:, :]  # (B, n_query, d_icl)
 
-        mu_Z_all = self.fc_mu(query_emb)  # (B, n_query, d_max)
-        s_Z_all = F.softplus(self.fc_d(query_emb)) + 1e-4  # (B, n_query, d_max)
         U_all = self.fc_V(query_emb).reshape(
             B, n_query, self.d_max, self.rank_max
         )  # (B, n_query, d_max, r_max)
 
-        # Slice to actual (d, r) and apply Woodbury reparameterisation
-        mu_Z = mu_Z_all[..., :d]
-        s_Z = s_Z_all[..., :d]
+        # Slice to actual (d, r) and apply Woodbury reparameterisation.
+        #
+        # Copula constraints: mu_Z = 0 and Sigma_ii = 1 (correlation matrix).
+        # After the probit-PIT, z_{i,j} = Phi^{-1}(F_j(y_{i,j}|x_i)) has
+        # standard-normal marginals: E[z_j|x_i] = 0 and Var[z_j|x_i] = 1.
+        # The Gaussian copula density is
+        #
+        #   -log c(u) = 1/2 log|R| + 1/2 z^T (R^{-1} - I) z
+        #
+        # which requires R to be a correlation matrix (R_{ii} = 1, mu = 0).
+        # Setting s_Z = 1 enforces this:
+        #   Sigma_ii = s_Z^2 * (C_diag_i + ||W_i||^2) = 1 * 1 = 1.
+
+        mu_Z = torch.zeros(
+            B, n_query, d, dtype=query_emb.dtype, device=query_emb.device
+        )
+
+        # s_Z = 1 (correlation matrix constraint, kept explicit for clarity)
+        s_Z = torch.ones(B, n_query, d, dtype=query_emb.dtype, device=query_emb.device)
         U = U_all[..., :d, :r]
 
-        U_sq_norm = (U**2).sum(dim=-1)
-        C_diag = 1.0 / (1.0 + U_sq_norm)
-        W = U / torch.sqrt(1.0 + U_sq_norm.unsqueeze(-1))
-        d_Z = (s_Z**2) * C_diag
-        V_Z = s_Z.unsqueeze(-1) * W
+        # Woodbury decomposition: R = diag(C_diag) + W W^T
+        # C_diag_i = 1/(1+||U_i||^2),  W_i = U_i/sqrt(1+||U_i||^2)
+        # => R_{ii} = C_diag_i + ||W_i||^2 = 1  (verified by construction)
+        U_sq_norm = (U**2).sum(dim=-1)  # (B, n_query, d)
+        C_diag = 1.0 / (1.0 + U_sq_norm)  # (B, n_query, d)
+        W = U / torch.sqrt(1.0 + U_sq_norm.unsqueeze(-1))  # (B, n_query, d, r)
+
+        d_Z = (s_Z**2) * C_diag  # = C_diag since s_Z = 1
+        V_Z = s_Z.unsqueeze(-1) * W  # = W since s_Z = 1
 
         return mu_Z, d_Z, V_Z
 

@@ -54,7 +54,7 @@ sys.path.insert(0, _HERE)
 from sklearn.covariance import OAS
 
 from dataset import infinite_episode_iter, make_episode_loader, split_episode_files
-from loss import energy_score, marginal_nll, woodbury_nll
+from loss import energy_score, indep_normal_nll, marginal_nll, woodbury_nll
 from model import build_copula_tabicl_v2
 from viz import plot_prediction_comparison
 
@@ -117,33 +117,36 @@ def run_val_pit(
     device: str,
     do_plot: bool = False,
 ) -> dict[str, float]:
-    """Validate on held-out PIT episodes in Z-space (PIT), same as training.
+    """Validate on held-out PIT episodes.  All NLL metrics are in copula-NLL units.
 
-    All core metrics are in Z-space so val/woodbury_nll and val/train_nll are
-    directly comparable to train/woodbury_nll logged during training steps.
+    Let I_z = indep_normal_nll(Z) = d/2 log(2π) + 1/2 ||z||² (Jacobian correction).
+    Every metric is copula_nll = woodbury_nll - I_z  so that the Sklar decomposition
+    holds exactly:   joint_y_nll = copula_nll + marginal_nll.
 
     Metrics:
-        val/woodbury_nll     — model NLL on Z_test with full context (100% support)
-        val/train_nll        — model NLL on Z_train with 70/30 split (mirrors training loss)
-        val/marginal_nll     — model NLL ignoring V (diagonal only)
-        val/nll_ratio        — woodbury / marginal
-        val/prior_nll        — N(0,I) baseline (floor for Z-space NLL)
-        val/oas_nll          — OAS shrinkage covariance baseline
-        val/knn5_cov_nll     — k=5 nearest-neighbour covariance baseline
-        val/linear_factor_nll — linear x→mean + global residual covariance
-        val/oracle_nll_z     — oracle lower bound in Z-space via N(0, corr(Σ_Y))
-        val/oracle_nll       — oracle lower bound in Y-space (reference)
-        val/hetero_gain      — oas_nll - oracle_nll_z (how much x_i matters, Z-space)
-        val/vs_knn5          — woodbury_nll - knn5_cov_nll (< 0 means model wins)
-        val/oracle_frac      — (woodbury - oracle_z) / (prior - oracle_z)
+        val/copula_nll        — model copula NLL on Z_test (full context)
+        val/joint_y_nll       — copula_nll + marginal_nll = full joint NLL in Y-space
+        val/train_nll         — model copula NLL on Z_train 70/30 split (overfitting check)
+        val/marginal_nll      — diagonal-only copula NLL (V=0 baseline)
+        val/copula_gain       — marginal_nll - copula_nll ≥ 0 (gain from V component)
+        val/oas_nll           — OAS baseline copula NLL (≈ woodbury_nll_oas - I_z)
+        val/knn5_cov_nll      — kNN-5 baseline copula NLL
+        val/linear_factor_nll — linear-factor baseline copula NLL
+        val/oracle_nll_z      — oracle copula NLL in Z-space via N(0, corr(Σ_Y)) - I_z
+        val/oracle_nll        — oracle full joint NLL in Y-space (direct reference for joint_y_nll)
+        val/hetero_gain       — oas_nll - oracle_nll_z  (how much x_i structure matters)
+        val/vs_knn5           — copula_nll - knn5_cov_nll  (< 0 means model beats kNN-5)
+        val/oracle_frac       — (copula_nll - oracle_nll_z) / (0 - oracle_nll_z)
+                                  0 = model at oracle,  1 = model at N(0,I) prior
+        val/energy_score      — Energy Score (sample quality, independent of NLL units)
     """
     model.eval()
     agg: dict[str, list[float]] = {
-        "val/woodbury_nll": [],
+        "val/copula_nll": [],
+        "val/joint_y_nll": [],
         "val/train_nll": [],
         "val/marginal_nll": [],
-        "val/nll_ratio": [],
-        "val/prior_nll": [],
+        "val/copula_gain": [],
         "val/oas_nll": [],
         "val/knn5_cov_nll": [],
         "val/linear_factor_nll": [],
@@ -158,50 +161,77 @@ def run_val_pit(
 
     with torch.no_grad():
         for i_ep, ep in enumerate(val_episodes):
-            X_tr = ep["X_train"].to(device)   # (B, n_train, p)
-            Z_tr = ep["Z_train"].to(device)   # (B, n_train, d) — PIT
-            Z_te = ep["Z_test"].to(device)    # (B, n_test,  d) — PIT
+            X_tr = ep["X_train"].to(device)  # (B, n_train, p)
+            Z_tr = ep["Z_train"].to(device)  # (B, n_train, d) — PIT
+            Z_te = ep["Z_test"].to(device)  # (B, n_test,  d) — PIT
             X_te = ep["X_test"].to(device)
+            log_p_te = ep["log_p_test"].to(
+                device
+            )  # (B, n_test,  d) — marginal log-densities
             oracle_mu = ep["oracle_mu"].to(device)
-            oracle_D  = ep["oracle_D"].to(device)
-            oracle_V  = ep["oracle_V"].to(device)
-            Y_test    = ep["Y_test"].to(device)
+            oracle_D = ep["oracle_D"].to(device)
+            oracle_V = ep["oracle_V"].to(device)
+            Y_test = ep["Y_test"].to(device)
 
             B, n_train, _ = Z_tr.shape
-            _, n_test, d  = Z_te.shape
+            _, n_test, d = Z_te.shape
 
             # ---- Model: full context → Z_test ----
             X_all = torch.cat([X_tr, X_te], dim=1)
             Z_all = torch.cat([Z_tr, torch.zeros_like(Z_te)], dim=1)
             mu_Z, d_Z, V_Z = model(X_all, Z_all, n_support=n_train)
 
+            # I_z = indep_normal_nll(Z_te) is computed once and reused for all
+            # Jacobian corrections.  copula_nll = woodbury_nll - I_z for every metric.
+            indep_z = indep_normal_nll(Z_te).item()
+
             wnll = woodbury_nll(Z_te, mu_Z, d_Z, V_Z).item()
             mnll = marginal_nll(Z_te, mu_Z, d_Z).item()
-            agg["val/woodbury_nll"].append(wnll)
-            agg["val/marginal_nll"].append(mnll)
-            agg["val/nll_ratio"].append(wnll / (mnll + 1e-8))
-            agg["val/energy_score"].append(float(np.mean([
-                energy_score(
-                    mu=mu_Z[b, i], D=d_Z[b, i], V=V_Z[b, i],
-                    y_ref=Z_te[b, i], n_samples=200,
-                ).item()
-                for b in range(B) for i in range(n_test)
-            ])))
+            cnll = wnll - indep_z  # model copula NLL
+            c_marg = mnll - indep_z  # diagonal-only copula NLL
 
-            # ---- Train NLL: 70/30 split on Z_train (mirrors training loss) ----
+            # Copula gain: improvement from V over diagonal; I_z cancels in the
+            # difference so copula_gain = mnll - wnll = c_marg - cnll >= 0 when V helps.
+            copula_gain = mnll - wnll
+
+            # Full joint NLL in Y-space = copula_nll + sum of marginal log-densities
+            marginal_nll_te = -log_p_te.sum(-1).mean().item()
+            joint_y_nll = cnll + marginal_nll_te
+
+            agg["val/copula_nll"].append(cnll)
+            agg["val/joint_y_nll"].append(joint_y_nll)
+            agg["val/marginal_nll"].append(c_marg)
+            agg["val/copula_gain"].append(copula_gain)
+            agg["val/energy_score"].append(
+                float(
+                    np.mean(
+                        [
+                            energy_score(
+                                mu=mu_Z[b, i],
+                                D=d_Z[b, i],
+                                V=V_Z[b, i],
+                                y_ref=Z_te[b, i],
+                                n_samples=200,
+                            ).item()
+                            for b in range(B)
+                            for i in range(n_test)
+                        ]
+                    )
+                )
+            )
+
+            # ---- Train copula NLL: 70/30 split (overfitting check vs val/copula_nll) ----
             n_sup = max(1, int(0.7 * n_train))
             perm_tr = torch.randperm(n_train, device=device)
             X_tr_perm = X_tr[:, perm_tr, :]
             Z_tr_perm = Z_tr[:, perm_tr, :]
             mu_tr, d_tr, V_tr = model(X_tr_perm, Z_tr_perm, n_support=n_sup)
             Z_query_tr = Z_tr_perm[:, n_sup:, :]
-            agg["val/train_nll"].append(woodbury_nll(Z_query_tr, mu_tr, d_tr, V_tr).item())
-
-            # ---- Prior: N(0, I) ----
-            prior_nll = marginal_nll(
-                Z_te, torch.zeros_like(mu_Z), torch.ones_like(d_Z)
-            ).item()
-            agg["val/prior_nll"].append(prior_nll)
+            train_copula_nll = (
+                woodbury_nll(Z_query_tr, mu_tr, d_tr, V_tr).item()
+                - indep_normal_nll(Z_query_tr).item()
+            )
+            agg["val/train_nll"].append(train_copula_nll)
 
             # ---- OAS + kNN5 + linear baselines ----
             oas_nlls, knn5_nlls, linear_nlls = [], [], []
@@ -215,9 +245,13 @@ def run_val_pit(
 
                 # OAS shrinkage
                 oas = OAS().fit(Z_tr_b_np)
-                Sigma_oas = torch.tensor(oas.covariance_, dtype=torch.float32, device=device)
+                Sigma_oas = torch.tensor(
+                    oas.covariance_, dtype=torch.float32, device=device
+                )
                 mu_oas = torch.tensor(oas.location_, dtype=torch.float32, device=device)
-                mu_p, d_p, V_p = _cov_to_woodbury_params(Sigma_oas, mu_oas, n_test, device)
+                mu_p, d_p, V_p = _cov_to_woodbury_params(
+                    Sigma_oas, mu_oas, n_test, device
+                )
                 oas_nlls.append(woodbury_nll(Z_te_b, mu_p, d_p, V_p).item())
                 if do_plot:
                     ep_sigma_oas_list.append(oas.covariance_.copy())
@@ -237,7 +271,9 @@ def run_val_pit(
                     Sigma_i = 0.5 * (Sigma_i + Sigma_i.T)
                     mu_nb = Z_nb.mean(0)
                     mu_p, d_p, V_p = _cov_to_woodbury_params(Sigma_i, mu_nb, 1, device)
-                    nlls_i.append(woodbury_nll(Z_te_b[i : i + 1], mu_p, d_p, V_p).item())
+                    nlls_i.append(
+                        woodbury_nll(Z_te_b[i : i + 1], mu_p, d_p, V_p).item()
+                    )
                 knn5_nlls.append(float(np.mean(nlls_i)))
 
                 # Linear factor
@@ -252,40 +288,55 @@ def run_val_pit(
                 Sigma_resid = 0.5 * (Sigma_resid + Sigma_resid.T)
                 lin_nlls_i = []
                 for i in range(n_test):
-                    mu_p, d_p, V_p = _cov_to_woodbury_params(Sigma_resid, mu_lin[i], 1, device)
+                    mu_p, d_p, V_p = _cov_to_woodbury_params(
+                        Sigma_resid, mu_lin[i], 1, device
+                    )
                     lin_nlls_i.append(
                         woodbury_nll(Z_te_b[i : i + 1], mu_p, d_p, V_p).item()
                     )
                 linear_nlls.append(float(np.mean(lin_nlls_i)))
 
-            oas_nll_ep = float(np.mean(oas_nlls))
-            agg["val/oas_nll"].append(oas_nll_ep)
-            agg["val/knn5_cov_nll"].append(float(np.mean(knn5_nlls)))
-            agg["val/linear_factor_nll"].append(float(np.mean(linear_nlls)))
+            # Convert baselines from Gaussian NLL to copula NLL units by subtracting I_z.
+            # These baselines fit non-zero mean and free variance, so they are not strict
+            # copula NLLs, but the Jacobian correction makes them comparable to val/copula_nll
+            # under the reasonable approximation that Z marginals are approximately N(0,1).
+            oas_copula_ep = float(np.mean(oas_nlls)) - indep_z
+            agg["val/oas_nll"].append(oas_copula_ep)
+            agg["val/knn5_cov_nll"].append(float(np.mean(knn5_nlls)) - indep_z)
+            agg["val/linear_factor_nll"].append(float(np.mean(linear_nlls)) - indep_z)
 
-            # ---- Oracle NLL in Z-space: N(0, ρ) where ρ = corr(Σ_Y) ----
+            # ---- Oracle copula NLL in Z-space: 1/2 log|ρ| + 1/2 z^T(ρ^{-1}-I)z ----
+            # ρ = corr(Σ_Y) is the correlation matrix derived from the oracle Y-space covariance.
+            # woodbury_nll(z; 0, ρ) = oracle_copula_nll_z + I_z, so we subtract I_z.
             Sigma_Y = torch.diag_embed(oracle_D) + oracle_V @ oracle_V.transpose(-2, -1)
             std_Y = Sigma_Y.diagonal(dim1=-2, dim2=-1).sqrt().clamp(min=1e-8)
             rho = Sigma_Y / (std_Y.unsqueeze(-1) * std_Y.unsqueeze(-2))
-            lam, U = torch.linalg.eigh(rho)
+            lam, U_eig = torch.linalg.eigh(rho)
             _delta = 1e-4
             D_rho = torch.full_like(oracle_D, _delta)
-            V_rho = U * (lam - _delta).clamp(min=0).sqrt().unsqueeze(-2)
-            oracle_nll_z = woodbury_nll(
-                Z_te, torch.zeros_like(oracle_mu), D_rho, V_rho
-            ).item()
-            agg["val/oracle_nll_z"].append(oracle_nll_z)
+            V_rho = U_eig * (lam - _delta).clamp(min=0).sqrt().unsqueeze(-2)
+            oracle_copula_z = (
+                woodbury_nll(Z_te, torch.zeros_like(oracle_mu), D_rho, V_rho).item()
+                - indep_z
+            )
+            agg["val/oracle_nll_z"].append(oracle_copula_z)
 
-            # ---- Oracle NLL in Y-space (reference) ----
+            # ---- Oracle full joint NLL in Y-space ----
             oracle_nll_y = woodbury_nll(Y_test, oracle_mu, oracle_D, oracle_V).item()
             agg["val/oracle_nll"].append(oracle_nll_y)
 
-            # ---- Diagnostic gaps (Z-space) ----
-            agg["val/hetero_gain"].append(oas_nll_ep - oracle_nll_z)
-            agg["val/vs_knn5"].append(wnll - float(np.mean(knn5_nlls)))
-            denom = prior_nll - oracle_nll_z
+            # ---- Diagnostic gaps (all in copula NLL units) ----
+            # hetero_gain: I_z cancels in this difference — same numerical value as before
+            agg["val/hetero_gain"].append(oas_copula_ep - oracle_copula_z)
+            # vs_knn5: I_z cancels — same numerical value as before
+            agg["val/vs_knn5"].append(cnll - (float(np.mean(knn5_nlls)) - indep_z))
+            # oracle_frac: 0 = model at oracle copula NLL,  1 = model at N(0,I) prior (copula NLL = 0)
+            # prior copula NLL = 0 since R=I gives 1/2 log|I| + 1/2 z^T(I-I)z = 0
+            denom = (
+                0.0 - oracle_copula_z
+            )  # = -oracle_copula_z  (oracle < 0 for structured data)
             agg["val/oracle_frac"].append(
-                (wnll - oracle_nll_z) / denom if abs(denom) > 1e-8 else float("nan")
+                (cnll - oracle_copula_z) / denom if abs(denom) > 1e-8 else float("nan")
             )
 
             # ---- Collect up to 2 episodes for the comparison plot ----
@@ -309,13 +360,14 @@ def run_val_pit(
 
     print(
         f"[val step={step:>6d}]  "
-        f"woodbury={metrics['val/woodbury_nll']:.4f}  "
-        f"train_nll={metrics['val/train_nll']:.4f}  "
-        f"oracle_z={metrics['val/oracle_nll_z']:.4f}  "
+        f"copula={metrics['val/copula_nll']:.4f}  "
+        f"joint_y={metrics['val/joint_y_nll']:.4f}  "
         f"oracle_y={metrics['val/oracle_nll']:.4f}  "
-        f"knn5={metrics['val/knn5_cov_nll']:.4f}  "
-        f"linear={metrics['val/linear_factor_nll']:.4f}  "
+        f"oracle_z={metrics['val/oracle_nll_z']:.4f}  "
+        f"train={metrics['val/train_nll']:.4f}  "
+        f"gain={metrics['val/copula_gain']:.4f}  "
         f"oas={metrics['val/oas_nll']:.4f}  "
+        f"knn5={metrics['val/knn5_cov_nll']:.4f}  "
         f"vs_knn5={metrics['val/vs_knn5']:.4f}  "
         f"oracle_frac={metrics['val/oracle_frac']:.4f}"
     )
@@ -372,6 +424,7 @@ def run_val_pit(
     if wandb_run is not None:
         if plot_figs:
             import wandb as _wandb
+
             metrics["val/plot"] = [_wandb.Image(f) for f in plot_figs]
         wandb_run.log(metrics, step=step)
         for f in plot_figs:
@@ -379,7 +432,6 @@ def run_val_pit(
 
     model.train()
     return metrics
-
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +564,9 @@ def main(cfg: DictConfig) -> None:
 
     # ---- Data loader (training episodes only — val episodes held out) ----
     val_n_episodes = int(cfg.training.get("val_n_episodes", 50))
-    train_files, val_files = split_episode_files(cfg.training.dataset_dir, val_n_episodes)
+    train_files, val_files = split_episode_files(
+        cfg.training.dataset_dir, val_n_episodes
+    )
     print(f"Dataset split: {len(train_files)} train / {len(val_files)} val episodes")
 
     loader = make_episode_loader(
@@ -626,9 +680,7 @@ def main(cfg: DictConfig) -> None:
         do_val = step % int(cfg.training.val_every) == 0
         do_plot = step % int(cfg.training.plot_every) == 0
         if do_val or do_plot:
-            run_val_pit(
-                model, val_episodes, step, wandb_run, device, do_plot=do_plot
-            )
+            run_val_pit(model, val_episodes, step, wandb_run, device, do_plot=do_plot)
 
         # ---- Checkpoint ----
         if (
