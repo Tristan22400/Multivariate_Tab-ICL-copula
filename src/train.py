@@ -40,6 +40,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -616,7 +617,44 @@ def main(cfg: DictConfig) -> None:
 
         # ---- Loss: Woodbury NLL on query instances ----
         Z_query = Z_perm[:, n_support:, :]  # (B, n_query, d)
-        loss = woodbury_nll(Z_query, mu_Z, d_Z, V_Z)
+        loss_nll = woodbury_nll(Z_query, mu_Z, d_Z, V_Z)
+        loss = loss_nll
+
+        # ---- Auxiliary off-diagonal MSE loss ----
+        aux_weight = float(cfg.training.get("aux_mse_weight", 0.0))
+        anneal_frac = float(cfg.training.get("aux_mse_anneal_frac", 0.7))
+        progress = min(1.0, step / max(1, anneal_frac * int(cfg.training.steps)))
+        alpha = aux_weight * (1.0 - progress)
+
+        if alpha > 0.0:
+            X_test_ep = episode["X_test"].to(device)  # (B, n_test, p)
+            Z_test_ep = episode["Z_test"].to(
+                device
+            )  # (B, n_test, d) — ignored by model for query positions
+            oracle_D_aux = episode["oracle_D"].to(device)  # (B, n_test, d)
+            oracle_V_aux = episode["oracle_V"].to(device)  # (B, n_test, d, r)
+
+            # Second forward: full X_train as support, X_test as queries
+            X_aux = torch.cat([X_train, X_test_ep], dim=1)  # (B, N+n_test, p)
+            Z_aux = torch.cat([Z_train, Z_test_ep], dim=1)  # (B, N+n_test, d)
+            _, d_Z_te, V_Z_te = model(X_aux, Z_aux, n_support=N)
+            # d_Z_te: (B, n_test, d),  V_Z_te: (B, n_test, d, r)
+
+            # Oracle correlation matrix (normalize Y-space covariance)
+            Sigma_ora = torch.diag_embed(
+                oracle_D_aux
+            ) + oracle_V_aux @ oracle_V_aux.transpose(-1, -2)  # (B, n_test, d, d)
+            std_ora = Sigma_ora.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+            R_ora = Sigma_ora / (std_ora.unsqueeze(-1) * std_ora.unsqueeze(-2))
+
+            # Predicted correlation matrix (diag=1 by Woodbury construction)
+            Sigma_pred_te = torch.diag_embed(d_Z_te) + V_Z_te @ V_Z_te.transpose(-1, -2)
+
+            ri, ci = torch.triu_indices(d, d, offset=1, device=device)
+            loss_mse = F.mse_loss(Sigma_pred_te[..., ri, ci], R_ora[..., ri, ci])
+            loss = loss + alpha * loss_mse
+        else:
+            loss_mse = torch.zeros(1, device=device)
 
         # ---- Backward ----
         optimizer.zero_grad()
@@ -630,7 +668,7 @@ def main(cfg: DictConfig) -> None:
         # ---- Logging ----
         if step % int(cfg.training.log_every) == 0:
             with torch.no_grad():
-                wnll = loss.item()
+                wnll = loss_nll.item()
                 mnll = marginal_nll(Z_query, mu_Z, d_Z).item()
                 cnll_train = wnll - indep_normal_nll(Z_query).item()  # copula NLL
                 copula_gain = mnll - wnll  # gain from V over diagonal; I_z cancels
@@ -658,10 +696,12 @@ def main(cfg: DictConfig) -> None:
             lr_now = scheduler.get_last_lr()[0]
             elapsed = time.perf_counter() - t0
 
+            loss_mse_val = loss_mse.item()
             print(
                 f"[step {step:>6d}]  copula_nll={cnll_train:.4f}  "
                 f"copula_gain={copula_gain:.4f}  oracle_y={oracle_nll_y:.4f}  "
                 f"pred_var={pred_off_diag_var:.4e}  oracle_var={oracle_off_diag_var:.4e}  "
+                f"aux_mse={loss_mse_val:.4e}  alpha={alpha:.3f}  "
                 f"lr={lr_now:.2e}  elapsed={elapsed:.1f}s"
             )
 
@@ -673,6 +713,8 @@ def main(cfg: DictConfig) -> None:
                         "train/oracle_nll_y": oracle_nll_y,
                         "train/pred_off_diag_var": pred_off_diag_var,
                         "train/oracle_off_diag_var": oracle_off_diag_var,
+                        "train/aux_mse": loss_mse_val,
+                        "train/alpha": alpha,
                         "train/lr": lr_now,
                         "step": step,
                     },

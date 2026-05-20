@@ -9,10 +9,12 @@ training:
   device: auto
   batch_size: 8          # B datasets per step (unused if dataset_dir is set; stored in episode)
   steps: 100000
-  lr: 1.0e-4
-  lr_min: 1.0e-7
+  lr: 1.0e-6
+  lr_min: 1.0e-8
   weight_decay: 0.0
   clip_grad_norm: 0.1
+  aux_mse_weight: 1.0        # peak weight for off-diagonal MSE auxiliary loss; set 0 to disable
+  aux_mse_anneal_frac: 0.7   # anneal weight from aux_mse_weight to 0 over this fraction of steps
   log_every: 100
   val_every: 500
   plot_every: 500
