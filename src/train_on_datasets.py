@@ -759,7 +759,7 @@ def main() -> None:
         "NW-Epan": nw_R["epanechnikov"],  # (n_te, d, d)
         "NW-Lap": nw_R["laplace"],  # (n_te, d, d)
         "Attention": R_attn,  # (n_te, d, d)
-        "CT": R_ct,  # (n_te, d, d)
+        "Copula Transformer": R_ct,  # (n_te, d, d)
     }
 
     fig_grid = plot_corr_grid(

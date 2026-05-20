@@ -225,7 +225,11 @@ def run_val_pit(
             perm_tr = torch.randperm(n_train, device=device)
             X_tr_perm = X_tr[:, perm_tr, :]
             Z_tr_perm = Z_tr[:, perm_tr, :]
-            mu_tr, d_tr, V_tr = model(X_tr_perm, Z_tr_perm, n_support=n_sup)
+            # Mask query Z values to zeros — same convention as test evaluation
+            # (lines 181-182), so the model cannot leak query Z into its predictions.
+            Z_tr_input = Z_tr_perm.clone()
+            Z_tr_input[:, n_sup:, :] = 0.0
+            mu_tr, d_tr, V_tr = model(X_tr_perm, Z_tr_input, n_support=n_sup)
             Z_query_tr = Z_tr_perm[:, n_sup:, :]
             train_copula_nll = (
                 woodbury_nll(Z_query_tr, mu_tr, d_tr, V_tr).item()
@@ -243,14 +247,14 @@ def run_val_pit(
                 X_tr_b = X_tr[b]
                 X_te_b = X_te[b]
 
-                # OAS shrinkage
+                # OAS shrinkage — force mu=0 to match the copula assumption N(0,ρ)
+                # and stay comparable to oracle_copula_z which also uses mu=0.
                 oas = OAS().fit(Z_tr_b_np)
                 Sigma_oas = torch.tensor(
                     oas.covariance_, dtype=torch.float32, device=device
                 )
-                mu_oas = torch.tensor(oas.location_, dtype=torch.float32, device=device)
                 mu_p, d_p, V_p = _cov_to_woodbury_params(
-                    Sigma_oas, mu_oas, n_test, device
+                    Sigma_oas, None, n_test, device
                 )
                 oas_nlls.append(woodbury_nll(Z_te_b, mu_p, d_p, V_p).item())
                 if do_plot:
