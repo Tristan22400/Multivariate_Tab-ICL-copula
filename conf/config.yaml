@@ -18,7 +18,7 @@ training:
   plot_every: 500
   save_every: 5000
   ckpt_dir: ./checkpoints
-  dataset_dir: ./data/pit_episodes_kernel_d8-1  # path to pre-computed PIT episodes; required for training
+  dataset_dir: ./data/pit_episodes_kernel_d4_n_train_256  # path to pre-computed PIT episodes; required for training
   val_n_episodes: 50       # number of held-out episodes reserved for validation (never used in training)
 
 dataset:
@@ -34,5 +34,23 @@ tabicl:
   ckpt: tabicl-regressor-v2-20260212.ckpt
   pit_batch_size: 256     # LOO chunk size (reduce if OOM during Phase 1)
   pit_eps: 1.0e-6        # fixed probit clamping epsilon
+
+attn_copula:
+  m: 64                  # hidden dim for feature/row encoders and attention
+  n_heads: 4
+  n_layers: 2            # self-attention depth
+  dropout: 0.15
+  weight_decay: 5.0e-3
+  alpha: 3.0             # tanh scale for Cholesky off-diag entries
+  lambda_min: 1.0e-4
+  lambda_max: 0.9
+  include_outer: true    # include vech(z z^T) in row encoder input
+  steps: 5000
+  lr: 1.0e-3
+  lr_min: 1.0e-6
+  clip_grad: 1.0
+  val_every: 100         # evaluate on held-out val set every N steps
+  patience: 500          # early stopping: stop if no improvement for N steps
+
 
 
