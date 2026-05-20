@@ -144,7 +144,11 @@ def plot_prediction_comparison(
       0 — Oracle  Sigma*    heatmap
       1 — Predicted Sigma   heatmap
       2 — |Sigma* - Sigma|  heatmap
-      3 — OAS Sigma heatmap (if sigma_oas provided, first row only)
+      3 — Row 0: OAS Sigma heatmap (if provided); rows 1+: off-diagonal
+          scatter (predicted vs oracle) with OLS regression line, annotated
+          with Pearson r, slope, and intercept.  A slope < 1 indicates the
+          model under-disperses predictions; a non-zero intercept is a
+          constant offset.  hexbin is used when n_pairs > 30.
 
     Args:
         mu_pred      : (B, N, d)    — unused, kept for API compatibility
@@ -175,6 +179,25 @@ def plot_prediction_comparison(
     n_instances = min(n_instances, N)
     indices = np.linspace(0, N - 1, n_instances, dtype=int)
 
+    # ------------------------------------------------------------------ #
+    # Pre-collect covariance matrices for the off-diagonal scatter        #
+    # ------------------------------------------------------------------ #
+    all_sigma_pred: list[np.ndarray] = []
+    all_sigma_true: list[np.ndarray] = []
+    for inst_idx in indices:
+        Sp_V = V_pred[batch_idx, inst_idx]
+        Sp_D = torch.diag(D_pred[batch_idx, inst_idx])
+        all_sigma_pred.append((Sp_D + Sp_V @ Sp_V.T).detach().cpu().numpy())
+        St_V = V_true[batch_idx, inst_idx]
+        St_D = torch.diag(D_true[batch_idx, inst_idx])
+        all_sigma_true.append((St_D + St_V @ St_V.T).detach().cpu().numpy())
+
+    d = all_sigma_pred[0].shape[0]
+    tri_r, tri_c = np.triu_indices(d, k=1)  # upper-triangle off-diagonal indices
+    # Shapes: (n_instances, n_pairs)
+    pred_off = np.stack([s[tri_r, tri_c] for s in all_sigma_pred])
+    true_off = np.stack([s[tri_r, tri_c] for s in all_sigma_true])
+
     created_fig = fig is None
     if created_fig:
         fig = plt.figure(figsize=(20, 5 * n_instances))
@@ -185,16 +208,8 @@ def plot_prediction_comparison(
         axes = axes[np.newaxis, :]
 
     for row, inst_idx in enumerate(indices):
-        # ------------------------------------------------------------------ #
-        # Covariance matrices                                                  #
-        # ------------------------------------------------------------------ #
-        Sp_V = V_pred[batch_idx, inst_idx]  # (d, r)
-        Sp_D = torch.diag(D_pred[batch_idx, inst_idx])  # (d, d)
-        Sigma_pred = (Sp_D + Sp_V @ Sp_V.T).detach().cpu().numpy()
-
-        St_V = V_true[batch_idx, inst_idx]
-        St_D = torch.diag(D_true[batch_idx, inst_idx])
-        Sigma_true = (St_D + St_V @ St_V.T).detach().cpu().numpy()
+        Sigma_pred = all_sigma_pred[row]
+        Sigma_true = all_sigma_true[row]
 
         cov_max = max(np.abs(Sigma_true).max(), np.abs(Sigma_pred).max())
         heatmap_kw = dict(
@@ -224,21 +239,62 @@ def plot_prediction_comparison(
         axes[row, 2].set_title(rf"$|\Sigma^* - \hat{{\Sigma}}|$ (inst {inst_idx})")
 
         # ------------------------------------------------------------------ #
-        # Column 3: OAS covariance heatmap (first row only)                  #
+        # Column 3: OAS (row 0) or off-diagonal scatter with OLS (rows 1+)   #
         # ------------------------------------------------------------------ #
         ax = axes[row, 3]
-        if sigma_oas is not None and row == 0:
-            oas_max = max(np.abs(sigma_oas).max(), cov_max)
-            oas_heatmap_kw = dict(
-                cmap="coolwarm", center=0, vmin=-oas_max, vmax=oas_max, square=True
-            )
-            if sns is not None:
-                sns.heatmap(sigma_oas, ax=ax, **oas_heatmap_kw)
+        if row == 0:
+            if sigma_oas is not None:
+                oas_max = max(np.abs(sigma_oas).max(), cov_max)
+                oas_heatmap_kw = dict(
+                    cmap="coolwarm", center=0, vmin=-oas_max, vmax=oas_max, square=True
+                )
+                if sns is not None:
+                    sns.heatmap(sigma_oas, ax=ax, **oas_heatmap_kw)
+                else:
+                    ax.imshow(sigma_oas, cmap="coolwarm", vmin=-oas_max, vmax=oas_max)
+                ax.set_title(r"OAS $\hat{\Sigma}_{OAS}$ (global baseline)")
             else:
-                ax.imshow(sigma_oas, cmap="coolwarm", vmin=-oas_max, vmax=oas_max)
-            ax.set_title(r"OAS $\hat{\Sigma}_{OAS}$ (global baseline)")
+                ax.axis("off")
         else:
-            ax.axis("off")
+            # Off-diagonal scatter: predicted vs oracle, with OLS regression.
+            # slope < 1  → model under-disperses (regresses to mean)
+            # intercept ≠ 0 → constant offset bias
+            x = true_off[row]  # oracle off-diagonal entries
+            y = pred_off[row]  # predicted off-diagonal entries
+            n_pairs = len(x)
+
+            if n_pairs > 30:
+                ax.hexbin(x, y, gridsize=20, cmap="Blues", mincnt=1)
+            else:
+                ax.scatter(x, y, alpha=0.6, s=20, color="steelblue", linewidths=0)
+
+            # OLS regression line
+            slope, intercept = np.polyfit(x, y, 1) if x.std() > 1e-8 else (1.0, 0.0)
+            x_lo, x_hi = x.min(), x.max()
+            x_line = np.array([x_lo, x_hi])
+            ax.plot(x_line, slope * x_line + intercept, "r-", lw=1.5, label="OLS fit")
+
+            # Identity reference
+            lim = max(np.abs(x).max(), np.abs(y).max(), 1e-8) * 1.15
+            ax.plot([-lim, lim], [-lim, lim], "k--", lw=0.8, alpha=0.35, label="y=x")
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.axhline(0, color="gray", lw=0.4, ls=":")
+            ax.axvline(0, color="gray", lw=0.4, ls=":")
+
+            r = (
+                float(np.corrcoef(x, y)[0, 1])
+                if x.std() > 1e-8 and y.std() > 1e-8
+                else float("nan")
+            )
+            ax.set_title(
+                rf"Off-diag pred vs oracle (inst {inst_idx})"
+                + f"\n$r={r:.2f}$  slope$={slope:.2f}$  $b={intercept:.3f}$",
+                fontsize=7,
+            )
+            ax.set_xlabel(r"Oracle $\Sigma^*_{ij}$", fontsize=7)
+            ax.set_ylabel(r"Predicted $\hat{\Sigma}_{ij}$", fontsize=7)
+            ax.tick_params(labelsize=6)
 
     fig.tight_layout(rect=[0, 0, 1, 0.97] if dataset_label else None)
     return fig
