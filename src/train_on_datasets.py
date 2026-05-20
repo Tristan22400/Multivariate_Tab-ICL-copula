@@ -36,7 +36,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
-from loss import indep_normal_nll, woodbury_nll
 from model import build_copula_tabicl_v2, build_copula_transformer
 from viz import plot_corr_grid, plot_prediction_comparison
 
@@ -669,23 +668,7 @@ def main() -> None:
         d_ct = d_ct.squeeze(0)
         V_ct = V_ct.squeeze(0)
 
-    wnll_ct_z = woodbury_nll(
-        Z_test.unsqueeze(0), mu_ct.unsqueeze(0), d_ct.unsqueeze(0), V_ct.unsqueeze(0)
-    ).item()
-    indep_z = indep_normal_nll(Z_test.unsqueeze(0)).item()
-    nll_ct_z = wnll_ct_z - indep_z
     marginal_nll_te = -log_p_test.sum(dim=-1).mean().item()
-    nll_ct_y = nll_ct_z + marginal_nll_te
-
-    nll_oracle_z = (
-        woodbury_nll(
-            Z_test.unsqueeze(0),
-            oracle_mu.unsqueeze(0),
-            oracle_D.unsqueeze(0),
-            oracle_V.unsqueeze(0),
-        ).item()
-        - indep_z
-    )
 
     # Convert Woodbury params (D, V) → full correlation matrix: R = Corr(diag(D) + VV^T)
     def _woodbury_to_corr(D: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
@@ -697,6 +680,16 @@ def main() -> None:
 
     R_ct = _woodbury_to_corr(d_ct, V_ct)  # (n_te, d, d)
     R_oracle = _woodbury_to_corr(oracle_D, oracle_V)  # (n_te, d, d)
+
+    # Oracle and CT copula NLL — both use copula_nll_full(Z, R) so they are on
+    # the same scale as all other estimators.  The old formula
+    # (woodbury_nll - indep_z) is only equivalent when diag(D) + ||V||² == 1
+    # element-wise, which holds for the CT output (Woodbury reparameterisation)
+    # but NOT for the oracle whose D/V come from the raw data generator.
+    nll_ct_z = copula_nll_full(Z_test, R_ct).item()
+    nll_oracle_z = copula_nll_full(Z_test, R_oracle).item()
+    marginal_nll_te = -log_p_test.sum(dim=-1).mean().item()
+    nll_ct_y = nll_ct_z + marginal_nll_te
 
     # ====================================================================
     # Phase 4 — Log final metrics
