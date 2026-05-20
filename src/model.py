@@ -822,10 +822,16 @@ class CopulaTabICLv2(nn.Module):
         rank_max: int = max(1, int(math.sqrt(d_max))) if rank is None else rank
 
         # ---- Target-aware embeddings (computed before feature embedding) ------
-        # Embed_TAE: Z_sup → d_model (added to X feature tokens before Stage 1)
-        self.embed_tae = nn.Linear(d_max, d_model)
-        # Embed_ICL: Z_sup → d_icl (added to support row embeddings before Stage 3)
-        self.embed_icl = nn.Linear(d_max, d_icl)
+        # Inputs include vech(z z^T) so the model can see pairwise covariance signal
+        # per support instance: e.g. "z_2 * z_5 is large" → dims 2,5 are correlated.
+        # Without outer products the model only sees marginal Z values and cannot
+        # learn which pairs of target dimensions covary.
+        d_vech = d_max * (d_max + 1) // 2
+        self.d_vech = d_vech
+        # Embed_TAE: [Z_sup, vech(Z_sup ⊗ Z_sup)] → d_model
+        self.embed_tae = nn.Linear(d_max + d_vech, d_model)
+        # Embed_ICL: same input → d_icl
+        self.embed_icl = nn.Linear(d_max + d_vech, d_icl)
 
         # ---- Feature embedding -----------------------------------------------
         self.phi_X = nn.Linear(1, d_model, bias=False)
@@ -855,15 +861,23 @@ class CopulaTabICLv2(nn.Module):
         )
         self.s3_norm = RMSNorm(d_icl)
 
+        # ---- Per-dimension conditioning for readout --------------------------
+        # Learnable embedding for each target dimension index, concatenated with
+        # the row embedding before fc_V. This breaks the symmetry that forces all
+        # d rows of U to be identical projections of the same row embedding.
+        d_dim_emb = d_icl // 4  # 128 for default d_icl=512
+        self.dim_emb = nn.Parameter(torch.empty(d_max, d_dim_emb))
+
         # ---- Readout head (2-layer MLP) --------------------------------------
-        # Only fc_V is needed: mu_Z = 0 and Sigma_ii = 1 (copula constraints).
-        self.fc_V = _MLP2(d_icl, d_ff_head, d_max * rank_max)
+        # Input: row embedding (d_icl) + dimension embedding (d_dim_emb)
+        self.fc_V = _MLP2(d_icl + d_dim_emb, d_ff_head, rank_max)
 
         # ---- Config ----------------------------------------------------------
         self.p_max = p_max
         self.d_max = d_max
         self.n_cls = n_cls
         self.d_icl = d_icl
+        self.d_dim_emb = d_icl // 4
         self.rank = rank
         self.rank_max = rank_max
         self.d_model = d_model
@@ -872,17 +886,19 @@ class CopulaTabICLv2(nn.Module):
 
     def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.cls_tokens, std=0.02)
+        nn.init.trunc_normal_(self.dim_emb, std=0.02)
         for block in self.s1_blocks:
             nn.init.trunc_normal_(block.inducing_points, std=0.02)
         nn.init.normal_(self.embed_tae.weight, std=0.02)
         nn.init.zeros_(self.embed_tae.bias)
         nn.init.normal_(self.embed_icl.weight, std=0.02)
         nn.init.zeros_(self.embed_icl.bias)
-        # fc_V: non-zero init avoids V=0 saddle in the copula NLL (gradients
-        # vanish at V=0 for both the log-det and quadratic Woodbury terms)
-        nn.init.normal_(self.fc_V.fc1.weight, std=0.02)
+        # fc_V: use std=0.1 (not 0.02) so U starts far enough from zero to
+        # escape the near-diagonal saddle. At U≈0, grad(log|M|)/dV ≈ 2V ≈ 0
+        # and grad(quadratic)/dV ≈ 0, so the model gets no signal to grow V.
+        nn.init.normal_(self.fc_V.fc1.weight, std=0.1)
         nn.init.zeros_(self.fc_V.fc1.bias)
-        nn.init.normal_(self.fc_V.fc2.weight, std=0.02)
+        nn.init.normal_(self.fc_V.fc2.weight, std=0.1)
         nn.init.zeros_(self.fc_V.fc2.bias)
 
     def forward(
@@ -922,8 +938,15 @@ class CopulaTabICLv2(nn.Module):
         else:
             Z_sup_pad = Z_sup
 
-        tae = self.embed_tae(Z_sup_pad)  # (B, n_sup, d_model)
-        icl_emb = self.embed_icl(Z_sup_pad)  # (B, n_sup, d_icl)
+        # Include pairwise outer product vech(z z^T) so the model sees which
+        # target dimensions covary in each support instance.
+        outer = Z_sup_pad.unsqueeze(-1) * Z_sup_pad.unsqueeze(-2)  # (B, n_sup, d_max, d_max)
+        tril_i, tril_j = torch.tril_indices(self.d_max, self.d_max, offset=0, device=Z_sup_pad.device)
+        vech = outer[..., tril_i, tril_j]  # (B, n_sup, d_vech)
+        tae_in = torch.cat([Z_sup_pad, vech], dim=-1)  # (B, n_sup, d_max + d_vech)
+
+        tae = self.embed_tae(tae_in)  # (B, n_sup, d_model)
+        icl_emb = self.embed_icl(tae_in)  # (B, n_sup, d_icl)
 
         # ------------------------------------------------------------------
         # 1. Feature embedding
@@ -981,13 +1004,19 @@ class CopulaTabICLv2(nn.Module):
         row_emb = self.s3_norm(row_emb)
 
         # ------------------------------------------------------------------
-        # 5. Readout: 2-layer MLP on query row embeddings
+        # 5. Readout: per-dimension MLP on query row embeddings
         # ------------------------------------------------------------------
         query_emb = row_emb[:, n_support:, :]  # (B, n_query, d_icl)
 
-        U_all = self.fc_V(query_emb).reshape(
-            B, n_query, self.d_max, self.rank_max
-        )  # (B, n_query, d_max, r_max)
+        # Tile row embedding over d_max dimensions, then concat per-dim embedding.
+        # This breaks the symmetry: each dimension gets a distinct input to fc_V,
+        # allowing it to produce different U rows for each target dimension.
+        query_exp = query_emb.unsqueeze(2).expand(B, n_query, self.d_max, -1)  # (B, n_query, d_max, d_icl)
+        dim_exp = self.dim_emb.unsqueeze(0).unsqueeze(0).expand(B, n_query, -1, -1)  # (B, n_query, d_max, d_dim_emb)
+        head_in = torch.cat([query_exp, dim_exp], dim=-1)  # (B, n_query, d_max, d_icl+d_dim_emb)
+
+        # fc_V maps each (d_icl+d_dim_emb)-dim vector to rank_max scalars
+        U_all = self.fc_V(head_in)  # (B, n_query, d_max, rank_max)
 
         # Slice to actual (d, r) and apply Woodbury reparameterisation.
         #
