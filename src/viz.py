@@ -180,8 +180,16 @@ def plot_prediction_comparison(
     indices = np.linspace(0, N - 1, n_instances, dtype=int)
 
     # ------------------------------------------------------------------ #
-    # Pre-collect covariance matrices for the off-diagonal scatter        #
+    # Pre-collect correlation matrices for the off-diagonal scatter.
+    # The model enforces unit diagonal by construction so Sigma_pred is
+    # already a correlation matrix.  The oracle D/V are in Y-space where
+    # diag(D) + ||V||^2 = Var(Y_test)/Var(Y_train) != 1, so we normalize
+    # to the copula correlation matrix R[i,j] = Sigma[i,j]/sqrt(Sigma[ii]*Sigma[jj]).
     # ------------------------------------------------------------------ #
+    def _cov_to_corr(sigma: np.ndarray) -> np.ndarray:
+        std = np.sqrt(np.diag(sigma).clip(min=1e-8))
+        return sigma / np.outer(std, std)
+
     all_sigma_pred: list[np.ndarray] = []
     all_sigma_true: list[np.ndarray] = []
     for inst_idx in indices:
@@ -190,7 +198,7 @@ def plot_prediction_comparison(
         all_sigma_pred.append((Sp_D + Sp_V @ Sp_V.T).detach().cpu().numpy())
         St_V = V_true[batch_idx, inst_idx]
         St_D = torch.diag(D_true[batch_idx, inst_idx])
-        all_sigma_true.append((St_D + St_V @ St_V.T).detach().cpu().numpy())
+        all_sigma_true.append(_cov_to_corr((St_D + St_V @ St_V.T).detach().cpu().numpy()))
 
     d = all_sigma_pred[0].shape[0]
     tri_r, tri_c = np.triu_indices(d, k=1)  # upper-triangle off-diagonal indices
@@ -234,9 +242,9 @@ def plot_prediction_comparison(
             )
             axes[row, 2].imshow(np.abs(Sigma_true - Sigma_pred), cmap="Reds")
 
-        axes[row, 0].set_title(rf"Oracle $\Sigma^*$ (inst {inst_idx})")
-        axes[row, 1].set_title(rf"Predicted $\hat{{\Sigma}}$ (inst {inst_idx})")
-        axes[row, 2].set_title(rf"$|\Sigma^* - \hat{{\Sigma}}|$ (inst {inst_idx})")
+        axes[row, 0].set_title(rf"Oracle $R^*$ (inst {inst_idx})")
+        axes[row, 1].set_title(rf"Predicted $\hat{{R}}$ (inst {inst_idx})")
+        axes[row, 2].set_title(rf"$|R^* - \hat{{R}}|$ (inst {inst_idx})")
 
         # ------------------------------------------------------------------ #
         # Column 3: OAS (row 0) or off-diagonal scatter with OLS (rows 1+)   #
@@ -288,12 +296,12 @@ def plot_prediction_comparison(
                 else float("nan")
             )
             ax.set_title(
-                rf"Off-diag pred vs oracle (inst {inst_idx})"
+                rf"Off-diag $\hat{{R}}$ vs $R^*$ (inst {inst_idx})"
                 + f"\n$r={r:.2f}$  slope$={slope:.2f}$  $b={intercept:.3f}$",
                 fontsize=7,
             )
-            ax.set_xlabel(r"Oracle $\Sigma^*_{ij}$", fontsize=7)
-            ax.set_ylabel(r"Predicted $\hat{\Sigma}_{ij}$", fontsize=7)
+            ax.set_xlabel(r"Oracle $R^*_{ij}$", fontsize=7)
+            ax.set_ylabel(r"Predicted $\hat{R}_{ij}$", fontsize=7)
             ax.tick_params(labelsize=6)
 
     fig.tight_layout(rect=[0, 0, 1, 0.97] if dataset_label else None)
