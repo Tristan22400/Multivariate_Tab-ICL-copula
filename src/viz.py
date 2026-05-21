@@ -198,7 +198,9 @@ def plot_prediction_comparison(
         all_sigma_pred.append((Sp_D + Sp_V @ Sp_V.T).detach().cpu().numpy())
         St_V = V_true[batch_idx, inst_idx]
         St_D = torch.diag(D_true[batch_idx, inst_idx])
-        all_sigma_true.append(_cov_to_corr((St_D + St_V @ St_V.T).detach().cpu().numpy()))
+        all_sigma_true.append(
+            _cov_to_corr((St_D + St_V @ St_V.T).detach().cpu().numpy())
+        )
 
     d = all_sigma_pred[0].shape[0]
     tri_r, tri_c = np.triu_indices(d, k=1)  # upper-triangle off-diagonal indices

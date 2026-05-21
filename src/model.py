@@ -940,8 +940,12 @@ class CopulaTabICLv2(nn.Module):
 
         # Include pairwise outer product vech(z z^T) so the model sees which
         # target dimensions covary in each support instance.
-        outer = Z_sup_pad.unsqueeze(-1) * Z_sup_pad.unsqueeze(-2)  # (B, n_sup, d_max, d_max)
-        tril_i, tril_j = torch.tril_indices(self.d_max, self.d_max, offset=0, device=Z_sup_pad.device)
+        outer = Z_sup_pad.unsqueeze(-1) * Z_sup_pad.unsqueeze(
+            -2
+        )  # (B, n_sup, d_max, d_max)
+        tril_i, tril_j = torch.tril_indices(
+            self.d_max, self.d_max, offset=0, device=Z_sup_pad.device
+        )
         vech = outer[..., tril_i, tril_j]  # (B, n_sup, d_vech)
         tae_in = torch.cat([Z_sup_pad, vech], dim=-1)  # (B, n_sup, d_max + d_vech)
 
@@ -1011,9 +1015,15 @@ class CopulaTabICLv2(nn.Module):
         # Tile row embedding over d_max dimensions, then concat per-dim embedding.
         # This breaks the symmetry: each dimension gets a distinct input to fc_V,
         # allowing it to produce different U rows for each target dimension.
-        query_exp = query_emb.unsqueeze(2).expand(B, n_query, self.d_max, -1)  # (B, n_query, d_max, d_icl)
-        dim_exp = self.dim_emb.unsqueeze(0).unsqueeze(0).expand(B, n_query, -1, -1)  # (B, n_query, d_max, d_dim_emb)
-        head_in = torch.cat([query_exp, dim_exp], dim=-1)  # (B, n_query, d_max, d_icl+d_dim_emb)
+        query_exp = query_emb.unsqueeze(2).expand(
+            B, n_query, self.d_max, -1
+        )  # (B, n_query, d_max, d_icl)
+        dim_exp = (
+            self.dim_emb.unsqueeze(0).unsqueeze(0).expand(B, n_query, -1, -1)
+        )  # (B, n_query, d_max, d_dim_emb)
+        head_in = torch.cat(
+            [query_exp, dim_exp], dim=-1
+        )  # (B, n_query, d_max, d_icl+d_dim_emb)
 
         # fc_V maps each (d_icl+d_dim_emb)-dim vector to rank_max scalars
         U_all = self.fc_V(head_in)  # (B, n_query, d_max, rank_max)

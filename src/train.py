@@ -473,6 +473,7 @@ def _save_checkpoint(
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
             "cfg": OmegaConf.to_container(cfg, resolve=True),
+            "hyperparameters": OmegaConf.to_container(cfg, resolve=True),
         },
         path,
     )
@@ -557,17 +558,19 @@ def main(cfg: DictConfig) -> None:
     # ---- Resume from checkpoint ----
     start_step = 0
     ckpt_dir = cfg.training.ckpt_dir
-    latest = _latest_ckpt(ckpt_dir)
-    if latest is not None:
-        print(f"Resuming from checkpoint: {latest}")
-        ckpt = torch.load(latest, map_location=device, weights_only=False)
+    resume_from = cfg.training.get("resume_from", None)
+    if resume_from is not None:
+        if not Path(resume_from).is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
+        print(f"Resuming from checkpoint: {resume_from}")
+        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
         start_step = int(ckpt["step"]) + 1
         print(f"Resumed at step {start_step}.")
     else:
-        print("No checkpoint found, training from scratch.")
+        print("No resume_from specified, training from scratch.")
 
     # ---- Data loader (training episodes only — val episodes held out) ----
     val_n_episodes = int(cfg.training.get("val_n_episodes", 50))
