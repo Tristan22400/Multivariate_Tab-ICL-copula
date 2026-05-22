@@ -12,6 +12,7 @@ Each training step:
   4. Computes Woodbury NLL on the query instances.
   5. Backpropagates and logs to W&B.
 
+
 Validation (every cfg.training.val_every steps):
   - Uses a fixed suite of synthetic generate_episode() episodes.
   - Y_test (z-normalised by generate_episode) serves as a proxy for Z_test,
@@ -55,7 +56,7 @@ sys.path.insert(0, _HERE)
 from sklearn.covariance import OAS
 
 from dataset import infinite_episode_iter, make_episode_loader, split_episode_files
-from loss import energy_score, indep_normal_nll, marginal_nll, woodbury_nll
+from loss import indep_normal_nll, woodbury_nll
 from model import build_copula_tabicl_v2
 from viz import plot_prediction_comparison
 
@@ -81,28 +82,47 @@ def set_seed(seed: int) -> None:
 def _cov_to_woodbury_params(
     Sigma: torch.Tensor,
     mu: torch.Tensor | None,
-    n_test: int,
-    device: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Decompose a dense (d, d) covariance into (mu, D, V) for woodbury_nll.
+    """Decompose (N, d, d) covariances into Woodbury params for woodbury_nll.
 
-    Keeps ALL d eigenvectors so the decomposition exactly recovers Sigma
-    (modulo clamping of numerically negative eigenvalues on the off-diagonal
-    part). V has shape (d, d), giving the true full-covariance NLL rather
-    than a low-rank approximation.
+    Accepts a batch of N covariance matrices and returns (N, d), (N, d),
+    (N, d, d) tensors ready to pass to woodbury_nll as a (1, N, ...) batch.
+    All d eigenvectors are kept so the decomposition exactly recovers Sigma.
     """
-    d = Sigma.shape[0]
-    diag_vals = Sigma.diagonal().clamp(min=1e-6)
-    off_diag = Sigma - torch.diag(diag_vals)
-    eigvals, eigvecs = torch.linalg.eigh(off_diag)
+    diag_vals = Sigma.diagonal(dim1=-2, dim2=-1).clamp(min=1e-6)  # (N, d)
+    off_diag = Sigma - torch.diag_embed(diag_vals)  # (N, d, d)
+    eigvals, eigvecs = torch.linalg.eigh(off_diag)  # (N, d), (N, d, d)
     eigvals = eigvals.clamp(min=0.0)
-    V_flat = eigvecs * eigvals.sqrt()  # (d, d)
-    mu_out = mu if mu is not None else torch.zeros(d, device=device)
-    return (
-        mu_out.unsqueeze(0).expand(n_test, -1),
-        diag_vals.unsqueeze(0).expand(n_test, -1),
-        V_flat.unsqueeze(0).expand(n_test, -1, -1),
-    )
+    V_out = eigvecs * eigvals.sqrt().unsqueeze(-2)  # (N, d, d)
+    N, d = diag_vals.shape
+    mu_out = mu if mu is not None else torch.zeros(N, d, device=Sigma.device)
+    return mu_out, diag_vals, V_out
+
+
+def _energy_score_batched(
+    mu: torch.Tensor,
+    D: torch.Tensor,
+    V: torch.Tensor,
+    y_ref: torch.Tensor,
+    n_samples: int = 200,
+) -> float:
+    """Energy score for all (B, T) instances in a single GPU pass.
+
+    Args:
+        mu, D, V : (B, T, d) / (B, T, d) / (B, T, d, r)
+        y_ref    : (B, T, d)
+    """
+    B, T, d = mu.shape
+    r = V.shape[-1]
+    eps_d = torch.randn(B, T, n_samples, d, device=mu.device, dtype=mu.dtype)
+    eps_r = torch.randn(B, T, n_samples, r, device=mu.device, dtype=mu.dtype)
+    samples = (
+        mu.unsqueeze(2) + D.unsqueeze(2).sqrt() * eps_d + (eps_r @ V.transpose(-2, -1))
+    )  # (B, T, M, d)
+    term1 = (samples - y_ref.unsqueeze(2)).norm(dim=-1).mean(dim=-1)  # (B, T)
+    samples_flat = samples.reshape(B * T, n_samples, d)
+    term2 = torch.cdist(samples_flat, samples_flat).mean(dim=(-2, -1)).reshape(B, T)
+    return (term1 - 0.5 * term2).mean().item()
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +137,8 @@ def run_val_pit(
     wandb_run,
     device: str,
     do_plot: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
+    use_amp: bool = False,
 ) -> dict[str, float]:
     """Validate on held-out PIT episodes.  All NLL metrics are in copula-NLL units.
 
@@ -128,8 +150,8 @@ def run_val_pit(
         val/copula_nll        — model copula NLL on Z_test (full context)
         val/joint_y_nll       — copula_nll + marginal_nll = full joint NLL in Y-space
         val/train_nll         — model copula NLL on Z_train 70/30 split (overfitting check)
-        val/marginal_nll      — diagonal-only copula NLL (V=0 baseline)
-        val/copula_gain       — marginal_nll - copula_nll ≥ 0 (gain from V component)
+        val/marginal_nll      — always 0.0 (copula NLL of N(0,I); fixed by PIT construction)
+        val/copula_gain       — -copula_nll = gain over N(0,I) fixed baseline (≥ 0 when model helps)
         val/oas_nll           — OAS baseline copula NLL (≈ woodbury_nll_oas - I_z)
         val/knn5_cov_nll      — kNN-5 baseline copula NLL
         val/linear_factor_nll — linear-factor baseline copula NLL
@@ -180,16 +202,18 @@ def run_val_pit(
             # ---- Model: full context → Z_test ----
             X_all = torch.cat([X_tr, X_te], dim=1)
             Z_all = torch.cat([Z_tr, torch.zeros_like(Z_te)], dim=1)
-            mu_Z, d_Z, V_Z = model(X_all, Z_all, n_support=n_train)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                mu_Z, d_Z, V_Z = model(X_all, Z_all, n_support=n_train)
+            mu_Z, d_Z, V_Z = mu_Z.float(), d_Z.float(), V_Z.float()
 
             # I_z = indep_normal_nll(Z_te) is computed once and reused for all
             # Jacobian corrections.  copula_nll = woodbury_nll - I_z for every metric.
             indep_z = indep_normal_nll(Z_te).item()
 
             wnll = woodbury_nll(Z_te, mu_Z, d_Z, V_Z).item()
-            mnll = marginal_nll(Z_te, mu_Z, d_Z).item()
+            mnll = indep_z  # fixed: N(0,I) baseline (PIT guarantees z_j ~ N(0,1))
             cnll = wnll - indep_z  # model copula NLL
-            c_marg = mnll - indep_z  # diagonal-only copula NLL
+            c_marg = 0.0  # copula NLL of N(0,I) is always 0 by definition
 
             # Copula gain: improvement from V over diagonal; I_z cancels in the
             # difference so copula_gain = mnll - wnll = c_marg - cnll >= 0 when V helps.
@@ -204,21 +228,7 @@ def run_val_pit(
             agg["val/marginal_nll"].append(c_marg)
             agg["val/copula_gain"].append(copula_gain)
             agg["val/energy_score"].append(
-                float(
-                    np.mean(
-                        [
-                            energy_score(
-                                mu=mu_Z[b, i],
-                                D=d_Z[b, i],
-                                V=V_Z[b, i],
-                                y_ref=Z_te[b, i],
-                                n_samples=200,
-                            ).item()
-                            for b in range(B)
-                            for i in range(n_test)
-                        ]
-                    )
-                )
+                _energy_score_batched(mu_Z, d_Z, V_Z, Z_te, n_samples=50)
             )
 
             # ---- Train copula NLL: 70/30 split (overfitting check vs val/copula_nll) ----
@@ -230,7 +240,9 @@ def run_val_pit(
             # (lines 181-182), so the model cannot leak query Z into its predictions.
             Z_tr_input = Z_tr_perm.clone()
             Z_tr_input[:, n_sup:, :] = 0.0
-            mu_tr, d_tr, V_tr = model(X_tr_perm, Z_tr_input, n_support=n_sup)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                mu_tr, d_tr, V_tr = model(X_tr_perm, Z_tr_input, n_support=n_sup)
+            mu_tr, d_tr, V_tr = mu_tr.float(), d_tr.float(), V_tr.float()
             Z_query_tr = Z_tr_perm[:, n_sup:, :]
             train_copula_nll = (
                 woodbury_nll(Z_query_tr, mu_tr, d_tr, V_tr).item()
@@ -243,47 +255,62 @@ def run_val_pit(
             ep_sigma_oas_list: list[np.ndarray] = []
             for b in range(B):
                 Z_tr_b_np = Z_tr[b].cpu().numpy()
-                Z_tr_b = Z_tr[b]
-                Z_te_b = Z_te[b]
-                X_tr_b = X_tr[b]
-                X_te_b = X_te[b]
+                Z_tr_b = Z_tr[b]  # (n_train, d)
+                Z_te_b = Z_te[b]  # (n_test,  d)
+                X_tr_b = X_tr[b]  # (n_train, p)
+                X_te_b = X_te[b]  # (n_test,  p)
 
-                # OAS shrinkage — force mu=0 to match the copula assumption N(0,ρ)
-                # and stay comparable to oracle_copula_z which also uses mu=0.
+                # OAS shrinkage — force mu=0 to match the copula assumption N(0,ρ).
+                # Decompose the single (d,d) matrix once, then expand to (n_test,).
                 oas = OAS().fit(Z_tr_b_np)
                 Sigma_oas = torch.tensor(
                     oas.covariance_, dtype=torch.float32, device=device
-                )
+                )  # (d, d)
                 mu_p, d_p, V_p = _cov_to_woodbury_params(
-                    Sigma_oas, None, n_test, device
+                    Sigma_oas.unsqueeze(0), None
+                )  # (1,d), (1,d), (1,d,d)
+                d_p_exp = d_p.expand(n_test, -1)
+                V_p_exp = V_p.expand(n_test, -1, -1)
+                mu_p_exp = torch.zeros(n_test, d, device=device)
+                oas_nlls.append(
+                    woodbury_nll(
+                        Z_te_b.unsqueeze(0),
+                        mu_p_exp.unsqueeze(0),
+                        d_p_exp.unsqueeze(0),
+                        V_p_exp.unsqueeze(0),
+                    ).item()
                 )
-                oas_nlls.append(woodbury_nll(Z_te_b, mu_p, d_p, V_p).item())
                 if do_plot:
                     ep_sigma_oas_list.append(oas.covariance_.copy())
 
-                # kNN-5
-                dists = torch.cdist(X_te_b, X_tr_b)
+                # kNN-5: gather all neighbors at once, batch covariance, one NLL call.
+                dists = torch.cdist(X_te_b, X_tr_b)  # (n_test, n_train)
                 k_eff = min(5, n_train)
-                nlls_i = []
-                for i in range(n_test):
-                    idx = dists[i].topk(k_eff, largest=False).indices
-                    Z_nb = Z_tr_b[idx]
-                    Sigma_i = (
-                        torch.cov(Z_nb.T)
-                        if k_eff > d
-                        else torch.diag(Z_nb.var(0, unbiased=False).clamp(min=1e-6))
-                    )
-                    Sigma_i = 0.5 * (Sigma_i + Sigma_i.T)
-                    mu_nb = Z_nb.mean(0)
-                    mu_p, d_p, V_p = _cov_to_woodbury_params(Sigma_i, mu_nb, 1, device)
-                    nlls_i.append(
-                        woodbury_nll(Z_te_b[i : i + 1], mu_p, d_p, V_p).item()
-                    )
-                knn5_nlls.append(float(np.mean(nlls_i)))
+                idx = dists.topk(k_eff, largest=False).indices  # (n_test, k_eff)
+                Z_nb = Z_tr_b[idx]  # (n_test, k_eff, d)
+                mu_nb = Z_nb.mean(dim=1)  # (n_test, d)
+                if k_eff > d:
+                    Z_c = Z_nb - mu_nb.unsqueeze(1)
+                    Sigma_knn = Z_c.transpose(-2, -1) @ Z_c / max(k_eff - 1, 1)
+                    Sigma_knn = 0.5 * (Sigma_knn + Sigma_knn.transpose(-2, -1))
+                else:
+                    Sigma_knn = torch.diag_embed(
+                        Z_nb.var(dim=1, unbiased=False).clamp(min=1e-6)
+                    )  # (n_test, d, d)
+                mu_knn, d_knn, V_knn = _cov_to_woodbury_params(Sigma_knn, mu_nb)
+                knn5_nlls.append(
+                    woodbury_nll(
+                        Z_te_b.unsqueeze(0),
+                        mu_knn.unsqueeze(0),
+                        d_knn.unsqueeze(0),
+                        V_knn.unsqueeze(0),
+                    ).item()
+                )
 
-                # Linear factor
+                # Linear factor: Sigma_resid is shared across all n_test instances,
+                # decompose once then expand — n_test NLL calls → one batched call.
                 W = torch.linalg.lstsq(X_tr_b, Z_tr_b).solution
-                mu_lin = X_te_b @ W
+                mu_lin = X_te_b @ W  # (n_test, d)
                 resid = Z_tr_b - X_tr_b @ W
                 Sigma_resid = (
                     torch.cov(resid.T)
@@ -291,15 +318,19 @@ def run_val_pit(
                     else torch.diag(resid.var(0, unbiased=False).clamp(min=1e-6))
                 )
                 Sigma_resid = 0.5 * (Sigma_resid + Sigma_resid.T)
-                lin_nlls_i = []
-                for i in range(n_test):
-                    mu_p, d_p, V_p = _cov_to_woodbury_params(
-                        Sigma_resid, mu_lin[i], 1, device
-                    )
-                    lin_nlls_i.append(
-                        woodbury_nll(Z_te_b[i : i + 1], mu_p, d_p, V_p).item()
-                    )
-                linear_nlls.append(float(np.mean(lin_nlls_i)))
+                _, d_lin, V_lin = _cov_to_woodbury_params(
+                    Sigma_resid.unsqueeze(0), None
+                )  # (1,d), (1,d,d)
+                d_lin_exp = d_lin.expand(n_test, -1)
+                V_lin_exp = V_lin.expand(n_test, -1, -1)
+                linear_nlls.append(
+                    woodbury_nll(
+                        Z_te_b.unsqueeze(0),
+                        mu_lin.unsqueeze(0),
+                        d_lin_exp.unsqueeze(0),
+                        V_lin_exp.unsqueeze(0),
+                    ).item()
+                )
 
             # Convert baselines from Gaussian NLL to copula NLL units by subtracting I_z.
             # These baselines fit non-zero mean and free variance, so they are not strict
@@ -466,10 +497,12 @@ def _save_checkpoint(
     cfg: DictConfig,
 ) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Unwrap compiled model so checkpoints are always plain state dicts
+    raw_model = getattr(model, "_orig_mod", model)
     torch.save(
         {
             "step": step,
-            "model_state": model.state_dict(),
+            "model_state": raw_model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
             "cfg": OmegaConf.to_container(cfg, resolve=True),
@@ -495,6 +528,14 @@ def main(cfg: DictConfig) -> None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device : {device}")
     print(OmegaConf.to_yaml(cfg))
+
+    # ---- Mixed precision setup ----
+    use_amp: bool = device == "cuda"
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    if use_amp:
+        torch.backends.cudnn.benchmark = True
+        print(f"AMP enabled  dtype={amp_dtype}  cudnn.benchmark=True")
 
     # ---- Validate required config ----
     if cfg.training.dataset_dir is None:
@@ -536,6 +577,7 @@ def main(cfg: DictConfig) -> None:
             f"s2={getattr(cfg.model, 'n_layers_s2', '?')}"
             f"s3={getattr(cfg.model, 'n_layers_s3', '?')}",
         )
+        _aux_w = float(cfg.training.get("aux_mse_weight", 0.0))
         _run_name = (
             f"lr={_lr_str}"
             f"_steps={cfg.training.steps}"
@@ -543,6 +585,7 @@ def main(cfg: DictConfig) -> None:
             f"_L={_n_layers}"
             f"_H={cfg.model.n_heads}"
             f"_r={cfg.model.rank}"
+            f"_auxw={_aux_w}"
             f"_data={_data_tag}"
         )
         wandb_run = wandb.init(
@@ -572,6 +615,13 @@ def main(cfg: DictConfig) -> None:
     else:
         print("No resume_from specified, training from scratch.")
 
+    # ---- torch.compile (optional, ~60 s one-time compilation cost) ----
+    if cfg.training.get("compile", False) and device == "cuda":
+        model = torch.compile(model, mode="reduce-overhead", dynamic=False)
+        print(
+            "torch.compile enabled (mode=reduce-overhead) — first forward will trigger JIT compilation."
+        )
+
     # ---- Data loader (training episodes only — val episodes held out) ----
     val_n_episodes = int(cfg.training.get("val_n_episodes", 50))
     train_files, val_files = split_episode_files(
@@ -594,94 +644,85 @@ def main(cfg: DictConfig) -> None:
     # ---- Training loop ----
     model.train()
     t0 = time.perf_counter()
+    accum_steps = int(cfg.training.get("gradient_accumulation_steps", 1))
+    optimizer.zero_grad()
 
     for step in range(start_step, int(cfg.training.steps)):
         episode = next(episode_iter)
 
-        X_train = episode["X_train"].to(device)  # (B, n_train, p)
-        Z_train = episode["Z_train"].to(device)  # (B, n_train, d)
+        X_train = episode["X_train"].to(device)  # (B, N, p)
+        Z_train = episode["Z_train"].to(device)  # (B, N, d)
+        X_test_ep = episode["X_test"].to(device)  # (B, n_test, p)
+        Z_test_ep = episode["Z_test"].to(device)  # (B, n_test, d)
+        oracle_D_ep = episode["oracle_D"].to(device)  # (B, n_test, d)
+        oracle_V_ep = episode["oracle_V"].to(device)  # (B, n_test, d, r)
 
         B, N, d = Z_train.shape
 
-        # ---- Random 70/30 support/query split ----
-        perm = torch.randperm(N, device=device)
-        n_support = max(1, int(0.7 * N))
-        # n_query  = N - n_support  (implicit)
+        # ---- Single forward: full X_train as support, X_test as queries ----
+        X_fwd = torch.cat([X_train, X_test_ep], dim=1)  # (B, N+n_test, p)
+        Z_fwd = torch.cat([Z_train, Z_test_ep], dim=1)  # (B, N+n_test, d)
 
-        X_perm = X_train[:, perm, :]  # (B, N, p)
-        Z_perm = Z_train[:, perm, :]  # (B, N, d)
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            mu_Z, d_Z, V_Z = model(X_fwd, Z_fwd, n_support=N)
+            # mu_Z: (B, n_test, d)
+            # d_Z:  (B, n_test, d)
+            # V_Z:  (B, n_test, d, r)
 
-        # ---- Forward pass ----
-        model.train()
-        mu_Z, d_Z, V_Z = model(X_perm, Z_perm, n_support)
-        # mu_Z: (B, n_query, d)     — zeros (copula: mu = 0)
-        # d_Z:  (B, n_query, d)     — C_diag = 1/(1+||U||^2), ensuring Sigma_ii = 1
-        # V_Z:  (B, n_query, d, r)  — W = U/sqrt(1+||U||^2)
+            # ---- Loss: Woodbury NLL on test queries ----
+            Z_query = Z_test_ep  # (B, n_test, d)
+            loss_nll = woodbury_nll(Z_query, mu_Z, d_Z, V_Z)
+            loss = loss_nll
 
-        # ---- Loss: Woodbury NLL on query instances ----
-        Z_query = Z_perm[:, n_support:, :]  # (B, n_query, d)
-        loss_nll = woodbury_nll(Z_query, mu_Z, d_Z, V_Z)
-        loss = loss_nll
+            # ---- Auxiliary off-diagonal MSE loss ----
+            aux_weight = float(cfg.training.get("aux_mse_weight", 0.0))
+            anneal_frac = float(cfg.training.get("aux_mse_anneal_frac", 0.7))
+            progress = min(1.0, step / max(1, anneal_frac * int(cfg.training.steps)))
+            alpha = aux_weight * (1.0 - progress)
 
-        # ---- Auxiliary off-diagonal MSE loss ----
-        aux_weight = float(cfg.training.get("aux_mse_weight", 0.0))
-        anneal_frac = float(cfg.training.get("aux_mse_anneal_frac", 0.7))
-        progress = min(1.0, step / max(1, anneal_frac * int(cfg.training.steps)))
-        alpha = aux_weight * (1.0 - progress)
+            if alpha > 0.0:
+                # Oracle correlation matrix from ground-truth low-rank factors
+                Sigma_ora = torch.diag_embed(
+                    oracle_D_ep
+                ) + oracle_V_ep @ oracle_V_ep.transpose(-1, -2)  # (B, n_test, d, d)
+                std_ora = Sigma_ora.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+                R_ora = Sigma_ora / (std_ora.unsqueeze(-1) * std_ora.unsqueeze(-2))
 
-        if alpha > 0.0:
-            X_test_ep = episode["X_test"].to(device)  # (B, n_test, p)
-            Z_test_ep = episode["Z_test"].to(
-                device
-            )  # (B, n_test, d) — ignored by model for query positions
-            oracle_D_aux = episode["oracle_D"].to(device)  # (B, n_test, d)
-            oracle_V_aux = episode["oracle_V"].to(device)  # (B, n_test, d, r)
+                # Predicted correlation matrix (diag=1 by Woodbury construction)
+                Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-1, -2)
 
-            # Second forward: full X_train as support, X_test as queries
-            X_aux = torch.cat([X_train, X_test_ep], dim=1)  # (B, N+n_test, p)
-            Z_aux = torch.cat([Z_train, Z_test_ep], dim=1)  # (B, N+n_test, d)
-            _, d_Z_te, V_Z_te = model(X_aux, Z_aux, n_support=N)
-            # d_Z_te: (B, n_test, d),  V_Z_te: (B, n_test, d, r)
-
-            # Oracle correlation matrix (normalize Y-space covariance)
-            Sigma_ora = torch.diag_embed(
-                oracle_D_aux
-            ) + oracle_V_aux @ oracle_V_aux.transpose(-1, -2)  # (B, n_test, d, d)
-            std_ora = Sigma_ora.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
-            R_ora = Sigma_ora / (std_ora.unsqueeze(-1) * std_ora.unsqueeze(-2))
-
-            # Predicted correlation matrix (diag=1 by Woodbury construction)
-            Sigma_pred_te = torch.diag_embed(d_Z_te) + V_Z_te @ V_Z_te.transpose(-1, -2)
-
-            ri, ci = torch.triu_indices(d, d, offset=1, device=device)
-            loss_mse = F.mse_loss(Sigma_pred_te[..., ri, ci], R_ora[..., ri, ci])
-            loss = loss + alpha * loss_mse
-        else:
-            loss_mse = torch.zeros(1, device=device)
+                ri, ci = torch.triu_indices(d, d, offset=1, device=device)
+                loss_mse = F.mse_loss(Sigma_pred[..., ri, ci], R_ora[..., ri, ci])
+                loss = loss + alpha * loss_mse
+            else:
+                loss_mse = torch.zeros(1, device=device)
 
         # ---- Backward ----
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(), float(cfg.training.clip_grad_norm)
-        )
-        optimizer.step()
-        scheduler.step()
+        scaler.scale(loss / accum_steps).backward()
+        if (step + 1) % accum_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), float(cfg.training.clip_grad_norm)
+            )
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
 
         # ---- Logging ----
         if step % int(cfg.training.log_every) == 0:
             with torch.no_grad():
                 wnll = loss_nll.item()
-                mnll = marginal_nll(Z_query, mu_Z, d_Z).item()
-                cnll_train = wnll - indep_normal_nll(Z_query).item()  # copula NLL
-                copula_gain = mnll - wnll  # gain from V over diagonal; I_z cancels
+                indep_z_train = indep_normal_nll(Z_query).item()
+                cnll_train = wnll - indep_z_train  # copula NLL
+                copula_gain = (
+                    indep_z_train - wnll
+                )  # = -cnll; gain over N(0,I) fixed baseline
 
                 oracle_mu = episode["oracle_mu"].to(device)
-                oracle_D = episode["oracle_D"].to(device)
-                oracle_V = episode["oracle_V"].to(device)
                 Y_test = episode["Y_test"].to(device)
                 oracle_nll_y = woodbury_nll(
-                    Y_test, oracle_mu, oracle_D, oracle_V
+                    Y_test, oracle_mu, oracle_D_ep, oracle_V_ep
                 ).item()
 
                 Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-1, -2)
@@ -691,8 +732,8 @@ def main(cfg: DictConfig) -> None:
                 pred_off_diag_var = off_diag_pred.var(dim=1).mean().item()
 
                 Sigma_oracle = torch.diag_embed(
-                    oracle_D
-                ) + oracle_V @ oracle_V.transpose(-1, -2)
+                    oracle_D_ep
+                ) + oracle_V_ep @ oracle_V_ep.transpose(-1, -2)
                 off_diag_oracle = Sigma_oracle[..., ri, ci]
                 oracle_off_diag_var = off_diag_oracle.var(dim=1).mean().item()
 
@@ -728,7 +769,16 @@ def main(cfg: DictConfig) -> None:
         do_val = step % int(cfg.training.val_every) == 0
         do_plot = step % int(cfg.training.plot_every) == 0
         if do_val or do_plot:
-            run_val_pit(model, val_episodes, step, wandb_run, device, do_plot=do_plot)
+            run_val_pit(
+                model,
+                val_episodes,
+                step,
+                wandb_run,
+                device,
+                do_plot=do_plot,
+                amp_dtype=amp_dtype,
+                use_amp=use_amp,
+            )
 
         # ---- Checkpoint ----
         if (
@@ -749,7 +799,15 @@ def main(cfg: DictConfig) -> None:
     else:
         print("Training complete. (No checkpoint saved)")
 
-    run_val_pit(model, val_episodes, final_step, wandb_run, device)
+    run_val_pit(
+        model,
+        val_episodes,
+        final_step,
+        wandb_run,
+        device,
+        amp_dtype=amp_dtype,
+        use_amp=use_amp,
+    )
 
     if wandb_run is not None:
         wandb_run.finish()
