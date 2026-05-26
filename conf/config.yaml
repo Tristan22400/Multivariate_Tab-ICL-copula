@@ -1,28 +1,33 @@
 defaults:
-  - model: copula_transformer
+  - model: copula_tabicl_v2
   - data: multivariate
   - _self_
 
 seed: 42
 
+
 training:
   device: auto
-  batch_size: 1          # B datasets per step (unused if dataset_dir is set; stored in episode)
-  steps: 30000
-  lr: 1.0e-4
-  lr_min: 1.0e-6
+  batch_size: 8          # B datasets per step (unused if dataset_dir is set; stored in episode)
+  steps: 100000
+  lr: 1.0e-6
+  lr_min: 1.0e-8
   weight_decay: 0.0
   clip_grad_norm: 0.1
+  aux_mse_weight: 1.0        # peak weight for off-diagonal MSE auxiliary loss; set 0 to disable
+  aux_mse_anneal_frac: 0.7   # anneal weight from aux_mse_weight to 0 over this fraction of steps
   log_every: 100
   val_every: 500
   plot_every: 500
   save_every: 5000
   ckpt_dir: null
-  dataset_dir: ./data/pit_episodes_kernel_d4  # path to pre-computed PIT episodes; required for training
+  resume_from: null  # direct checkpoint path; takes priority over ckpt_dir auto-detection
+  dataset_dir: ./data/pit_episodes_kernel_d4_n_train_256  # path to pre-computed PIT episodes; required for training
+  val_n_episodes: 50       # number of held-out episodes reserved for validation (never used in training)
 
 dataset:
-  n_episodes: 50000
-  output_dir: ./data/pit_episodes_kernel_d4
+  n_episodes: 100000
+  output_dir: ./data/pit_episodes_kernel_d4_n_train_256
   resume: true
   batch_size: 16         # B datasets per episode saved to disk
   episodes_per_step: 32   # K episodes produced per GPU step (effective batch = B*K); reduce if OOM
@@ -33,4 +38,23 @@ tabicl:
   ckpt: tabicl-regressor-v2-20260212.ckpt
   pit_batch_size: 256     # LOO chunk size (reduce if OOM during Phase 1)
   pit_eps: 1.0e-6        # fixed probit clamping epsilon
+
+attn_copula:
+  m: 64                  # hidden dim for feature/row encoders and attention
+  n_heads: 4
+  n_layers: 2            # self-attention depth
+  dropout: 0.15
+  weight_decay: 5.0e-3
+  alpha: 3.0             # tanh scale for Cholesky off-diag entries
+  lambda_min: 1.0e-4
+  lambda_max: 0.9
+  include_outer: true    # include vech(z z^T) in row encoder input
+  steps: 5000
+  lr: 1.0e-3
+  lr_min: 1.0e-6
+  clip_grad: 1.0
+  val_every: 100         # evaluate on held-out val set every N steps
+  patience: 500          # early stopping: stop if no improvement for N steps
+
+
 

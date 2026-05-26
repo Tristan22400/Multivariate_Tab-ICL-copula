@@ -1,0 +1,12 @@
+d_model: 128
+n_heads: 8
+n_layers_s1: 3
+n_layers_s2: 3
+n_layers_s3: 12
+n_inducing: 128
+n_cls: 4
+p_max: 20
+d_max: 8
+rank: 4
+d_ff: null
+dropout: 0.0

@@ -9,6 +9,120 @@ import numpy as np
 import torch
 
 
+def plot_corr_grid(
+    estimators: dict[str, torch.Tensor],
+    oracle_R: torch.Tensor,
+    n_instances: int = 3,
+    title: str = "",
+) -> plt.Figure:
+    """Compare correlation matrices from multiple estimators against the oracle.
+
+    Layout: one column per estimator (plus one oracle column), n_instances rows.
+    Each cell shows the (d×d) correlation heatmap.
+    A second block of rows shows the absolute error |R* - R_hat| per estimator.
+
+    Args:
+        estimators : dict mapping estimator name → R tensor of shape (d, d) or
+                     (n_qry, d, d).  A (d, d) tensor is broadcast to all instances.
+        oracle_R   : (n_qry, d, d) or (d, d) — oracle correlation matrices.
+        n_instances: number of query instances (rows) to plot.
+        title      : figure suptitle.
+
+    Returns:
+        matplotlib Figure.
+    """
+    try:
+        import seaborn as sns
+    except ImportError:
+        sns = None
+
+    # Resolve oracle shape
+    if oracle_R.dim() == 2:
+        oracle_R = oracle_R.unsqueeze(0)
+    n_qry = oracle_R.shape[0]
+    n_instances = min(n_instances, n_qry)
+    d = oracle_R.shape[-1]
+    indices = np.linspace(0, n_qry - 1, n_instances, dtype=int)
+
+    # Normalise each estimator to (n_qry, d, d)
+    est_tensors: dict[str, np.ndarray] = {}
+    for name, R in estimators.items():
+        if R.dim() == 2:
+            R = R.unsqueeze(0).expand(n_qry, -1, -1)
+        est_tensors[name] = R.detach().cpu().numpy()
+
+    oracle_np = oracle_R.detach().cpu().numpy()
+    names = list(est_tensors.keys())
+    n_est = len(names)
+
+    # Layout: 2 * n_instances rows (predicted | error), n_est+1 columns (oracle + estimators)
+    n_cols = n_est + 1
+    n_rows = 2 * n_instances
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.0 * n_cols, 3.0 * n_rows))
+    if title:
+        fig.suptitle(title, fontsize=13, fontweight="bold", y=1.01)
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+
+    def _heatmap(ax, data, vmin, vmax, cmap="coolwarm"):
+        if sns is not None:
+            sns.heatmap(
+                data,
+                ax=ax,
+                cmap=cmap,
+                center=0 if cmap == "coolwarm" else None,
+                vmin=vmin,
+                vmax=vmax,
+                square=True,
+                xticklabels=False,
+                yticklabels=False,
+                cbar=False,
+            )
+        else:
+            ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+    for row_i, inst_idx in enumerate(indices):
+        R_oracle = oracle_np[inst_idx]  # (d, d)
+        cov_max = max(abs(R_oracle).max(), 1.0)
+
+        # --- Top half: predicted correlation matrices ---
+        pred_row = row_i * 2
+
+        # Oracle column (col 0)
+        ax = axes[pred_row, 0]
+        _heatmap(ax, R_oracle, -cov_max, cov_max)
+        ax.set_title(f"Oracle R* (i={inst_idx})", fontsize=8)
+        if row_i == 0:
+            axes[pred_row, 0].set_ylabel("Predicted", fontsize=8)
+
+        # Estimator columns
+        for col_i, name in enumerate(names):
+            R_est = est_tensors[name][inst_idx]
+            ax = axes[pred_row, col_i + 1]
+            _heatmap(ax, R_est, -cov_max, cov_max)
+            ax.set_title(name, fontsize=8)
+
+        # --- Bottom half: absolute error |R* - R_hat| ---
+        err_row = row_i * 2 + 1
+
+        # Empty oracle column for the error row (just blank)
+        axes[err_row, 0].axis("off")
+        if row_i == 0:
+            axes[err_row, 0].set_ylabel("|R* − R̂|", fontsize=8)
+
+        for col_i, name in enumerate(names):
+            R_est = est_tensors[name][inst_idx]
+            err = np.abs(R_oracle - R_est)
+            ax = axes[err_row, col_i + 1]
+            _heatmap(ax, err, 0, err.max().clip(min=1e-6), cmap="Reds")
+            ax.set_title(f"|R*−{name}|", fontsize=8)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97] if title else None)
+    return fig
+
+
 def plot_prediction_comparison(
     mu_pred: torch.Tensor,
     D_pred: torch.Tensor,
@@ -24,34 +138,36 @@ def plot_prediction_comparison(
     fig: plt.Figure | None = None,
     dataset_label: str = "",
 ) -> plt.Figure:
-    """Compare predicted vs oracle mean and covariance for multiple query instances.
+    """Compare predicted vs oracle covariance for multiple query instances.
 
-    One row per instance, five columns:
+    One row per instance, four columns:
       0 — Oracle  Sigma*    heatmap
       1 — Predicted Sigma   heatmap
       2 — |Sigma* - Sigma|  heatmap
-      3 — mu* vs mu hat (+ optional baseline) bar chart
-      4 — OAS Sigma heatmap (if sigma_oas provided) or |mu* - mu hat| bar chart
+      3 — Row 0: OAS Sigma heatmap (if provided); rows 1+: off-diagonal
+          scatter (predicted vs oracle) with OLS regression line, annotated
+          with Pearson r, slope, and intercept.  A slope < 1 indicates the
+          model under-disperses predictions; a non-zero intercept is a
+          constant offset.  hexbin is used when n_pairs > 30.
 
     Args:
-        mu_pred      : (B, N, d)    — predicted conditional means
+        mu_pred      : (B, N, d)    — unused, kept for API compatibility
         D_pred       : (B, N, d)    — predicted diagonal variances
         V_pred       : (B, N, d, r) — predicted low-rank factors
-        mu_true      : (B, N, d)    — oracle conditional means
+        mu_true      : (B, N, d)    — unused, kept for API compatibility
         D_true       : (B, N, d)    — oracle diagonal variances
         V_true       : (B, N, d, r) — oracle low-rank factors
         batch_idx    : which batch element to visualise
         n_instances  : number of query instances (rows) to plot
-        mu_baseline  : (B, N, d) optional — baseline scalar predictions
-                       (e.g. marginal-only or independent-TabICL means)
-        baseline_label : legend label for the baseline bars
+        mu_baseline  : unused, kept for API compatibility
+        baseline_label : unused, kept for API compatibility
         sigma_oas    : (d, d) optional — OAS shrinkage covariance matrix
         fig          : optional existing Figure (or SubFigure) to draw into;
                        if None a new Figure is created.
         dataset_label: if non-empty, added as a suptitle to identify the dataset.
 
     Returns:
-        matplotlib Figure with n_instances × 5 subplots.
+        matplotlib Figure with n_instances × 4 subplots.
     """
 
     try:
@@ -63,26 +179,47 @@ def plot_prediction_comparison(
     n_instances = min(n_instances, N)
     indices = np.linspace(0, N - 1, n_instances, dtype=int)
 
+    # ------------------------------------------------------------------ #
+    # Pre-collect correlation matrices for the off-diagonal scatter.
+    # The model enforces unit diagonal by construction so Sigma_pred is
+    # already a correlation matrix.  The oracle D/V are in Y-space where
+    # diag(D) + ||V||^2 = Var(Y_test)/Var(Y_train) != 1, so we normalize
+    # to the copula correlation matrix R[i,j] = Sigma[i,j]/sqrt(Sigma[ii]*Sigma[jj]).
+    # ------------------------------------------------------------------ #
+    def _cov_to_corr(sigma: np.ndarray) -> np.ndarray:
+        std = np.sqrt(np.diag(sigma).clip(min=1e-8))
+        return sigma / np.outer(std, std)
+
+    all_sigma_pred: list[np.ndarray] = []
+    all_sigma_true: list[np.ndarray] = []
+    for inst_idx in indices:
+        Sp_V = V_pred[batch_idx, inst_idx]
+        Sp_D = torch.diag(D_pred[batch_idx, inst_idx])
+        all_sigma_pred.append((Sp_D + Sp_V @ Sp_V.T).detach().cpu().numpy())
+        St_V = V_true[batch_idx, inst_idx]
+        St_D = torch.diag(D_true[batch_idx, inst_idx])
+        all_sigma_true.append(
+            _cov_to_corr((St_D + St_V @ St_V.T).detach().cpu().numpy())
+        )
+
+    d = all_sigma_pred[0].shape[0]
+    tri_r, tri_c = np.triu_indices(d, k=1)  # upper-triangle off-diagonal indices
+    # Shapes: (n_instances, n_pairs)
+    pred_off = np.stack([s[tri_r, tri_c] for s in all_sigma_pred])
+    true_off = np.stack([s[tri_r, tri_c] for s in all_sigma_true])
+
     created_fig = fig is None
     if created_fig:
-        fig = plt.figure(figsize=(26, 5 * n_instances))
-    axes = fig.subplots(n_instances, 5)
+        fig = plt.figure(figsize=(20, 5 * n_instances))
+    axes = fig.subplots(n_instances, 4)
     if dataset_label:
         fig.suptitle(dataset_label, fontsize=13, fontweight="bold", y=1.01)
     if n_instances == 1:
         axes = axes[np.newaxis, :]
 
     for row, inst_idx in enumerate(indices):
-        # ------------------------------------------------------------------ #
-        # Covariance matrices                                                  #
-        # ------------------------------------------------------------------ #
-        Sp_V = V_pred[batch_idx, inst_idx]  # (d, r)
-        Sp_D = torch.diag(D_pred[batch_idx, inst_idx])  # (d, d)
-        Sigma_pred = (Sp_D + Sp_V @ Sp_V.T).detach().cpu().numpy()
-
-        St_V = V_true[batch_idx, inst_idx]
-        St_D = torch.diag(D_true[batch_idx, inst_idx])
-        Sigma_true = (St_D + St_V @ St_V.T).detach().cpu().numpy()
+        Sigma_pred = all_sigma_pred[row]
+        Sigma_true = all_sigma_true[row]
 
         cov_max = max(np.abs(Sigma_true).max(), np.abs(Sigma_pred).max())
         heatmap_kw = dict(
@@ -107,111 +244,67 @@ def plot_prediction_comparison(
             )
             axes[row, 2].imshow(np.abs(Sigma_true - Sigma_pred), cmap="Reds")
 
-        axes[row, 0].set_title(rf"Oracle $\Sigma^*$ (inst {inst_idx})")
-        axes[row, 1].set_title(rf"Predicted $\hat{{\Sigma}}$ (inst {inst_idx})")
-        axes[row, 2].set_title(rf"$|\Sigma^* - \hat{{\Sigma}}|$ (inst {inst_idx})")
+        axes[row, 0].set_title(rf"Oracle $R^*$ (inst {inst_idx})")
+        axes[row, 1].set_title(rf"Predicted $\hat{{R}}$ (inst {inst_idx})")
+        axes[row, 2].set_title(rf"$|R^* - \hat{{R}}|$ (inst {inst_idx})")
 
         # ------------------------------------------------------------------ #
-        # Mean vectors                                                         #
+        # Column 3: OAS (row 0) or off-diagonal scatter with OLS (rows 1+)   #
         # ------------------------------------------------------------------ #
-        mu_t = mu_true[batch_idx, inst_idx].detach().cpu().numpy()  # (d,)
-        mu_p = mu_pred[batch_idx, inst_idx].detach().cpu().numpy()  # (d,)
-        d = len(mu_t)
-        dims = np.arange(d)
-
         ax = axes[row, 3]
-        if mu_baseline is not None:
-            mu_b = mu_baseline[batch_idx, inst_idx].detach().cpu().numpy()
-            width = 0.25
-            ax.bar(
-                dims - width,
-                mu_t,
-                width,
-                label=r"Oracle $\mu^*$",
-                color="#2563EB",
-                alpha=0.8,
-            )
-            ax.bar(
-                dims,
-                mu_p,
-                width,
-                label=r"Predicted $\hat{\mu}$",
-                color="#EA580C",
-                alpha=0.8,
-            )
-            ax.bar(
-                dims + width,
-                mu_b,
-                width,
-                label=baseline_label,
-                color="#16A34A",
-                alpha=0.8,
-            )
-        else:
-            width = 0.35
-            ax.bar(
-                dims - width / 2,
-                mu_t,
-                width,
-                label=r"Oracle $\mu^*$",
-                color="#2563EB",
-                alpha=0.8,
-            )
-            ax.bar(
-                dims + width / 2,
-                mu_p,
-                width,
-                label=r"Predicted $\hat{\mu}$",
-                color="#EA580C",
-                alpha=0.8,
-            )
-
-        ax.axhline(0, color="gray", lw=0.5)
-        ax.set_xticks(dims)
-        ax.set_xlabel("dim")
-        ax.set_title(rf"Mean (inst {inst_idx})")
-        ax.legend(fontsize=8)
-
-        # ------------------------------------------------------------------ #
-        # Column 4: OAS covariance heatmap or absolute mean error             #
-        # ------------------------------------------------------------------ #
-        ax = axes[row, 4]
-        if sigma_oas is not None:
-            oas_max = max(np.abs(sigma_oas).max(), cov_max)
-            oas_heatmap_kw = dict(
-                cmap="coolwarm", center=0, vmin=-oas_max, vmax=oas_max, square=True
-            )
-            if sns is not None:
-                sns.heatmap(sigma_oas, ax=ax, **oas_heatmap_kw)
-            else:
-                ax.imshow(sigma_oas, cmap="coolwarm", vmin=-oas_max, vmax=oas_max)
-            ax.set_title(r"OAS $\hat{\Sigma}_{OAS}$")
-        else:
-            if mu_baseline is not None:
-                mu_b = mu_baseline[batch_idx, inst_idx].detach().cpu().numpy()
-                width = 0.35
-                ax.bar(
-                    dims - width / 2,
-                    np.abs(mu_t - mu_p),
-                    width,
-                    label=r"$|\mu^*-\hat{\mu}|$",
-                    color="#7C3AED",
-                    alpha=0.8,
+        if row == 0:
+            if sigma_oas is not None:
+                oas_max = max(np.abs(sigma_oas).max(), cov_max)
+                oas_heatmap_kw = dict(
+                    cmap="coolwarm", center=0, vmin=-oas_max, vmax=oas_max, square=True
                 )
-                ax.bar(
-                    dims + width / 2,
-                    np.abs(mu_t - mu_b),
-                    width,
-                    label=f"|μ*−{baseline_label}|",
-                    color="#16A34A",
-                    alpha=0.8,
-                )
-                ax.legend(fontsize=8)
+                if sns is not None:
+                    sns.heatmap(sigma_oas, ax=ax, **oas_heatmap_kw)
+                else:
+                    ax.imshow(sigma_oas, cmap="coolwarm", vmin=-oas_max, vmax=oas_max)
+                ax.set_title(r"OAS $\hat{\Sigma}_{OAS}$ (global baseline)")
             else:
-                ax.bar(dims, np.abs(mu_t - mu_p), color="#7C3AED", alpha=0.8)
-            ax.set_xticks(dims)
-            ax.set_xlabel("dim")
-            ax.set_title(rf"$|\mu^* - \hat{{\mu}}|$ (inst {inst_idx})")
+                ax.axis("off")
+        else:
+            # Off-diagonal scatter: predicted vs oracle, with OLS regression.
+            # slope < 1  → model under-disperses (regresses to mean)
+            # intercept ≠ 0 → constant offset bias
+            x = true_off[row]  # oracle off-diagonal entries
+            y = pred_off[row]  # predicted off-diagonal entries
+            n_pairs = len(x)
+
+            if n_pairs > 30:
+                ax.hexbin(x, y, gridsize=20, cmap="Blues", mincnt=1)
+            else:
+                ax.scatter(x, y, alpha=0.6, s=20, color="steelblue", linewidths=0)
+
+            # OLS regression line
+            slope, intercept = np.polyfit(x, y, 1) if x.std() > 1e-8 else (1.0, 0.0)
+            x_lo, x_hi = x.min(), x.max()
+            x_line = np.array([x_lo, x_hi])
+            ax.plot(x_line, slope * x_line + intercept, "r-", lw=1.5, label="OLS fit")
+
+            # Identity reference
+            lim = max(np.abs(x).max(), np.abs(y).max(), 1e-8) * 1.15
+            ax.plot([-lim, lim], [-lim, lim], "k--", lw=0.8, alpha=0.35, label="y=x")
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.axhline(0, color="gray", lw=0.4, ls=":")
+            ax.axvline(0, color="gray", lw=0.4, ls=":")
+
+            r = (
+                float(np.corrcoef(x, y)[0, 1])
+                if x.std() > 1e-8 and y.std() > 1e-8
+                else float("nan")
+            )
+            ax.set_title(
+                rf"Off-diag $\hat{{R}}$ vs $R^*$ (inst {inst_idx})"
+                + f"\n$r={r:.2f}$  slope$={slope:.2f}$  $b={intercept:.3f}$",
+                fontsize=7,
+            )
+            ax.set_xlabel(r"Oracle $R^*_{ij}$", fontsize=7)
+            ax.set_ylabel(r"Predicted $\hat{R}_{ij}$", fontsize=7)
+            ax.tick_params(labelsize=6)
 
     fig.tight_layout(rect=[0, 0, 1, 0.97] if dataset_label else None)
     return fig

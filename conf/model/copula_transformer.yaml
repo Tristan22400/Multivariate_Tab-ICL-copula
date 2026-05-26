@@ -1,8 +1,8 @@
-d_model: 128
+d_model: 256
 n_heads: 8
-n_layers: 6
+n_layers: 24
 d_ff: null      # null = auto (8/3 * d_model rounded to nearest 64)
 p_max: 20   # pad/truncate features to this size (handles large UCI p)
 d_max: 8       # max target dims; sets dim_enc and mask-token sizes
-rank: null      # null = auto: max(1, int(sqrt(d_max)))
+rank: 4      # null = auto: max(1, int(sqrt(d_max)))
 dropout: 0.0
