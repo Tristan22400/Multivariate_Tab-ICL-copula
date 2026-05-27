@@ -1,6 +1,9 @@
 #!/bin/bash
 #OAR -n TabICL_Generate
 #OAR -l gpu=1,walltime=16:00:00
+#OAR -p gpumem>=40000
+
+
 
 
 set -e

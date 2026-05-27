@@ -467,15 +467,14 @@ def generate_episode(
     device: torch.device | str,
     mlp_hidden: int = 64,
     return_oracle: bool = False,
-    fixed_cov: bool = False,
-    fixed_cov_rho: float = 0.8,
-    fixed_cov_params: tuple | None = None,
-    fixed_cov_n_anchors: int = 4,
     fixed_nets: GlobalFixedNets | None = None,
     anchor_gen: GlobalAnchorCovGen | None = None,
     kernel_cov_gen: KernelCovGen | None = None,
     diag_alpha: float = 0.0,
     return_norm_stats: bool = False,
+    hyperplane_bimodal: bool = False,
+    hyperplane_bimodal_scale_lo: float = 0.3,
+    hyperplane_bimodal_scale_hi: float = 3.0,
 ) -> tuple:
     """Generate one training episode (one gradient step worth of data).
 
@@ -516,12 +515,6 @@ def generate_episode(
             "D"  : (B, n_test, d) — ground-truth diagonal variance (normalised space)
             "V"  : (B, n_test, d, r) — ground-truth low-rank factor (normalised space)
 
-    fixed_cov : bool
-        When True, each of the B datasets gets an independently sampled
-        covariance Sigma = diag(D) + V @ V^T and a piecewise-constant mean
-        defined by fixed_cov_n_anchors Voronoi regions.  Both are constant
-        across all T instances within one dataset.  Y is still z-normalised.
-        fixed_cov_params, if supplied, must have shapes (B, 1, d) and (B, 1, d, r).
     """
     T = n_train + n_test
 
@@ -529,29 +522,42 @@ def generate_episode(
     X = sample_tabular_x(B, T, p, device, n_train=n_train)  # (B, T, p)
 
     with torch.no_grad():
-        if fixed_cov:
-            # Per-dataset fixed covariance + piecewise-constant mean.
-            # D and V are sampled independently per batch element (B, 1, d) / (B, 1, d, r)
-            # and broadcast to all T instances within each dataset.
-            # fixed_cov_params, if supplied, must have matching shapes (B, 1, d) and (B, 1, d, r).
-            if fixed_cov_params is not None:
-                D_fixed, V_fixed = fixed_cov_params
-            else:
-                D_fixed = (
-                    torch.nn.functional.softplus(torch.randn(B, 1, d, device=device))
-                    + 1e-6
-                )
-                V_fixed = torch.randn(B, 1, d, r, device=device) / math.sqrt(r)
-            diag_x = D_fixed.expand(B, T, d)
-            V_x = V_fixed.expand(B, T, d, r)
+        if hyperplane_bimodal:
+            # Two random PSD matrices per dataset (Σ₁ weak, Σ₂ strong), separated by a
+            # random hyperplane in X-space.  The hyperplane threshold is the per-dataset
+            # median of the training-split projections so the split is exactly ~50/50 in
+            # the context set regardless of the X distribution.
+            scale1 = hyperplane_bimodal_scale_lo / math.sqrt(r)
+            scale2 = hyperplane_bimodal_scale_hi / math.sqrt(r)
+
+            D1 = F.softplus(torch.randn(B, 1, d, device=device)) + 1e-6  # (B, 1, d)
+            V1 = torch.randn(B, 1, d, r, device=device) * scale1  # (B, 1, d, r)
+            D2 = F.softplus(torch.randn(B, 1, d, device=device)) + 1e-6  # (B, 1, d)
+            V2 = torch.randn(B, 1, d, r, device=device) * scale2  # (B, 1, d, r)
+
+            # One unit-norm hyperplane direction per dataset in feature space
+            w = F.normalize(torch.randn(B, p, device=device), dim=-1)  # (B, p)
+
+            # Scalar projection of every instance onto the hyperplane normal
+            scores = torch.einsum("btp,bp->bt", X, w)  # (B, T)
+
+            # Per-dataset threshold = median of training projections (guarantees ~50/50 split)
+            threshold = scores[:, :n_train].median(dim=1).values.unsqueeze(1)  # (B, 1)
+
+            # True → group 1 (Σ₁ / weak), False → group 2 (Σ₂ / strong)
+            mask = scores > threshold  # (B, T)
+
+            mask_d = mask.unsqueeze(-1)  # (B, T, 1)
+            mask_v = mask.unsqueeze(-1).unsqueeze(-1)  # (B, T, 1, 1)
+            diag_x = torch.where(
+                mask_d, D1.expand(B, T, d), D2.expand(B, T, d)
+            )  # (B, T, d)
+            V_x = torch.where(
+                mask_v, V1.expand(B, T, d, r), V2.expand(B, T, d, r)
+            )  # (B, T, d, r)
             _r = r
-            # Piecewise-constant mean: fixed_cov_n_anchors Voronoi regions per dataset,
-            # hard nearest-anchor assignment (same pattern as AnchorCovarianceGen.get_mean).
-            K_mu = fixed_cov_n_anchors
-            C = F.normalize(torch.randn(B, K_mu, p, device=device), dim=-1)  # (B, K, p)
-            M = torch.randn(B, K_mu, d, device=device)                        # (B, K, d)
-            k_star = torch.einsum("btp,bkp->btk", X, C).argmax(dim=-1)        # (B, T)
-            mu_x = M[torch.arange(B, device=device).unsqueeze(1), k_star]     # (B, T, d)
+            mu_x = torch.zeros(B, T, d, device=device)
+
         elif kernel_cov_gen is not None:
             # Kernel-based: full x-dependent distribution (mean, diagonal, and full-rank covariance
             # all vary per instance via frozen random MLPs sampled fresh each episode).
