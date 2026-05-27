@@ -8,3 +8,5 @@
 
 
 Use the conda environment 'multivariate_ICL' to run some test locally. 
+python src/train_on_datasets.py --config conf/config.yaml --ckpt ./checkpoints/copula-tabicl/
+ 
