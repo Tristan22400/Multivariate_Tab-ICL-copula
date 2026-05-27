@@ -605,6 +605,7 @@ def main(cfg: DictConfig) -> None:
             f"s3={getattr(cfg.model, 'n_layers_s3', '?')}",
         )
         _aux_w = float(cfg.training.get("aux_mse_weight", 0.0))
+        _nll_w = float(cfg.training.get("nll_weight", 1.0))
         _run_name = (
             f"lr={_lr_str}"
             f"_steps={cfg.training.steps}"
@@ -612,6 +613,7 @@ def main(cfg: DictConfig) -> None:
             f"_L={_n_layers}"
             f"_H={cfg.model.n_heads}"
             f"_r={cfg.model.rank}"
+            f"_nllw={_nll_w}"
             f"_auxw={_aux_w}"
             f"_data={_data_tag}"
         )
@@ -702,7 +704,8 @@ def main(cfg: DictConfig) -> None:
             # ---- Loss: Woodbury NLL on test queries ----
             Z_query = Z_test_ep  # (B, n_test, d)
             loss_nll = woodbury_nll(Z_query, mu_Z, d_Z, V_Z)
-            loss = loss_nll
+            nll_weight = float(cfg.training.get("nll_weight", 1.0))
+            loss = nll_weight * loss_nll
 
             # ---- Auxiliary off-diagonal MSE loss ----
             aux_weight = float(cfg.training.get("aux_mse_weight", 0.0))
@@ -789,6 +792,7 @@ def main(cfg: DictConfig) -> None:
                         "train/oracle_off_diag_var": oracle_off_diag_var,
                         "train/aux_mse": loss_mse_val,
                         "train/alpha": alpha,
+                        "train/nll_weight": nll_weight,
                         "train/lr": lr_now,
                         "step": step,
                     },
