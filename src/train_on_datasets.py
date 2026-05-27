@@ -31,7 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
@@ -96,6 +96,52 @@ def moment_estimator(Z: torch.Tensor, delta: float = 1e-6) -> torch.Tensor:
     std = S.diagonal().clamp(min=1e-8).sqrt()
     R = S / (std.unsqueeze(1) * std.unsqueeze(0))
     return R
+
+
+def _xi_cond_stats(R: torch.Tensor) -> dict[str, float]:
+    """Xi-conditioning diagnostics for a batch of correlation matrices.
+
+    Args:
+        R : (n, d, d) correlation matrices — one per query point xi.
+    Returns:
+        mean_abs_offdiag  : avg |R_ij| for i≠j — overall correlation strength.
+        std_offdiag_xi    : mean std of each off-diagonal entry across query
+                            points — 0 for xi-invariant models (moment), >0
+                            when the model adapts its predictions to xi.
+        var_frob_from_I   : variance of ||R - I||_F^2 across instances —
+                            a single-number summary of xi-conditioning.
+    """
+    n, d, _ = R.shape
+    idx_i, idx_j = torch.tril_indices(d, d, offset=-1, device=R.device)
+    offdiag = R[:, idx_i, idx_j]          # (n, n_pairs)
+    mean_abs = offdiag.abs().mean().item()
+    # std across query instances for each pair, then averaged over pairs
+    std_xi = offdiag.std(dim=0).mean().item() if n > 1 else 0.0
+    I = torch.eye(d, device=R.device).unsqueeze(0)
+    frob_sq = (R - I).pow(2).sum(dim=(-1, -2))  # (n,)
+    var_frob = frob_sq.var().item() if n > 1 else 0.0
+    return {
+        "mean_abs_offdiag": mean_abs,
+        "std_offdiag_xi": std_xi,
+        "var_frob_from_I": var_frob,
+    }
+
+
+def _woodbury_diag_stats(D: torch.Tensor, V: torch.Tensor) -> dict[str, float]:
+    """Variance stats for the diagonal of Sigma = diag(D) + VV^T across xi.
+
+    Args:
+        D : (n, d)    — diagonal variances per query point.
+        V : (n, d, r) — low-rank factors per query point.
+    Returns:
+        mean_diag_var     : mean of diag(Sigma) across dims and instances.
+        std_diag_var_xi   : mean std of diag(Sigma) across query instances —
+                            measures how much the marginal variance varies with xi.
+    """
+    diag_var = D + (V**2).sum(-1)          # (n, d)  — diag(diag(D) + VV^T)
+    mean_dv = diag_var.mean().item()
+    std_dv_xi = diag_var.std(dim=0).mean().item() if D.shape[0] > 1 else 0.0
+    return {"mean_diag_var": mean_dv, "std_diag_var_xi": std_dv_xi}
 
 
 def shrinkage_grid_cv(
@@ -533,9 +579,20 @@ def main() -> None:
         lr=float(acfg.lr),
         weight_decay=float(acfg.weight_decay),
     )
-    scheduler = CosineAnnealingLR(
-        optimizer, T_max=max(n_steps, 1), eta_min=float(acfg.lr_min)
+    warmup_steps = int(acfg.get("warmup_steps", 0))
+    cosine_steps = max(n_steps - warmup_steps, 1)
+    _cosine = CosineAnnealingLR(
+        optimizer, T_max=cosine_steps, eta_min=float(acfg.lr_min)
     )
+    if warmup_steps > 0:
+        _warmup = LinearLR(
+            optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
+        )
+        scheduler = SequentialLR(
+            optimizer, schedulers=[_warmup, _cosine], milestones=[warmup_steps]
+        )
+    else:
+        scheduler = _cosine
 
     best_val_nll = float("inf")
     best_state = copy.deepcopy(model.state_dict())
@@ -583,11 +640,16 @@ def main() -> None:
             else:
                 steps_since_improvement += val_every
 
+            # --- xi-conditioning diagnostics on val set ---
+            xi_val = _xi_cond_stats(R_val)
+
             lr_now = scheduler.get_last_lr()[0]
             print(
                 f"[step {step:>5d}]  train={loss.item():.4f}  val={val_nll:.4f}"
                 f"{'*' if improved else ' '}  γ={gamma_mean:.3f}  λ={lam_mean:.3f}"
                 f"  lr={lr_now:.2e}"
+                f"  |ρ|={xi_val['mean_abs_offdiag']:.3f}"
+                f"  std_ξ={xi_val['std_offdiag_xi']:.4f}"
             )
             if wandb_run is not None:
                 wandb_run.log(
@@ -597,6 +659,9 @@ def main() -> None:
                         "attn/gamma_mean": gamma_mean,
                         "attn/lambda_mean": lam_mean,
                         "attn/lr": lr_now,
+                        "attn/val_mean_abs_offdiag": xi_val["mean_abs_offdiag"],
+                        "attn/val_std_offdiag_xi": xi_val["std_offdiag_xi"],
+                        "attn/val_var_frob_from_I": xi_val["var_frob_from_I"],
                     },
                     step=step,
                 )
@@ -725,12 +790,52 @@ def main() -> None:
         "eval/shrunk_moment_best_lambda": best_lam_cv,
     }
 
+    # ====================================================================
+    # Xi-conditioning table — does each model's covariance vary with xi?
+    # ====================================================================
+    # For correlation-matrix models: std_offdiag_xi > 0 ↔ model is xi-conditioned.
+    # For Woodbury (D, V) models: std_diag_var_xi > 0 ↔ marginal variance varies with xi.
+    # Moment / ShrunkMoment give a single global R → xi-invariant (std=0 by construction).
+
+    # Broadcast global R matrices to (n_test, d, d) for uniform API
+    R_mom_exp_stat = R_mom_full.unsqueeze(0).expand(n_test, -1, -1)
+    R_shrunk_exp_stat = R_shrunk.unsqueeze(0).expand(n_test, -1, -1)
+
+    xi_corr_models: dict[str, torch.Tensor] = {
+        "moment":      R_mom_exp_stat,
+        "shrunk_mom":  R_shrunk_exp_stat,
+        "nw_rbf":      nw_R["rbf"],
+        "nw_epan":     nw_R["epanechnikov"],
+        "nw_laplace":  nw_R["laplace"],
+        "attn":        R_attn,
+        "ct":          R_ct,
+        "oracle":      R_oracle,
+    }
+    xi_corr_stats: dict[str, dict[str, float]] = {
+        name: _xi_cond_stats(R) for name, R in xi_corr_models.items()
+    }
+    # Woodbury (D, V) models have actual diagonal variances per xi
+    xi_wb_stats: dict[str, dict[str, float]] = {
+        "oracle": _woodbury_diag_stats(oracle_D, oracle_V),
+        "ct":     _woodbury_diag_stats(d_ct, V_ct),
+    }
+
+    # Flatten into eval_metrics for W&B
+    for name, s in xi_corr_stats.items():
+        for k, v in s.items():
+            eval_metrics[f"xi_cond/{name}_{k}"] = v
+    for name, s in xi_wb_stats.items():
+        for k, v in s.items():
+            eval_metrics[f"xi_cond/{name}_{k}"] = v
+
     print("\n--- Summary ---")
     col_w = max(len(k) for k in eval_metrics) + 2
     copula_keys = [k for k in eval_metrics if "copula_nll" in k]
     joint_keys = [k for k in eval_metrics if "joint_nll_y" in k]
+    xi_keys = [k for k in eval_metrics if k.startswith("xi_cond/")]
     diag_keys = [
-        k for k in eval_metrics if k not in copula_keys and k not in joint_keys
+        k for k in eval_metrics
+        if k not in copula_keys and k not in joint_keys and k not in xi_keys
     ]
     for header, keys in [
         ("Copula NLL (z-space)", copula_keys),
@@ -740,6 +845,22 @@ def main() -> None:
         print(f"\n  [{header}]")
         for k in keys:
             print(f"  {k:<{col_w}}: {eval_metrics[k]:.4f}")
+
+    # ---- Xi-conditioning table (console only — more readable as a table) ----
+    model_names = list(xi_corr_stats.keys())
+    print(f"\n  [Xi-conditioning: does the predicted covariance vary with xi?]")
+    print(f"  {'model':<14}  {'|ρ|_mean':>9}  {'std_ξ(ρ)':>10}  {'var_frob':>10}", end="")
+    print(f"  {'mean_var':>10}  {'std_var_ξ':>10}")
+    print("  " + "-" * 68)
+    for name in model_names:
+        cs = xi_corr_stats[name]
+        wb = xi_wb_stats.get(name, {})
+        mv = wb.get("mean_diag_var", float("nan"))
+        sv = wb.get("std_diag_var_xi", float("nan"))
+        print(
+            f"  {name:<14}  {cs['mean_abs_offdiag']:>9.4f}  {cs['std_offdiag_xi']:>10.5f}"
+            f"  {cs['var_frob_from_I']:>10.5f}  {mv:>10.4f}  {sv:>10.5f}"
+        )
 
     if wandb_run is not None:
         wandb_run.log(eval_metrics, step=final_step)
