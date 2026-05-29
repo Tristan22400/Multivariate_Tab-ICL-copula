@@ -851,9 +851,10 @@ class CopulaTabICLv2(nn.Module):
         self.embed_tae = nn.Linear(d_max + d_vech, d_model)
         # Embed_ICL: same input → d_icl
         self.embed_icl = nn.Linear(d_max + d_vech, d_icl)
-        # Gate on ICL injection: sigmoid(-3) ≈ 0.047 at init.
-        # Prevents embed_icl from dominating S3 keys at the start of training.
-        self.icl_gate = nn.Parameter(torch.tensor(-3.0))
+        # Gate on ICL injection: sigmoid(-1) ≈ 0.27 at init.
+        # Provides 4× stronger gradient than the original -3.0 init (sigmoid≈0.05)
+        # which caused the gate to remain permanently closed across all runs.
+        self.icl_gate = nn.Parameter(torch.tensor(-1.0))
 
         # ---- Feature embedding -----------------------------------------------
         self.phi_X = nn.Linear(1, d_model, bias=False)
@@ -882,6 +883,12 @@ class CopulaTabICLv2(nn.Module):
             [ICLBlock(d_icl, n_heads, d_ff_icl, dropout) for _ in range(n_layers_s3)]
         )
         self.s3_norm = RMSNorm(d_icl)
+        # Normalise the mean-subtracted query embeddings before the readout head.
+        # After mean-subtraction the residual has RMS ~0.06 while dim_emb has
+        # magnitude ~1, so fc_V would be blind to instance-specific signal.
+        # Initialised as identity (scale=ones) so checkpoint loading with
+        # strict=False preserves the current behaviour until further training.
+        self.query_emb_norm = RMSNorm(d_icl)
 
         # ---- Per-dimension conditioning for readout --------------------------
         # Learnable embedding for each target dimension index, concatenated with
@@ -1042,7 +1049,10 @@ class CopulaTabICLv2(nn.Module):
         # s3_norm collapses every query row to the same unit vector.
         # Subtracting the mean zeros the shared component and exposes the
         # instance-specific signal that varies across query rows.
+        # query_emb_norm then rescales to unit RMS so fc_V sees a consistent
+        # magnitude regardless of how much S3 differentiated the query rows.
         query_emb = query_emb - query_emb.mean(dim=1, keepdim=True)
+        query_emb = self.query_emb_norm(query_emb)
 
         # Tile row embedding over d_max dimensions, then concat per-dim embedding.
         # This breaks the symmetry: each dimension gets a distinct input to fc_V,

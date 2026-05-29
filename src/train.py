@@ -636,10 +636,19 @@ def main(cfg: DictConfig) -> None:
             raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
         print(f"Resuming from checkpoint: {resume_from}")
         ckpt = torch.load(resume_from, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state"])
+        missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+        if missing:
+            print(f"  New parameters (default init): {missing}")
+        if unexpected:
+            print(f"  Unexpected keys ignored: {unexpected}")
         optimizer.load_state_dict(ckpt["optimizer_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
         start_step = int(ckpt["step"]) + 1
+        if cfg.training.get("reset_icl_gate", False):
+            raw_model = getattr(model, "_orig_mod", model)
+            with torch.no_grad():
+                raw_model.icl_gate.fill_(-1.0)
+            print("  icl_gate reset to -1.0 (overriding stuck checkpoint value).")
         print(f"Resumed at step {start_step}.")
     else:
         print("No resume_from specified, training from scratch.")
