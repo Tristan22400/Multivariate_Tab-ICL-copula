@@ -10,20 +10,24 @@ training:
   device: auto
   batch_size: 8          # B datasets per step (unused if dataset_dir is set; stored in episode)
   steps: 100000
-  lr: 1.0e-6
+  lr: 1.0e-4
   lr_min: 1.0e-8
+  warmup_steps: 1000        # linear LR warmup before cosine decay
   weight_decay: 0.0
   clip_grad_norm: 0.1
-  aux_mse_weight: 1.0        # peak weight for off-diagonal MSE auxiliary loss; set 0 to disable
+  gradient_accumulation_steps: 16  # accumulate gradients over N steps before optimizer update
+  nll_weight: 1.0            # weight on the Woodbury NLL term; set 0.0 to train with auxiliary loss only
+  aux_mse_weight: 0.0        # peak weight for off-diagonal MSE auxiliary loss; set 0 to disable
   aux_mse_anneal_frac: 0.7   # anneal weight from aux_mse_weight to 0 over this fraction of steps
   log_every: 100
   val_every: 500
   plot_every: 500
   save_every: 5000
-  ckpt_dir: null
+  ckpt_dir: ./checkpoints/copula-tabicl/mse
   resume_from: null  # direct checkpoint path; takes priority over ckpt_dir auto-detection
-  dataset_dir: ./data/pit_episodes_kernel_d4_n_train_256  # path to pre-computed PIT episodes; required for training
+  dataset_dir: ./data/pit_hyperplane_debug  # path to pre-computed PIT episodes; required for training
   val_n_episodes: 50       # number of held-out episodes reserved for validation (never used in training)
+  compile: true          # set true to enable torch.compile (~60 s one-time JIT cost, then 20-40% faster)
 
 dataset:
   n_episodes: 100000
@@ -52,9 +56,11 @@ attn_copula:
   steps: 5000
   lr: 1.0e-3
   lr_min: 1.0e-6
+  warmup_steps: 200         # linear LR warmup before cosine decay
   clip_grad: 1.0
   val_every: 100         # evaluate on held-out val set every N steps
   patience: 500          # early stopping: stop if no improvement for N steps
+
 
 
 

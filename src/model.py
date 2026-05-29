@@ -724,11 +724,21 @@ class ICLBlock(nn.Module):
         )
         self.norm2 = RMSNorm(d_icl)
         self.ffn = SwiGLUFFN(d_icl, d_ff, dropout=dropout)
+        # ReZero: learned scalars, init=0 → block starts as identity.
+        self.alpha_attn = nn.Parameter(torch.zeros(1))
+        self.alpha_ffn  = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x: torch.Tensor, n_support: int) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        n_support: int,
+        return_attn_weights: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Args:
-        x         : (B, N, d_icl).
-        n_support : number of support instances.
+        x                  : (B, N, d_icl).
+        n_support          : number of support instances.
+        return_attn_weights: if True, return (x, attn_weights) where
+                             attn_weights is (B, N, N) averaged over heads.
         """
         N = x.shape[1]
         mask = torch.zeros(N, N, dtype=x.dtype, device=x.device)
@@ -736,8 +746,16 @@ class ICLBlock(nn.Module):
             mask[:, n_support:] = float("-inf")
 
         x_n = self.norm1(x)
-        x = x + self.attn(x_n, x_n, x_n, attn_mask=mask)[0]
-        x = x + self.ffn(self.norm2(x))
+        attn_out, attn_w = self.attn(
+            x_n, x_n, x_n,
+            attn_mask=mask,
+            need_weights=return_attn_weights,
+            average_attn_weights=True,
+        )
+        x = x + self.alpha_attn * attn_out
+        x = x + self.alpha_ffn  * self.ffn(self.norm2(x))
+        if return_attn_weights:
+            return x, attn_w
         return x
 
 
@@ -810,6 +828,7 @@ class CopulaTabICLv2(nn.Module):
         rank: Optional[int] = None,
         d_ff: Optional[int] = None,
         dropout: float = 0.0,
+        phi_x_scale: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -832,6 +851,9 @@ class CopulaTabICLv2(nn.Module):
         self.embed_tae = nn.Linear(d_max + d_vech, d_model)
         # Embed_ICL: same input → d_icl
         self.embed_icl = nn.Linear(d_max + d_vech, d_icl)
+        # Gate on ICL injection: sigmoid(-3) ≈ 0.047 at init.
+        # Prevents embed_icl from dominating S3 keys at the start of training.
+        self.icl_gate = nn.Parameter(torch.tensor(-3.0))
 
         # ---- Feature embedding -----------------------------------------------
         self.phi_X = nn.Linear(1, d_model, bias=False)
@@ -873,6 +895,7 @@ class CopulaTabICLv2(nn.Module):
         self.fc_V = _MLP2(d_icl + d_dim_emb, d_ff_head, rank_max)
 
         # ---- Config ----------------------------------------------------------
+        self.phi_x_scale = phi_x_scale
         self.p_max = p_max
         self.d_max = d_max
         self.n_cls = n_cls
@@ -962,7 +985,7 @@ class CopulaTabICLv2(nn.Module):
         else:
             X_in = X_all
 
-        E1 = self.phi_X(X_in.unsqueeze(-1))  # (B, N, p_max, d_model)
+        E1 = self.phi_X(X_in.unsqueeze(-1)) * self.phi_x_scale  # (B, N, p_max, d_model)
 
         # Add target-aware embedding to all feature tokens of support rows
         E2 = E1.clone()
@@ -1000,7 +1023,7 @@ class CopulaTabICLv2(nn.Module):
         # 4. Stage 3: TF_icl — ICL over row embeddings
         # ------------------------------------------------------------------
         row_emb = row_emb.clone()
-        row_emb[:, :n_support, :] = row_emb[:, :n_support, :] + icl_emb
+        row_emb[:, :n_support, :] += torch.sigmoid(self.icl_gate) * icl_emb
 
         for block in self.s3_blocks:
             row_emb = block(row_emb, n_support)
@@ -1011,6 +1034,15 @@ class CopulaTabICLv2(nn.Module):
         # 5. Readout: per-dimension MLP on query row embeddings
         # ------------------------------------------------------------------
         query_emb = row_emb[:, n_support:, :]  # (B, n_query, d_icl)
+
+        # Remove the shared "support-context drift" component.
+        # All query rows attend to the same support in Stage 3, so each ICL
+        # block adds the same large residual to all of them.  After 12 blocks
+        # the shared component dominates (||shared|| >> ||specific||) and
+        # s3_norm collapses every query row to the same unit vector.
+        # Subtracting the mean zeros the shared component and exposes the
+        # instance-specific signal that varies across query rows.
+        query_emb = query_emb - query_emb.mean(dim=1, keepdim=True)
 
         # Tile row embedding over d_max dimensions, then concat per-dim embedding.
         # This breaks the symmetry: each dimension gets a distinct input to fc_V,

@@ -44,7 +44,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 # ---------------------------------------------------------------------------
 # Path setup — must happen before local imports
@@ -147,7 +147,7 @@ def run_val_pit(
     holds exactly:   joint_y_nll = copula_nll + marginal_nll.
 
     Metrics:
-        val/copula_nll        — model copula NLL on Z_test (full context)
+        val/copula_nll        — model copula NLL on Z_test (70% of train as support)
         val/joint_y_nll       — copula_nll + marginal_nll = full joint NLL in Y-space
         val/train_nll         — model copula NLL on Z_train 70/30 split (overfitting check)
         val/marginal_nll      — always 0.0 (copula NLL of N(0,I); fixed by PIT construction)
@@ -199,13 +199,50 @@ def run_val_pit(
             B, n_train, _ = Z_tr.shape
             _, n_test, d = Z_te.shape
 
-            # ---- Model: full context → Z_test ----
-            X_all = torch.cat([X_tr, X_te], dim=1)
-            Z_all = torch.cat([Z_tr, torch.zeros_like(Z_te)], dim=1)
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                mu_Z, d_Z, V_Z = model(X_all, Z_all, n_support=n_train)
-            mu_Z, d_Z, V_Z = mu_Z.float(), d_Z.float(), V_Z.float()
+            # ---- Single forward pass: 70% of X_tr as support,
+            #      query the remaining 30% of X_tr (overfitting check) and
+            #      all X_te (test eval) together. This avoids a second model
+            #      call which would overwrite the CUDAGraph output buffer.
+            n_sup = max(1, int(0.7 * n_train))
+            perm_tr = torch.randperm(n_train, device=device)
+            X_sup = X_tr[:, perm_tr[:n_sup], :]
+            Z_sup = Z_tr[:, perm_tr[:n_sup], :]
+            X_tr_qry = X_tr[:, perm_tr[n_sup:], :]
+            Z_tr_qry = Z_tr[:, perm_tr[n_sup:], :]
+            n_tr_qry = X_tr_qry.shape[1]
 
+            X_fwd = torch.cat([X_sup, X_tr_qry, X_te], dim=1)
+            Z_fwd = torch.cat(
+                [Z_sup, torch.zeros_like(Z_tr_qry), torch.zeros_like(Z_te)], dim=1
+            )
+
+            torch.compiler.cudagraph_mark_step_begin()
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                mu_all, d_all, V_all = model(X_fwd, Z_fwd, n_support=n_sup)
+            mu_all = mu_all.float()
+            d_all = d_all.float()
+            V_all = V_all.float()
+
+            # Split outputs: first n_tr_qry slots → train check; rest → test
+            mu_tr, d_tr, V_tr = (
+                mu_all[:, :n_tr_qry],
+                d_all[:, :n_tr_qry],
+                V_all[:, :n_tr_qry],
+            )
+            mu_Z, d_Z, V_Z = (
+                mu_all[:, n_tr_qry:],
+                d_all[:, n_tr_qry:],
+                V_all[:, n_tr_qry:],
+            )
+
+            # ---- Overfitting check (train copula NLL) ----
+            train_copula_nll = (
+                woodbury_nll(Z_tr_qry, mu_tr, d_tr, V_tr).item()
+                - indep_normal_nll(Z_tr_qry).item()
+            )
+            agg["val/train_nll"].append(train_copula_nll)
+
+            # ---- Test metrics ----
             # I_z = indep_normal_nll(Z_te) is computed once and reused for all
             # Jacobian corrections.  copula_nll = woodbury_nll - I_z for every metric.
             indep_z = indep_normal_nll(Z_te).item()
@@ -230,25 +267,6 @@ def run_val_pit(
             agg["val/energy_score"].append(
                 _energy_score_batched(mu_Z, d_Z, V_Z, Z_te, n_samples=50)
             )
-
-            # ---- Train copula NLL: 70/30 split (overfitting check vs val/copula_nll) ----
-            n_sup = max(1, int(0.7 * n_train))
-            perm_tr = torch.randperm(n_train, device=device)
-            X_tr_perm = X_tr[:, perm_tr, :]
-            Z_tr_perm = Z_tr[:, perm_tr, :]
-            # Mask query Z values to zeros — same convention as test evaluation
-            # (lines 181-182), so the model cannot leak query Z into its predictions.
-            Z_tr_input = Z_tr_perm.clone()
-            Z_tr_input[:, n_sup:, :] = 0.0
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                mu_tr, d_tr, V_tr = model(X_tr_perm, Z_tr_input, n_support=n_sup)
-            mu_tr, d_tr, V_tr = mu_tr.float(), d_tr.float(), V_tr.float()
-            Z_query_tr = Z_tr_perm[:, n_sup:, :]
-            train_copula_nll = (
-                woodbury_nll(Z_query_tr, mu_tr, d_tr, V_tr).item()
-                - indep_normal_nll(Z_query_tr).item()
-            )
-            agg["val/train_nll"].append(train_copula_nll)
 
             # ---- OAS + kNN5 + linear baselines ----
             oas_nlls, knn5_nlls, linear_nlls = [], [], []
@@ -382,9 +400,9 @@ def run_val_pit(
                 plot_episodes.append(
                     {
                         "key": f"pit_ep{i_ep}",
-                        "mu_pred": mu_Z,
-                        "D_pred": d_Z,
-                        "V_pred": V_Z,
+                        "mu_pred": mu_Z.clone(),
+                        "D_pred": d_Z.clone(),
+                        "V_pred": V_Z.clone(),
                         "mu_true": oracle_mu,
                         "D_true": oracle_D,
                         "V_true": oracle_V,
@@ -493,7 +511,7 @@ def _save_checkpoint(
     step: int,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: CosineAnnealingLR,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     cfg: DictConfig,
 ) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -556,11 +574,20 @@ def main(cfg: DictConfig) -> None:
         lr=float(cfg.training.lr),
         weight_decay=float(cfg.training.weight_decay),
     )
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=int(cfg.training.steps),
-        eta_min=float(cfg.training.lr_min),
+    warmup_steps = int(cfg.training.get("warmup_steps", 0))
+    cosine_steps = max(int(cfg.training.steps) - warmup_steps, 1)
+    _cosine = CosineAnnealingLR(
+        optimizer, T_max=cosine_steps, eta_min=float(cfg.training.lr_min)
     )
+    if warmup_steps > 0:
+        _warmup = LinearLR(
+            optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
+        )
+        scheduler = SequentialLR(
+            optimizer, schedulers=[_warmup, _cosine], milestones=[warmup_steps]
+        )
+    else:
+        scheduler = _cosine
 
     # ---- W&B (optional) ----
     wandb_run = None
@@ -578,6 +605,7 @@ def main(cfg: DictConfig) -> None:
             f"s3={getattr(cfg.model, 'n_layers_s3', '?')}",
         )
         _aux_w = float(cfg.training.get("aux_mse_weight", 0.0))
+        _nll_w = float(cfg.training.get("nll_weight", 1.0))
         _run_name = (
             f"lr={_lr_str}"
             f"_steps={cfg.training.steps}"
@@ -585,6 +613,7 @@ def main(cfg: DictConfig) -> None:
             f"_L={_n_layers}"
             f"_H={cfg.model.n_heads}"
             f"_r={cfg.model.rank}"
+            f"_nllw={_nll_w}"
             f"_auxw={_aux_w}"
             f"_data={_data_tag}"
         )
@@ -617,9 +646,9 @@ def main(cfg: DictConfig) -> None:
 
     # ---- torch.compile (optional, ~60 s one-time compilation cost) ----
     if cfg.training.get("compile", False) and device == "cuda":
-        model = torch.compile(model, mode="reduce-overhead", dynamic=False)
+        model = torch.compile(model, mode="default", dynamic=False)
         print(
-            "torch.compile enabled (mode=reduce-overhead) — first forward will trigger JIT compilation."
+            "torch.compile enabled (mode=default) — first forward will trigger JIT compilation."
         )
 
     # ---- Data loader (training episodes only — val episodes held out) ----
@@ -663,8 +692,11 @@ def main(cfg: DictConfig) -> None:
         X_fwd = torch.cat([X_train, X_test_ep], dim=1)  # (B, N+n_test, p)
         Z_fwd = torch.cat([Z_train, Z_test_ep], dim=1)  # (B, N+n_test, d)
 
+        torch.compiler.cudagraph_mark_step_begin()
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
             mu_Z, d_Z, V_Z = model(X_fwd, Z_fwd, n_support=N)
+
+            mu_Z, d_Z, V_Z = mu_Z.clone(), d_Z.clone(), V_Z.clone()
             # mu_Z: (B, n_test, d)
             # d_Z:  (B, n_test, d)
             # V_Z:  (B, n_test, d, r)
@@ -672,7 +704,8 @@ def main(cfg: DictConfig) -> None:
             # ---- Loss: Woodbury NLL on test queries ----
             Z_query = Z_test_ep  # (B, n_test, d)
             loss_nll = woodbury_nll(Z_query, mu_Z, d_Z, V_Z)
-            loss = loss_nll
+            nll_weight = float(cfg.training.get("nll_weight", 1.0))
+            loss = nll_weight * loss_nll
 
             # ---- Auxiliary off-diagonal MSE loss ----
             aux_weight = float(cfg.training.get("aux_mse_weight", 0.0))
@@ -759,6 +792,7 @@ def main(cfg: DictConfig) -> None:
                         "train/oracle_off_diag_var": oracle_off_diag_var,
                         "train/aux_mse": loss_mse_val,
                         "train/alpha": alpha,
+                        "train/nll_weight": nll_weight,
                         "train/lr": lr_now,
                         "step": step,
                     },
@@ -779,6 +813,7 @@ def main(cfg: DictConfig) -> None:
                 amp_dtype=amp_dtype,
                 use_amp=use_amp,
             )
+            model.train()
 
         # ---- Checkpoint ----
         if (

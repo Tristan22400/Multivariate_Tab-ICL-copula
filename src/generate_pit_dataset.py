@@ -89,16 +89,20 @@ def main(cfg: DictConfig) -> None:
     nt_lo, nt_hi = int(cfg.data.n_test_range[0]), int(cfg.data.n_test_range[1])
     r_data = int(cfg.data.r_data)
     mlp_hidden = int(cfg.data.mlp_hidden)
-    fixed_cov = bool(cfg.data.get("fixed_cov", False))
-    fixed_cov_rho = float(cfg.data.get("fixed_cov_rho", 0.8))
-    fixed_cov_n_anchors = int(cfg.data.get("fixed_cov_n_anchors", 4))
     diag_alpha = float(cfg.data.get("diag_alpha", 0.0))
+    hyperplane_bimodal = bool(cfg.data.get("hyperplane_bimodal", False))
+    hyperplane_bimodal_scale_lo = float(
+        cfg.data.get("hyperplane_bimodal_scale_lo", 0.3)
+    )
+    hyperplane_bimodal_scale_hi = float(
+        cfg.data.get("hyperplane_bimodal_scale_hi", 3.0)
+    )
 
     # ---- Covariance generator (persistent across episodes for stability) ----
     fixed_nets: GlobalFixedNets | None = None
     anchor_gen: GlobalAnchorCovGen | None = None
     kernel_cov_gen: KernelCovGen | None = None
-    if not fixed_cov:
+    if not hyperplane_bimodal:
         cov_type = str(cfg.data.get("cov_type", "mlp"))
         if cov_type == "anchor":
             num_anchors = int(cfg.data.get("num_anchors", 8))
@@ -136,7 +140,7 @@ def main(cfg: DictConfig) -> None:
         "n_train_range": [pt_lo, pt_hi],
         "n_test_range": [nt_lo, nt_hi],
         "r_data": r_data,
-        "fixed_cov": fixed_cov,
+        "hyperplane_bimodal": hyperplane_bimodal,
         "diag_alpha": diag_alpha,
     }
 
@@ -237,13 +241,13 @@ def main(cfg: DictConfig) -> None:
                 device,
                 mlp_hidden=mlp_hidden,
                 return_oracle=True,
-                fixed_cov=fixed_cov,
-                fixed_cov_rho=fixed_cov_rho,
-                fixed_cov_n_anchors=fixed_cov_n_anchors,
                 fixed_nets=fixed_nets,
                 anchor_gen=anchor_gen,
                 kernel_cov_gen=kernel_cov_gen,
                 diag_alpha=diag_alpha,
+                hyperplane_bimodal=hyperplane_bimodal,
+                hyperplane_bimodal_scale_lo=hyperplane_bimodal_scale_lo,
+                hyperplane_bimodal_scale_hi=hyperplane_bimodal_scale_hi,
             )
             t1 = time.perf_counter()
             prof["t_datagen"].append(t1 - t0)

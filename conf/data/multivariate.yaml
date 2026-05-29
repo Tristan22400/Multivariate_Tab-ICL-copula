@@ -52,3 +52,12 @@ kernel_type: random
 kernel_latent_dim: 1  # dimension of latent embeddings e_j for each output dim
 kernel_nugget: 1.0e-4 # jitter added to diagonal for strict PD
 
+# Hyperplane-bimodal debug mode: two random PSD matrices per dataset separated by a
+# random hyperplane in X-space.  Group assignment is ~50/50 (per-dataset median split).
+# Activate with: data.hyperplane_bimodal=true
+# V scale for group 1 (weak correlations, near-independent)
+hyperplane_bimodal: false
+hyperplane_bimodal_scale_lo: 0.3
+# V scale for group 2 (strong correlations, highly structured)
+hyperplane_bimodal_scale_hi: 3.0
+
