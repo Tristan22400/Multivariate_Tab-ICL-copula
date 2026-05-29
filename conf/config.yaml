@@ -17,7 +17,7 @@ training:
   clip_grad_norm: 0.1
   gradient_accumulation_steps: 16  # accumulate gradients over N steps before optimizer update
   nll_weight: 1.0            # weight on the Woodbury NLL term; set 0.0 to train with auxiliary loss only
-  aux_mse_weight: 0.0        # peak weight for off-diagonal MSE auxiliary loss; set 0 to disable
+  aux_mse_weight: 1.0        # peak weight for off-diagonal MSE auxiliary loss; set 0 to disable
   aux_mse_anneal_frac: 0.7   # anneal weight from aux_mse_weight to 0 over this fraction of steps
   log_every: 100
   val_every: 500
