@@ -57,7 +57,7 @@ from sklearn.covariance import OAS
 
 from dataset import infinite_episode_iter, make_episode_loader, split_episode_files
 from loss import indep_normal_nll, woodbury_nll
-from model import build_icl_corr_net
+from model import build_copula_tabicl_v2, build_icl_corr_net, build_icl_corr_net_v2
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -635,7 +635,13 @@ def main(cfg: DictConfig) -> None:
         )
 
     # ---- Model ----
-    model: nn.Module = build_icl_corr_net(cfg).to(device)
+    _model_name = getattr(cfg.model, "name", "icl_corr_net")
+    if _model_name == "copula_tabicl_v2":
+        model: nn.Module = build_copula_tabicl_v2(cfg).to(device)
+    elif _model_name == "icl_corr_net_v2":
+        model: nn.Module = build_icl_corr_net_v2(cfg).to(device)
+    else:
+        model: nn.Module = build_icl_corr_net(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters : {n_params:,}")
 
@@ -668,16 +674,23 @@ def main(cfg: DictConfig) -> None:
         _data_tag = Path(cfg.training.dataset_dir).name
         _lr = cfg.training.lr
         _lr_str = f"{_lr:.0e}".replace("e-0", "e-").replace("e+0", "e")
-        _n_layers = cfg.model.n_layers
+        # n_layers key differs across model configs
+        _n_layers = getattr(cfg.model, "n_layers",
+                            f"{getattr(cfg.model, 'n_layers_s1', '?')}/"
+                            f"{getattr(cfg.model, 'n_layers_s2', '?')}/"
+                            f"{getattr(cfg.model, 'n_layers_s3', '?')}")
+        _d_hidden = getattr(cfg.model, "d_hidden", getattr(cfg.model, "d_model", "?"))
+        _rank = getattr(cfg.model, "rank", "?")
         _aux_w = float(cfg.training.get("aux_mse_weight", 0.0))
         _nll_w = float(cfg.training.get("nll_weight", 1.0))
         _run_name = (
-            f"lr={_lr_str}"
+            f"{_model_name}"
+            f"_lr={_lr_str}"
             f"_steps={cfg.training.steps}"
-            f"_dh={cfg.model.d_hidden}"
+            f"_dh={_d_hidden}"
             f"_L={_n_layers}"
             f"_H={cfg.model.n_heads}"
-            f"_r={cfg.model.rank}"
+            f"_r={_rank}"
             f"_nllw={_nll_w}"
             f"_auxw={_aux_w}"
             f"_data={_data_tag}"

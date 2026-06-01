@@ -1,0 +1,234 @@
+Device : cuda
+model:
+  name: icl_corr_net_v2
+  d_hidden: 256
+  n_heads: 8
+  n_layers: 6
+  p_max: 20
+  d_max: 8
+  rank: 8
+  dropout: 0.0
+data:
+  p_range:
+  - 20
+  - 20
+  d_range:
+  - 8
+  - 8
+  n_train_range:
+  - 256
+  - 256
+  n_test_range:
+  - 16
+  - 16
+  r_data: 8
+  mlp_hidden: 64
+  diag_alpha: 0.5
+  fixed_cov: false
+  fixed_cov_n_anchors: 4
+  cov_type: kernel
+  num_anchors: 2
+  anchor_temp: 1.0
+  kernel_type: random
+  kernel_latent_dim: 1
+  kernel_nugget: 0.0001
+  hyperplane_bimodal: false
+  hyperplane_bimodal_scale_lo: 0.3
+  hyperplane_bimodal_scale_hi: 3.0
+seed: 42
+training:
+  device: auto
+  batch_size: 16
+  steps: 5000
+  lr: 0.0003
+  lr_min: 1.0e-08
+  warmup_steps: 200
+  weight_decay: 0.0001
+  clip_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  nll_weight: 1.0
+  aux_mse_weight: 0.0
+  aux_mse_anneal_frac: 10.0
+  log_every: 100
+  val_every: 500
+  plot_every: 500
+  save_every: 5000
+  ckpt_dir: ./checkpoints/icl_corr_net_v2_debug
+  resume_from: null
+  reset_icl_gate: false
+  dataset_dir: ./data/pit_hyperplane_debug
+  val_n_episodes: 50
+  compile: false
+dataset:
+  n_episodes: 100000
+  output_dir: ./data/pit_episodes_kernel_d4_n_train_256
+  resume: true
+  batch_size: 16
+  episodes_per_step: 32
+  num_workers: 2
+  k_folds: 3
+tabicl:
+  ckpt: tabicl-regressor-v2-20260212.ckpt
+  pit_batch_size: 256
+  pit_eps: 1.0e-06
+attn_copula:
+  m: 64
+  n_heads: 4
+  n_layers: 2
+  dropout: 0.15
+  weight_decay: 0.005
+  alpha: 3.0
+  lambda_min: 0.0001
+  lambda_max: 0.9
+  include_outer: true
+  steps: 5000
+  lr: 0.001
+  lr_min: 1.0e-06
+  warmup_steps: 200
+  clip_grad: 1.0
+  val_every: 100
+  patience: 500
+
+AMP enabled  dtype=torch.bfloat16  cudnn.benchmark=True
+[ICLCorrNetV2]  d_hidden=256  n_heads=8  n_layers=6  p_max=20  d_max=8  rank=8  dropout=0.0  |  params=5,055,041
+Model parameters : 5,055,041
+W&B run : https://wandb.ai/iliass-lasri-team/multivariate-tab-icl/runs/hxquhuo7
+No resume_from specified, training from scratch.
+Dataset split: 37430 train / 50 val episodes
+Loading 50 validation episodes …
+Validation episodes loaded.
+[step      0]  mse=0.00000  div=0.2253  copula=0.5614  gain=-0.5614  alpha=0.000  lr=1.50e-06  elapsed=3.1s
+[val step=     0]  copula=0.5489  joint_y=10.8773  oracle_y=7.8208  oracle_z=-0.7617  train=0.5649  gain=-0.5489  oas=-0.2592  knn5=6.0035  vs_knn5=-5.4547  oracle_frac=1.7361
+[2026-06-01 15:14:32,050][root][WARNING] - Images sizes do not match. This will causes images to be display incorrectly in the UI.
+[step    100]  mse=0.00000  div=0.0191  copula=0.0771  gain=-0.0771  alpha=0.000  lr=1.52e-04  elapsed=18.8s
+[step    200]  mse=0.00000  div=0.0063  copula=0.0229  gain=-0.0229  alpha=0.000  lr=3.00e-04  elapsed=23.0s
+[step    300]  mse=0.00000  div=0.0060  copula=0.0568  gain=-0.0568  alpha=0.000  lr=3.00e-04  elapsed=26.8s
+[step    400]  mse=0.00000  div=0.0022  copula=0.0151  gain=-0.0151  alpha=0.000  lr=2.99e-04  elapsed=30.8s
+[step    500]  mse=0.00000  div=0.0008  copula=0.0215  gain=-0.0215  alpha=0.000  lr=2.97e-04  elapsed=34.8s
+[val step=   500]  copula=0.0064  joint_y=10.3348  oracle_y=7.8208  oracle_z=-0.7617  train=0.0042  gain=-0.0064  oas=-0.2592  knn5=6.0035  vs_knn5=-5.9971  oracle_frac=1.0088
+[2026-06-01 15:15:03,314][root][WARNING] - Images sizes do not match. This will causes images to be display incorrectly in the UI.
+[step    600]  mse=0.00000  div=0.0006  copula=0.0097  gain=-0.0097  alpha=0.000  lr=2.95e-04  elapsed=49.8s
+[step    700]  mse=0.00000  div=0.0003  copula=0.0027  gain=-0.0027  alpha=0.000  lr=2.92e-04  elapsed=53.7s
+[step    800]  mse=0.00000  div=0.0006  copula=0.0007  gain=-0.0007  alpha=0.000  lr=2.89e-04  elapsed=58.0s
+[step    900]  mse=0.00000  div=0.0005  copula=0.0020  gain=-0.0020  alpha=0.000  lr=2.84e-04  elapsed=62.2s
+[step   1000]  mse=0.00000  div=0.0007  copula=0.0065  gain=-0.0065  alpha=0.000  lr=2.80e-04  elapsed=66.2s
+[val step=  1000]  copula=0.0025  joint_y=10.3310  oracle_y=7.8208  oracle_z=-0.7617  train=0.0029  gain=-0.0025  oas=-0.2592  knn5=6.0035  vs_knn5=-6.0010  oracle_frac=1.0035
+[2026-06-01 15:15:34,562][root][WARNING] - Images sizes do not match. This will causes images to be display incorrectly in the UI.
+[step   1100]  mse=0.00000  div=0.0008  copula=-0.0051  gain=0.0051  alpha=0.000  lr=2.75e-04  elapsed=81.0s
+[step   1200]  mse=0.00000  div=0.0004  copula=-0.0030  gain=0.0030  alpha=0.000  lr=2.69e-04  elapsed=85.1s
+[step   1300]  mse=0.00000  div=0.0004  copula=-0.0027  gain=0.0027  alpha=0.000  lr=2.63e-04  elapsed=89.1s
+[step   1400]  mse=0.00000  div=0.0005  copula=0.0158  gain=-0.0158  alpha=0.000  lr=2.56e-04  elapsed=93.0s
+[step   1500]  mse=0.00000  div=0.0004  copula=0.0009  gain=-0.0009  alpha=0.000  lr=2.49e-04  elapsed=97.0s
+[val step=  1500]  copula=0.0002  joint_y=10.3287  oracle_y=7.8208  oracle_z=-0.7617  train=0.0004  gain=-0.0002  oas=-0.2592  knn5=6.0035  vs_knn5=-6.0033  oracle_frac=1.0004
+[2026-06-01 15:16:05,278][root][WARNING] - Images sizes do not match. This will causes images to be display incorrectly in the UI.
+[step   1600]  mse=0.00000  div=0.0005  copula=-0.0028  gain=0.0028  alpha=0.000  lr=2.41e-04  elapsed=111.9s
+[step   1700]  mse=0.00000  div=0.0003  copula=-0.0022  gain=0.0022  alpha=0.000  lr=2.33e-04  elapsed=115.8s
+[step   1800]  mse=0.00000  div=0.0005  copula=-0.0015  gain=0.0015  alpha=0.000  lr=2.25e-04  elapsed=119.7s
+[step   1900]  mse=0.00000  div=0.0005  copula=0.0003  gain=-0.0003  alpha=0.000  lr=2.16e-04  elapsed=123.5s
+[step   2000]  mse=0.00000  div=0.0005  copula=0.0086  gain=-0.0086  alpha=0.000  lr=2.07e-04  elapsed=127.8s
+[val step=  2000]  copula=-0.0000  joint_y=10.3284  oracle_y=7.8208  oracle_z=-0.7617  train=0.0014  gain=0.0000  oas=-0.2592  knn5=6.0035  vs_knn5=-6.0035  oracle_frac=1.0000
+[2026-06-01 15:16:36,108][root][WARNING] - Images sizes do not match. This will causes images to be display incorrectly in the UI.
+[step   2100]  mse=0.00000  div=0.0010  copula=-0.0200  gain=0.0200  alpha=0.000  lr=1.98e-04  elapsed=142.7s
+[step   2200]  mse=0.00000  div=0.0019  copula=-0.0133  gain=0.0133  alpha=0.000  lr=1.89e-04  elapsed=146.7s
+[step   2300]  mse=0.00000  div=0.0042  copula=-0.0595  gain=0.0595  alpha=0.000  lr=1.79e-04  elapsed=150.8s
+[step   2400]  mse=0.00000  div=0.0066  copula=-0.1126  gain=0.1126  alpha=0.000  lr=1.69e-04  elapsed=154.8s
+[step   2500]  mse=0.00000  div=0.0084  copula=-0.2204  gain=0.2204  alpha=0.000  lr=1.60e-04  elapsed=158.8s
+[val step=  2500]  copula=-0.2447  joint_y=10.0837  oracle_y=7.8208  oracle_z=-0.7617  train=-0.2490  gain=0.2447  oas=-0.2592  knn5=6.0035  vs_knn5=-6.2483  oracle_frac=0.6773
+[2026-06-01 15:17:07,459][root][WARNING] - Images sizes do not match. This will causes images to be display incorrectly in the UI.
+[step   2600]  mse=0.00000  div=0.0074  copula=-0.3220  gain=0.3220  alpha=0.000  lr=1.50e-04  elapsed=174.0s
+[step   2700]  mse=0.00000  div=0.0094  copula=-0.3833  gain=0.3833  alpha=0.000  lr=1.40e-04  elapsed=178.0s
+[step   2800]  mse=0.00000  div=0.0080  copula=-0.5495  gain=0.5495  alpha=0.000  lr=1.30e-04  elapsed=182.0s
+[step   2900]  mse=0.00000  div=0.0092  copula=-0.4197  gain=0.4197  alpha=0.000  lr=1.21e-04  elapsed=186.0s
+[step   3000]  mse=0.00000  div=0.0088  copula=-0.5219  gain=0.5219  alpha=0.000  lr=1.11e-04  elapsed=190.2s
+[val step=  3000]  copula=-0.4783  joint_y=9.8501  oracle_y=7.8208  oracle_z=-0.7617  train=-0.4911  gain=0.4783  oas=-0.2592  knn5=6.0035  vs_knn5=-6.4819  oracle_frac=0.3672
+[2026-06-01 15:17:38,714][root][WARNING] - Images sizes do not match. This will causes images to be display incorrectly in the UI.
+[step   3100]  mse=0.00000  div=0.0062  copula=-0.5400  gain=0.5400  alpha=0.000  lr=1.02e-04  elapsed=205.3s
+[step   3200]  mse=0.00000  div=0.0075  copula=-0.5636  gain=0.5636  alpha=0.000  lr=9.25e-05  elapsed=209.4s
+[step   3300]  mse=0.00000  div=0.0060  copula=-0.5583  gain=0.5583  alpha=0.000  lr=8.36e-05  elapsed=213.6s
+[step   3400]  mse=0.00000  div=0.0058  copula=-0.7448  gain=0.7448  alpha=0.000  lr=7.49e-05  elapsed=217.5s
+[step   3500]  mse=0.00000  div=0.0063  copula=-0.4965  gain=0.4965  alpha=0.000  lr=6.66e-05  elapsed=221.6s
+[val step=  3500]  copula=-0.5528  joint_y=9.7756  oracle_y=7.8208  oracle_z=-0.7617  train=-0.5700  gain=0.5528  oas=-0.2592  knn5=6.0035  vs_knn5=-6.5564  oracle_frac=0.2657
+[2026-06-01 15:18:11,518][root][WARNING] - Images sizes do not match. This will causes images to be display incorrectly in the UI.
+[step   3600]  mse=0.00000  div=0.0066  copula=-0.5955  gain=0.5955  alpha=0.000  lr=5.86e-05  elapsed=238.2s
+[step   3700]  mse=0.00000  div=0.0067  copula=-0.4705  gain=0.4705  alpha=0.000  lr=5.10e-05  elapsed=242.2s
+[step   3800]  mse=0.00000  div=0.0059  copula=-0.6139  gain=0.6139  alpha=0.000  lr=4.39e-05  elapsed=246.1s
+[step   3900]  mse=0.00000  div=0.0055  copula=-0.5808  gain=0.5808  alpha=0.000  lr=3.72e-05  elapsed=250.2s
+[step   4000]  mse=0.00000  div=0.0059  copula=-0.6256  gain=0.6256  alpha=0.000  lr=3.09e-05  elapsed=254.3s
+[val step=  4000]  copula=-0.5903  joint_y=9.7382  oracle_y=7.8208  oracle_z=-0.7617  train=-0.6059  gain=0.5903  oas=-0.2592  knn5=6.0035  vs_knn5=-6.5938  oracle_frac=0.2165
+[2026-06-01 15:18:44,294][root][WARNING] - Images sizes do not match. This will causes images to be display incorrectly in the UI.
+[step   4100]  mse=0.00000  div=0.0069  copula=-0.4955  gain=0.4955  alpha=0.000  lr=2.52e-05  elapsed=270.9s
+[step   4200]  mse=0.00000  div=0.0053  copula=-0.4441  gain=0.4441  alpha=0.000  lr=2.01e-05  elapsed=275.2s
+[step   4300]  mse=0.00000  div=0.0057  copula=-0.5680  gain=0.5680  alpha=0.000  lr=1.54e-05  elapsed=279.2s
+[step   4400]  mse=0.00000  div=0.0069  copula=-0.5443  gain=0.5443  alpha=0.000  lr=1.14e-05  elapsed=283.3s
+[step   4500]  mse=0.00000  div=0.0055  copula=-0.5466  gain=0.5466  alpha=0.000  lr=7.94e-06  elapsed=287.2s
+[val step=  4500]  copula=-0.6075  joint_y=9.7209  oracle_y=7.8208  oracle_z=-0.7617  train=-0.6198  gain=0.6075  oas=-0.2592  knn5=6.0035  vs_knn5=-6.6110  oracle_frac=0.1923
+[2026-06-01 15:19:15,741][root][WARNING] - Images sizes do not match. This will causes images to be display incorrectly in the UI.
+[step   4600]  mse=0.00000  div=0.0059  copula=-0.6439  gain=0.6439  alpha=0.000  lr=5.10e-06  elapsed=302.2s
+[step   4700]  mse=0.00000  div=0.0064  copula=-0.5272  gain=0.5272  alpha=0.000  lr=2.87e-06  elapsed=306.3s
+[step   4800]  mse=0.00000  div=0.0057  copula=-0.7107  gain=0.7107  alpha=0.000  lr=1.28e-06  elapsed=310.1s
+[step   4900]  mse=0.00000  div=0.0060  copula=-0.6043  gain=0.6043  alpha=0.000  lr=3.25e-07  elapsed=314.2s
+Training complete. Final checkpoint → ./checkpoints/icl_corr_net_v2_debug/step_0004999_final.pt
+[val step=  4999]  copula=-0.6055  joint_y=9.7229  oracle_y=7.8208  oracle_z=-0.7617  train=-0.6246  gain=0.6055  oas=-0.2592  knn5=6.0035  vs_knn5=-6.6090  oracle_frac=0.1965
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/trmartin/.netrc.
+wandb: Currently logged in as: tristanmartin22400 (iliass-lasri-team) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run hxquhuo7
+wandb: Tracking run with wandb version 0.25.1
+wandb: Run data is saved locally in /srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/wandb/run-20260601_151415-hxquhuo7
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run lr=3e-4_steps=5000_dh=256_L=6_H=8_r=8_nllw=1.0_auxw=0.0_data=pit_hyperplane_debug
+wandb: ⭐️ View project at https://wandb.ai/iliass-lasri-team/multivariate-tab-icl
+wandb: 🚀 View run at https://wandb.ai/iliass-lasri-team/multivariate-tab-icl/runs/hxquhuo7
+/srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/src/train.py:206: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  fig.tight_layout()
+/srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/src/train.py:206: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  fig.tight_layout()
+/srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/src/train.py:206: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  fig.tight_layout()
+/srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/src/train.py:206: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  fig.tight_layout()
+/srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/src/train.py:206: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  fig.tight_layout()
+/srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/src/train.py:206: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  fig.tight_layout()
+/srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/src/train.py:206: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  fig.tight_layout()
+/srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/src/train.py:206: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  fig.tight_layout()
+/srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/src/train.py:206: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  fig.tight_layout()
+/srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/src/train.py:206: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  fig.tight_layout()
+wandb: updating run metadata
+wandb: uploading output.log; uploading wandb-summary.json; uploading config.yaml
+wandb: uploading history steps 49-50, summary, console lines 95-96
+wandb: 
+wandb: Run history:
+wandb:                      step ▁▁▁▂▂▂▂▂▂▃▃▃▃▃▃▄▄▄▄▄▅▅▅▅▅▆▆▆▆▆▆▇▇▇▇▇▇███
+wandb:               train/alpha ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:         train/copula_gain ▁▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▅▅▆▆▇▇▇▇█▇▇▇▇▇▇▇▇▇▇▇
+wandb:          train/copula_nll █▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▄▄▃▂▃▂▂▂▁▂▂▂▂▂▂▂▂▂▂▂
+wandb:                 train/div █▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                  train/lr ▁▅████████▇▇▇▇▇▆▆▆▆▅▅▅▄▄▄▄▃▃▃▃▂▂▂▂▂▁▁▁▁▁
+wandb:                 train/mse ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:          train/nll_weight ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:        train/oracle_nll_y ▅▂▄▂▄▆▁▁▃▂█▂▂▁▃▆▂▁▂▃▄▂▄▁█▁▅▃▃▂▅▃▃▅▃▃▂▄▃▂
+wandb: train/oracle_off_diag_var █▃▂▃▆▅▅▆▁▄▄▅▄▂▅▁▂▄▄█▄▂▃▂▂▄▇▆▄▄▅▆▄▂▅▁▅▃▂▃
+wandb:                       +15 ...
+wandb: 
+wandb: Run summary:
+wandb:                      step 4999
+wandb:               train/alpha 0
+wandb:         train/copula_gain 0.60429
+wandb:          train/copula_nll -0.60429
+wandb:                 train/div 0.00601
+wandb:                  train/lr 0.0
+wandb:                 train/mse 0
+wandb:          train/nll_weight 1
+wandb:        train/oracle_nll_y 7.62323
+wandb: train/oracle_off_diag_var 0.08148
+wandb:                       +15 ...
+wandb: 
+wandb: 🚀 View run lr=3e-4_steps=5000_dh=256_L=6_H=8_r=8_nllw=1.0_auxw=0.0_data=pit_hyperplane_debug at: https://wandb.ai/iliass-lasri-team/multivariate-tab-icl/runs/hxquhuo7
+wandb: ⭐️ View project at: https://wandb.ai/iliass-lasri-team/multivariate-tab-icl
+wandb: Synced 5 W&B file(s), 50 media file(s), 0 artifact file(s) and 0 other file(s)
+wandb: Find logs at: ./wandb/run-20260601_151415-hxquhuo7/logs
