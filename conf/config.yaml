@@ -3,12 +3,12 @@ defaults:
   - data: multivariate
   - _self_
 
-seed: 42
+seed: 42  # test edit
 
 
 training:
   device: auto
-  batch_size: 8          # B datasets per step (unused if dataset_dir is set; stored in episode)
+  batch_size: 16          # B datasets per step (unused if dataset_dir is set; stored in episode)
   steps: 100000
   lr: 1.0e-4
   lr_min: 1.0e-8
@@ -25,6 +25,7 @@ training:
   save_every: 5000
   ckpt_dir: ./checkpoints/copula-tabicl/mse
   resume_from: null  # direct checkpoint path; takes priority over ckpt_dir auto-detection
+  reset_icl_gate: false  # set true when resuming from a checkpoint where icl_gate is stuck near -3.0
   dataset_dir: ./data/pit_hyperplane_debug  # path to pre-computed PIT episodes; required for training
   val_n_episodes: 50       # number of held-out episodes reserved for validation (never used in training)
   compile: true          # set true to enable torch.compile (~60 s one-time JIT cost, then 20-40% faster)
