@@ -57,8 +57,7 @@ from sklearn.covariance import OAS
 
 from dataset import infinite_episode_iter, make_episode_loader, split_episode_files
 from loss import indep_normal_nll, woodbury_nll
-from model import build_copula_tabicl_v2
-from viz import plot_prediction_comparison
+from model import build_icl_corr_net
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -126,6 +125,89 @@ def _energy_score_batched(
 
 
 # ---------------------------------------------------------------------------
+# Validation plot helpers
+# ---------------------------------------------------------------------------
+
+
+def _corr_all_instances_fig(
+    d_pred: torch.Tensor,   # (B, n_test, d)
+    V_pred: torch.Tensor,   # (B, n_test, d, r)
+    oracle_D: torch.Tensor, # (B, n_test, d)
+    oracle_V: torch.Tensor, # (B, n_test, d, r)
+    batch_idx: int = 0,
+    label: str = "",
+) -> tuple[plt.Figure, float]:
+    """Grid of oracle vs predicted correlation matrices for all test instances.
+
+    Layout mirrors the debug script's make_all_instances_plot:
+      row 0: oracle    instances 0 .. half-1
+      row 1: predicted instances 0 .. half-1
+      row 2: oracle    instances half .. n_test-1
+      row 3: predicted instances half .. n_test-1
+    Returns (fig, mean_mse).
+    """
+    b = batch_idx
+
+    Sigma_pred = torch.diag_embed(d_pred[b]) + V_pred[b] @ V_pred[b].transpose(-2, -1)
+    std_p = Sigma_pred.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+    R_pred = (Sigma_pred / (std_p.unsqueeze(-1) * std_p.unsqueeze(-2))).float().cpu()
+
+    Sigma_ora = torch.diag_embed(oracle_D[b]) + oracle_V[b] @ oracle_V[b].transpose(-2, -1)
+    std_o = Sigma_ora.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+    R_ora = (Sigma_ora / (std_o.unsqueeze(-1) * std_o.unsqueeze(-2))).float().cpu()
+
+    d = R_pred.shape[-1]
+    ri, ci = torch.triu_indices(d, d, offset=1)
+    n_test = R_pred.shape[0]
+    half = max(n_test // 2, 1)
+
+    mse_per = [F.mse_loss(R_pred[i, ri, ci], R_ora[i, ri, ci]).item() for i in range(n_test)]
+    mean_mse = float(np.mean(mse_per))
+
+    R_pred_np = R_pred.numpy()
+    R_ora_np  = R_ora.numpy()
+
+    n_cols = max(half, 1)
+    fig, axes = plt.subplots(4, n_cols, figsize=(2.5 * n_cols, 10))
+    if n_cols == 1:
+        axes = axes[:, np.newaxis]
+
+    im = None
+    for i in range(half):
+        for grp in range(2):
+            inst = i + grp * half
+            if inst >= n_test:
+                continue
+            for row_off, is_oracle in enumerate([True, False]):
+                row = grp * 2 + row_off
+                ax = axes[row, i]
+                R = R_ora_np[inst] if is_oracle else R_pred_np[inst]
+                im = ax.imshow(R, vmin=-1, vmax=1, cmap="RdBu_r")
+                if is_oracle:
+                    ax.set_title(f"Oracle #{inst}", fontsize=7)
+                else:
+                    ax.set_title(f"MSE={mse_per[inst]:.3f}", fontsize=7, color="darkred")
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+    for row, lbl in enumerate([
+        f"Oracle  0–{half-1}", f"Pred  0–{half-1}",
+        f"Oracle  {half}–{n_test-1}", f"Pred  {half}–{n_test-1}",
+    ]):
+        axes[row, 0].set_ylabel(lbl, fontsize=8)
+
+    if im is not None:
+        fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.35, pad=0.02)
+
+    title = f"All {n_test} instances — mean MSE={mean_mse:.4f}"
+    if label:
+        title = f"{label}  |  {title}"
+    fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    return fig, mean_mse
+
+
+# ---------------------------------------------------------------------------
 # PIT-episode validation (Z-space — same distribution as training)
 # ---------------------------------------------------------------------------
 
@@ -181,6 +263,8 @@ def run_val_pit(
         "val/energy_score": [],
     }
     plot_episodes: list[dict] = []
+    all_off_pred: list[np.ndarray] = []  # off-diag predicted values, for scatter
+    all_off_ora:  list[np.ndarray] = []  # off-diag oracle values,    for scatter
 
     with torch.no_grad():
         for i_ep, ep in enumerate(val_episodes):
@@ -270,7 +354,6 @@ def run_val_pit(
 
             # ---- OAS + kNN5 + linear baselines ----
             oas_nlls, knn5_nlls, linear_nlls = [], [], []
-            ep_sigma_oas_list: list[np.ndarray] = []
             for b in range(B):
                 Z_tr_b_np = Z_tr[b].cpu().numpy()
                 Z_tr_b = Z_tr[b]  # (n_train, d)
@@ -298,8 +381,7 @@ def run_val_pit(
                         V_p_exp.unsqueeze(0),
                     ).item()
                 )
-                if do_plot:
-                    ep_sigma_oas_list.append(oas.covariance_.copy())
+                pass  # ep_sigma_oas_list no longer needed (replaced by corr grid)
 
                 # kNN-5: gather all neighbors at once, batch covariance, one NLL call.
                 dists = torch.cdist(X_te_b, X_tr_b)  # (n_test, n_train)
@@ -395,21 +477,31 @@ def run_val_pit(
                 (cnll - oracle_copula_z) / denom if abs(denom) > 1e-8 else float("nan")
             )
 
-            # ---- Collect up to 2 episodes for the comparison plot ----
-            if do_plot and len(plot_episodes) < 2:
-                plot_episodes.append(
-                    {
-                        "key": f"pit_ep{i_ep}",
-                        "mu_pred": mu_Z.clone(),
-                        "D_pred": d_Z.clone(),
-                        "V_pred": V_Z.clone(),
-                        "mu_true": oracle_mu,
-                        "D_true": oracle_D,
-                        "V_true": oracle_V,
-                        "sigma_oas_list": ep_sigma_oas_list,
-                        "n_test": n_test,
-                    }
-                )
+            # ---- Collect data for plots ----
+            if do_plot:
+                # Off-diagonal correlation values for the global scatter
+                Sigma_pp = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-2, -1)
+                std_pp = Sigma_pp.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+                R_pp = Sigma_pp / (std_pp.unsqueeze(-1) * std_pp.unsqueeze(-2))
+                Sigma_oo = torch.diag_embed(oracle_D) + oracle_V @ oracle_V.transpose(-2, -1)
+                std_oo = Sigma_oo.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+                R_oo = Sigma_oo / (std_oo.unsqueeze(-1) * std_oo.unsqueeze(-2))
+                ri_p, ci_p = torch.triu_indices(d, d, offset=1, device=d_Z.device)
+                all_off_pred.append(R_pp[..., ri_p, ci_p].float().cpu().numpy().flatten())
+                all_off_ora.append(R_oo[..., ri_p, ci_p].float().cpu().numpy().flatten())
+
+                # Store up to 2 episodes for the all-instances grid plot
+                if len(plot_episodes) < 2:
+                    plot_episodes.append(
+                        {
+                            "key": f"pit_ep{i_ep}",
+                            "d_pred": d_Z.clone(),
+                            "V_pred": V_Z.clone(),
+                            "oracle_D": oracle_D,
+                            "oracle_V": oracle_V,
+                            "n_test": n_test,
+                        }
+                    )
 
     metrics = {k: float(np.mean(v)) for k, v in agg.items()}
     metrics["step"] = step
@@ -429,58 +521,37 @@ def run_val_pit(
     )
 
     plot_figs = []
-    if do_plot and plot_episodes and wandb_run is not None:
-        n_inst = min(3, plot_episodes[0]["n_test"])
-        ep0 = plot_episodes[0]
-        B0 = ep0["mu_pred"].shape[0]
-        if len(plot_episodes) == 1 and B0 >= 2:
-            # Single episode: show two different batch elements side-by-side
-            for b_idx in range(2):
-                sigma_oas_b = (
-                    ep0["sigma_oas_list"][b_idx]
-                    if b_idx < len(ep0["sigma_oas_list"])
-                    else None
-                )
-                fig = plot_prediction_comparison(
-                    mu_pred=ep0["mu_pred"],
-                    D_pred=ep0["D_pred"],
-                    V_pred=ep0["V_pred"],
-                    mu_true=ep0["mu_true"],
-                    D_true=ep0["D_true"],
-                    V_true=ep0["V_true"],
+    if do_plot and wandb_run is not None:
+        # — All-instances correlation grids (one per stored episode, up to 2 batch elems each) —
+        for ep in plot_episodes:
+            B_ep = ep["d_pred"].shape[0]
+            for b_idx in range(min(2, B_ep)):
+                fig, _ = _corr_all_instances_fig(
+                    ep["d_pred"], ep["V_pred"],
+                    ep["oracle_D"], ep["oracle_V"],
                     batch_idx=b_idx,
-                    n_instances=n_inst,
-                    sigma_oas=sigma_oas_b,
-                    dataset_label=f"{ep0['key']} — batch {b_idx}",
+                    label=f"{ep['key']} b={b_idx}",
                 )
                 plot_figs.append(fig)
-        else:
-            # Multiple episodes: cycle batch index across episodes for diversity
-            for ep_idx, ep_data in enumerate(plot_episodes):
-                b_idx = ep_idx % ep_data["mu_pred"].shape[0]
-                sigma_oas_b = (
-                    ep_data["sigma_oas_list"][b_idx]
-                    if b_idx < len(ep_data["sigma_oas_list"])
-                    else None
-                )
-                fig = plot_prediction_comparison(
-                    mu_pred=ep_data["mu_pred"],
-                    D_pred=ep_data["D_pred"],
-                    V_pred=ep_data["V_pred"],
-                    mu_true=ep_data["mu_true"],
-                    D_true=ep_data["D_true"],
-                    V_true=ep_data["V_true"],
-                    batch_idx=b_idx,
-                    n_instances=n_inst,
-                    sigma_oas=sigma_oas_b,
-                    dataset_label=f"Dataset: {ep_data['key']} — batch {b_idx}",
-                )
-                plot_figs.append(fig)
+
+        # — Off-diagonal scatter: predicted vs oracle across all episodes —
+        if all_off_pred and all_off_ora:
+            off_p = np.concatenate(all_off_pred)
+            off_o = np.concatenate(all_off_ora)
+            fig_sc, ax_sc = plt.subplots(figsize=(5, 5))
+            ax_sc.scatter(off_o, off_p, s=2, alpha=0.3, rasterized=True)
+            lo = min(float(off_o.min()), float(off_p.min()))
+            hi = max(float(off_o.max()), float(off_p.max()))
+            ax_sc.plot([lo, hi], [lo, hi], "r--", lw=1)
+            ax_sc.set_xlabel("Oracle off-diag corr")
+            ax_sc.set_ylabel("Predicted off-diag corr")
+            ax_sc.set_title(f"step {step} — {len(off_p):,} off-diag values")
+            fig_sc.tight_layout()
+            plot_figs.append(fig_sc)
 
     if wandb_run is not None:
         if plot_figs:
             import wandb as _wandb
-
             metrics["val/plot"] = [_wandb.Image(f) for f in plot_figs]
         wandb_run.log(metrics, step=step)
         for f in plot_figs:
@@ -564,7 +635,7 @@ def main(cfg: DictConfig) -> None:
         )
 
     # ---- Model ----
-    model: nn.Module = build_copula_tabicl_v2(cfg).to(device)
+    model: nn.Module = build_icl_corr_net(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters : {n_params:,}")
 
@@ -597,19 +668,13 @@ def main(cfg: DictConfig) -> None:
         _data_tag = Path(cfg.training.dataset_dir).name
         _lr = cfg.training.lr
         _lr_str = f"{_lr:.0e}".replace("e-0", "e-").replace("e+0", "e")
-        _n_layers = getattr(
-            cfg.model,
-            "n_layers",
-            f"s1={getattr(cfg.model, 'n_layers_s1', '?')}"
-            f"s2={getattr(cfg.model, 'n_layers_s2', '?')}"
-            f"s3={getattr(cfg.model, 'n_layers_s3', '?')}",
-        )
+        _n_layers = cfg.model.n_layers
         _aux_w = float(cfg.training.get("aux_mse_weight", 0.0))
         _nll_w = float(cfg.training.get("nll_weight", 1.0))
         _run_name = (
             f"lr={_lr_str}"
             f"_steps={cfg.training.steps}"
-            f"_d={cfg.model.d_model}"
+            f"_dh={cfg.model.d_hidden}"
             f"_L={_n_layers}"
             f"_H={cfg.model.n_heads}"
             f"_r={cfg.model.rank}"
@@ -644,11 +709,6 @@ def main(cfg: DictConfig) -> None:
         optimizer.load_state_dict(ckpt["optimizer_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
         start_step = int(ckpt["step"]) + 1
-        if cfg.training.get("reset_icl_gate", False):
-            raw_model = getattr(model, "_orig_mod", model)
-            with torch.no_grad():
-                raw_model.icl_gate.fill_(-1.0)
-            print("  icl_gate reset to -1.0 (overriding stuck checkpoint value).")
         print(f"Resumed at step {start_step}.")
     else:
         print("No resume_from specified, training from scratch.")
@@ -712,9 +772,16 @@ def main(cfg: DictConfig) -> None:
 
             # ---- Loss: Woodbury NLL on test queries ----
             Z_query = Z_test_ep  # (B, n_test, d)
-            loss_nll = woodbury_nll(Z_query, mu_Z, d_Z, V_Z)
             nll_weight = float(cfg.training.get("nll_weight", 1.0))
-            loss = nll_weight * loss_nll
+            # Guard: only run woodbury_nll when it contributes to the loss.
+            # With bfloat16 the Cholesky can produce NaN; 0.0 * NaN = NaN which
+            # would corrupt the MSE auxiliary loss even when nll_weight=0.
+            if nll_weight > 0.0:
+                loss_nll = woodbury_nll(Z_query, mu_Z, d_Z, V_Z)
+                loss = nll_weight * loss_nll
+            else:
+                loss_nll = torch.zeros(1, device=device)
+                loss = torch.zeros(1, device=device)
 
             # ---- Auxiliary off-diagonal MSE loss ----
             aux_weight = float(cfg.training.get("aux_mse_weight", 0.0))
@@ -783,23 +850,28 @@ def main(cfg: DictConfig) -> None:
             elapsed = time.perf_counter() - t0
 
             loss_mse_val = loss_mse.item()
+            div = pred_off_diag_var / max(oracle_off_diag_var, 1e-8)
             print(
-                f"[step {step:>6d}]  copula_nll={cnll_train:.4f}  "
-                f"copula_gain={copula_gain:.4f}  oracle_y={oracle_nll_y:.4f}  "
-                f"pred_var={pred_off_diag_var:.4e}  oracle_var={oracle_off_diag_var:.4e}  "
-                f"aux_mse={loss_mse_val:.4e}  alpha={alpha:.3f}  "
-                f"lr={lr_now:.2e}  elapsed={elapsed:.1f}s"
+                f"[step {step:>6d}]  "
+                f"mse={loss_mse_val:.5f}  "
+                f"div={div:.4f}  "
+                f"copula={cnll_train:.4f}  "
+                f"gain={copula_gain:.4f}  "
+                f"alpha={alpha:.3f}  "
+                f"lr={lr_now:.2e}  "
+                f"elapsed={elapsed:.1f}s"
             )
 
             if wandb_run is not None:
                 wandb_run.log(
                     {
+                        "train/mse": loss_mse_val,
+                        "train/div": div,
                         "train/copula_nll": cnll_train,
                         "train/copula_gain": copula_gain,
                         "train/oracle_nll_y": oracle_nll_y,
                         "train/pred_off_diag_var": pred_off_diag_var,
                         "train/oracle_off_diag_var": oracle_off_diag_var,
-                        "train/aux_mse": loss_mse_val,
                         "train/alpha": alpha,
                         "train/nll_weight": nll_weight,
                         "train/lr": lr_now,
