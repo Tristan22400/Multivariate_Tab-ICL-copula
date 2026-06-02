@@ -16,3 +16,27 @@ Episodes: 37430 train / 50 val
 [  5500]  mse=0.04746  div=0.0130  gate=0.301  H_norm=[b0=0.962 b1=0.996 b2=0.841 b3=1.000]  alpha_a=[-0.0247 0.0310 -0.0044 0.0002]  alpha_f=[-0.0000 0.0001 -0.0000 0.0001]  t=554s
 [  6000]  mse=0.05000  div=0.0154  gate=0.301  H_norm=[b0=0.960 b1=0.995 b2=0.842 b3=1.000]  alpha_a=[-0.0248 0.0313 -0.0045 0.0000]  alpha_f=[0.0001 -0.0000 0.0001 -0.0000]  t=604s
 [  6500]  mse=0.04634  div=0.0187  gate=0.302  H_norm=[b0=0.961 b1=0.994 b2=0.840 b3=1.000]  alpha_a=[-0.0250 0.0321 -0.0049 0.0002]  alpha_f=[-0.0000 -0.0000 -0.0001 -0.0000]  t=655s
+[  7000]  mse=0.05365  div=0.0145  gate=0.301  H_norm=[b0=0.956 b1=0.995 b2=0.843 b3=1.000]  alpha_a=[-0.0248 0.0322 -0.0048 0.0004]  alpha_f=[-0.0001 -0.0000 -0.0000 -0.0000]  t=705s
+[  7500]  mse=0.04932  div=0.0153  gate=0.302  H_norm=[b0=0.954 b1=0.995 b2=0.843 b3=1.000]  alpha_a=[-0.0250 0.0322 -0.0051 0.0001]  alpha_f=[-0.0001 0.0000 -0.0001 -0.0000]  t=755s
+[  8000]  mse=0.04904  div=0.0133  gate=0.302  H_norm=[b0=0.957 b1=0.995 b2=0.843 b3=1.000]  alpha_a=[-0.0250 0.0324 -0.0052 0.0002]  alpha_f=[-0.0001 -0.0001 0.0000 -0.0000]  t=805s
+[  8500]  mse=0.05154  div=0.0192  gate=0.302  H_norm=[b0=0.952 b1=0.996 b2=0.842 b3=1.000]  alpha_a=[-0.0253 0.0327 -0.0056 0.0008]  alpha_f=[-0.0000 -0.0000 0.0000 0.0000]  t=856s
+[  9000]  mse=0.04558  div=0.0150  gate=0.302  H_norm=[b0=0.952 b1=0.996 b2=0.843 b3=1.000]  alpha_a=[-0.0254 0.0328 -0.0059 0.0020]  alpha_f=[-0.0001 -0.0000 -0.0001 0.0001]  t=906s
+[  9500]  mse=0.04996  div=0.0141  gate=0.302  H_norm=[b0=0.953 b1=0.996 b2=0.843 b3=1.000]  alpha_a=[-0.0255 0.0330 -0.0060 0.0027]  alpha_f=[-0.0001 -0.0001 -0.0001 0.0000]  t=956s
+
+======================================================================
+FINAL  mse=0.03742  r=0.278  slope=0.055  div=0.0149
+Stage-3 attention entropy (H_norm):
+  blk 0: 0.9545  [COLLAPSED]
+  blk 1: 0.9958  [COLLAPSED]
+  blk 2: 0.8429  [partial]
+  blk 3: 0.9999  [COLLAPSED]
+ReZero alphas (attn / ffn):
+  blk 0: alpha_attn=-0.02540  alpha_ffn=-0.00007
+  blk 1: alpha_attn=0.03292  alpha_ffn=-0.00008
+  blk 2: alpha_attn=-0.00601  alpha_ffn=-0.00010
+  blk 3: alpha_attn=0.00287  alpha_ffn=0.00002
+ICL gate: 0.3016
+======================================================================
+
+Plot saved: /srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/debug/tabicl_v2_train_debug/training_diagnostics.png
+Scatter saved: /srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/copula-intra/debug/tabicl_v2_train_debug/scatter.png

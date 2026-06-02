@@ -877,19 +877,24 @@ class CopulaTabICLv2(nn.Module):
     def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.cls_tokens, std=0.02)
         nn.init.trunc_normal_(self.row_pos_emb, std=0.02)
-        nn.init.trunc_normal_(self.dim_emb, std=0.02)
+        # Orthogonal init for dim_emb so each target dimension starts with a
+        # distinct direction in embedding space, preventing all U rows from
+        # collapsing to the same direction (which causes R ≈ 11^T at init).
+        nn.init.orthogonal_(self.dim_emb)
+        self.dim_emb.data *= 0.5
         for block in self.s1_blocks:
             nn.init.trunc_normal_(block.inducing_points, std=0.02)
         nn.init.normal_(self.embed_tae.weight, std=0.02)
         nn.init.zeros_(self.embed_tae.bias)
         nn.init.normal_(self.embed_icl.weight, std=0.02)
         nn.init.zeros_(self.embed_icl.bias)
-        # fc_V: use std=0.1 (not 0.02) so U starts far enough from zero to
-        # escape the near-diagonal saddle. At U≈0, grad(log|M|)/dV ≈ 2V ≈ 0
-        # and grad(quadratic)/dV ≈ 0, so the model gets no signal to grow V.
+        # fc_V readout: calibrate output variance so ||U_i||² ≈ rank at init.
+        # fc1 std=0.1 is standard; fc2 uses 1/sqrt(d_ff_head) (variance-preserving)
+        # to prevent variance explosion that would cause all U rows to collapse
+        # to the same direction and produce R ≈ 11^T.
         nn.init.normal_(self.fc_V.fc1.weight, std=0.1)
         nn.init.zeros_(self.fc_V.fc1.bias)
-        nn.init.normal_(self.fc_V.fc2.weight, std=0.1)
+        nn.init.normal_(self.fc_V.fc2.weight, std=1.0 / math.sqrt(self.fc_V.fc2.in_features))
         nn.init.zeros_(self.fc_V.fc2.bias)
 
     def forward(

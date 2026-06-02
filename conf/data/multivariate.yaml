@@ -48,7 +48,7 @@ anchor_temp: 1.0      # τ: softmax temperature for x-to-anchor similarity (cov_
 # Kernel covariance settings (used when cov_type: kernel)
 # kernel_type: rbf | exponential | matern32 | rational_quadratic | periodic | random
 #   random picks one kernel per episode uniformly.
-kernel_type: random
+kernel_type: rbf
 kernel_latent_dim: 1  # dimension of latent embeddings e_j for each output dim
 kernel_nugget: 1.0e-4 # jitter added to diagonal for strict PD
 
