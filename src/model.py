@@ -429,10 +429,14 @@ class ICLCorrNetV2(nn.Module):
             nn.Linear(d_hidden, d_hidden),
         )
 
-        # Z-covariance encoder for support tokens only
-        self.enc_z       = nn.Linear(d_vech, d_hidden, bias=False)
-        self.z_gate      = nn.Parameter(torch.tensor(-1.0))   # sigmoid≈0.27 at init
-        self.sup_emb_norm = RMSNorm(d_hidden)
+        # Z-covariance encoder for support tokens only.
+        # Input is [Z_sup, vech(Z⊗Z)] so the model sees both raw Z values
+        # (preserving sign) and pairwise products.  bias=True because the
+        # diagonal of vech has non-zero mean (~1 for standard-normal Z).
+        self.enc_z        = nn.Linear(d_max + d_vech, d_hidden, bias=True)
+        self.z_gate       = nn.Parameter(torch.tensor(-1.0))   # sigmoid≈0.27 at init
+        self.sup_emb_norm  = RMSNorm(d_hidden)
+        self.query_emb_norm = RMSNorm(d_hidden)
 
         # Joint masked transformer
         self.blocks = nn.ModuleList([
@@ -441,9 +445,9 @@ class ICLCorrNetV2(nn.Module):
         ])
         self.out_norm = RMSNorm(d_hidden)
 
-        # Readout: cat([query_tok, x_tok]) → d_max × rank
+        # Readout: query_tok → d_max × rank
         self.readout_U = nn.Sequential(
-            nn.Linear(d_hidden * 2, d_hidden), nn.GELU(),
+            nn.Linear(d_hidden, d_hidden), nn.GELU(),
             nn.Linear(d_hidden, d_max * rank),
         )
 
@@ -486,22 +490,26 @@ class ICLCorrNetV2(nn.Module):
         else:
             X_in = X_all
 
-        # vech(Z_sup ⊗ Z_sup) — pairwise covariance signal for support instances
+        # [Z_sup, vech(Z_sup ⊗ Z_sup)] — raw Z (preserves sign) + pairwise products
         Z_sup = Z_all[:, :n_support]
         if d < self.d_max:
             Z_sup_pad = F.pad(Z_sup, (0, self.d_max - d))
         else:
             Z_sup_pad = Z_sup[..., : self.d_max]
-        outer = Z_sup_pad.unsqueeze(-1) * Z_sup_pad.unsqueeze(-2)  # (B,n_sup,d_max,d_max)
-        vech  = outer[:, :, self.ti, self.tj]                       # (B,n_sup,d_vech)
+        outer  = Z_sup_pad.unsqueeze(-1) * Z_sup_pad.unsqueeze(-2)  # (B,n_sup,d_max,d_max)
+        vech   = outer[:, :, self.ti, self.tj]                       # (B,n_sup,d_vech)
+        z_in   = torch.cat([Z_sup_pad, vech], dim=-1)                # (B,n_sup,d_max+d_vech)
 
-        # Embed all instances from X; inject Z-covariance into support tokens
-        tok = self.enc_x(X_in)                                      # (B, N, d_hidden)
-        z_emb = self.enc_z(vech)                                    # (B, n_sup, d_hidden)
-        tok = tok.clone()
-        tok[:, :n_support] = self.sup_emb_norm(
-            tok[:, :n_support] + torch.sigmoid(self.z_gate) * z_emb
-        )
+        # Embed all instances from X; inject Z signal into support tokens.
+        # Use cat instead of in-place writes — two consecutive in-place ops on tok
+        # cause autograd version-counter errors during backward.
+        raw = self.enc_x(X_in)                                        # (B, N, d_hidden)
+        z_emb = self.enc_z(z_in)                                      # (B, n_sup, d_hidden)
+        sup_tok = self.sup_emb_norm(
+            raw[:, :n_support] + torch.sigmoid(self.z_gate) * z_emb
+        )                                                              # (B, n_sup, d_hidden)
+        qry_tok = self.query_emb_norm(raw[:, n_support:])             # (B, n_qry, d_hidden)
+        tok = torch.cat([sup_tok, qry_tok], dim=1)                    # (B, N, d_hidden)
 
         # Causal mask: block query positions from acting as keys.
         # Shape (N, N); broadcast over B by nn.MultiheadAttention automatically.
@@ -515,10 +523,9 @@ class ICLCorrNetV2(nn.Module):
 
         tok = self.out_norm(tok)
 
-        # Readout from query positions; skip-connect to pre-transformer X embedding
-        query_tok  = tok[:, n_support:]                              # (B, n_query, d_hidden)
-        query_xinit = self.enc_x(X_in[:, n_support:])               # (B, n_query, d_hidden)
-        U_flat = self.readout_U(torch.cat([query_tok, query_xinit], dim=-1))
+        # Readout from query positions
+        query_tok = tok[:, n_support:]                               # (B, n_query, d_hidden)
+        U_flat = self.readout_U(query_tok)
         U      = U_flat.reshape(B, n_query, self.d_max, self.rank_max)
         U      = U[..., :d, :]
 
@@ -681,9 +688,6 @@ class ICLBlock(nn.Module):
         )
         self.norm2 = RMSNorm(d_icl)
         self.ffn = SwiGLUFFN(d_icl, d_ff, dropout=dropout)
-        # ReZero: learned scalars, init=0 → block starts as identity.
-        self.alpha_attn = nn.Parameter(torch.zeros(1))
-        self.alpha_ffn  = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -709,8 +713,8 @@ class ICLBlock(nn.Module):
             need_weights=return_attn_weights,
             average_attn_weights=True,
         )
-        x = x + self.alpha_attn * attn_out
-        x = x + self.alpha_ffn  * self.ffn(self.norm2(x))
+        x = x + attn_out
+        x = x + self.ffn(self.norm2(x))
         if return_attn_weights:
             return x, attn_w
         return x
@@ -808,10 +812,10 @@ class CopulaTabICLv2(nn.Module):
         self.embed_tae = nn.Linear(d_max + d_vech, d_model)
         # Embed_ICL: same input → d_icl
         self.embed_icl = nn.Linear(d_max + d_vech, d_icl)
-        # Gate on ICL injection: sigmoid(-1) ≈ 0.27 at init.
-        # Provides 4× stronger gradient than the original -3.0 init (sigmoid≈0.05)
-        # which caused the gate to remain permanently closed across all runs.
-        self.icl_gate = nn.Parameter(torch.tensor(-1.0))
+        # Gate on ICL injection: sigmoid(0) = 0.50 at init.
+        # Starting at 0.5 gives Stage 3 immediate access to ICL embeddings,
+        # roughly doubling the effective gradient signal vs sigmoid(-1)≈0.27.
+        self.icl_gate = nn.Parameter(torch.tensor(0.0))
 
         # ---- Feature embedding -----------------------------------------------
         self.phi_X = nn.Linear(1, d_model, bias=False)
@@ -827,6 +831,11 @@ class CopulaTabICLv2(nn.Module):
 
         # ---- Stage 2: TF_row — row-wise aggregation via CLS tokens ------------
         self.cls_tokens = nn.Parameter(torch.empty(n_cls, d_model))
+        # Per-slot position embeddings: break the shared-CLS symmetry so each
+        # of the n_cls+p_max token positions gets a distinct starting point.
+        # Without this, all row embeddings start identical after Stage 2 and
+        # Stage 3's Q·K dot products are uniformly zero.
+        self.row_pos_emb = nn.Parameter(torch.empty(n_cls + p_max, d_model))
         self.s2_blocks = nn.ModuleList(
             [
                 RowAggregatorBlock(d_model, n_heads, d_ff, dropout)
@@ -840,12 +849,6 @@ class CopulaTabICLv2(nn.Module):
             [ICLBlock(d_icl, n_heads, d_ff_icl, dropout) for _ in range(n_layers_s3)]
         )
         self.s3_norm = RMSNorm(d_icl)
-        # Normalise the mean-subtracted query embeddings before the readout head.
-        # After mean-subtraction the residual has RMS ~0.06 while dim_emb has
-        # magnitude ~1, so fc_V would be blind to instance-specific signal.
-        # Initialised as identity (scale=ones) so checkpoint loading with
-        # strict=False preserves the current behaviour until further training.
-        self.query_emb_norm = RMSNorm(d_icl)
 
         # ---- Per-dimension conditioning for readout --------------------------
         # Learnable embedding for each target dimension index, concatenated with
@@ -873,6 +876,7 @@ class CopulaTabICLv2(nn.Module):
 
     def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.cls_tokens, std=0.02)
+        nn.init.trunc_normal_(self.row_pos_emb, std=0.02)
         nn.init.trunc_normal_(self.dim_emb, std=0.02)
         for block in self.s1_blocks:
             nn.init.trunc_normal_(block.inducing_points, std=0.02)
@@ -973,6 +977,7 @@ class CopulaTabICLv2(nn.Module):
         # ------------------------------------------------------------------
         cls_exp = self.cls_tokens.unsqueeze(0).unsqueeze(0).expand(B, N, -1, -1)
         row_tok = torch.cat([cls_exp, feat_emb], dim=2)  # (B, N, n_cls+p_max, D)
+        row_tok = row_tok + self.row_pos_emb  # break shared-CLS symmetry
         S = row_tok.shape[2]
         row_tok = row_tok.reshape(B * N, S, self.d_model)
 
@@ -998,18 +1003,6 @@ class CopulaTabICLv2(nn.Module):
         # 5. Readout: per-dimension MLP on query row embeddings
         # ------------------------------------------------------------------
         query_emb = row_emb[:, n_support:, :]  # (B, n_query, d_icl)
-
-        # Remove the shared "support-context drift" component.
-        # All query rows attend to the same support in Stage 3, so each ICL
-        # block adds the same large residual to all of them.  After 12 blocks
-        # the shared component dominates (||shared|| >> ||specific||) and
-        # s3_norm collapses every query row to the same unit vector.
-        # Subtracting the mean zeros the shared component and exposes the
-        # instance-specific signal that varies across query rows.
-        # query_emb_norm then rescales to unit RMS so fc_V sees a consistent
-        # magnitude regardless of how much S3 differentiated the query rows.
-        query_emb = query_emb - query_emb.mean(dim=1, keepdim=True)
-        query_emb = self.query_emb_norm(query_emb)
 
         # Tile row embedding over d_max dimensions, then concat per-dim embedding.
         # This breaks the symmetry: each dimension gets a distinct input to fc_V,
