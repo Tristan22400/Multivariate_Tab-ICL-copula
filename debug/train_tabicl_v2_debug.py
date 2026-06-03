@@ -42,7 +42,7 @@ from model import build_copula_tabicl_v2
 # Config
 # ---------------------------------------------------------------------------
 DATA_DIR   = ROOT / "data" / "pit_hyperplane_debug"
-OUTPUT_DIR = ROOT / "debug" / "tabicl_v2_train_debug_15k"
+OUTPUT_DIR = ROOT / "debug" / "tabicl_v2_train_debug_fixed"
 N_STEPS    = 15_000
 LR         = 3e-4
 WD         = 1e-4
@@ -476,11 +476,28 @@ def main():
         optimizer.zero_grad()
         mu_Z, d_Z, V_Z = model(X_fwd, Z_fwd, n_support=N)
 
-        Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-2, -1)
-        R_ora      = _cov_to_corr(oD, oV)
-        nt         = Sigma_pred.shape[-1]
-        ri, ci     = torch.triu_indices(nt, nt, offset=1, device=device)
-        loss       = F.mse_loss(Sigma_pred[..., ri, ci], R_ora[..., ri, ci])
+        # NLL loss on query Z values (copula training objective)
+        loss_nll = woodbury_nll(Z_test, mu_Z, d_Z, V_Z)
+
+        # Auxiliary loss: MSE between predicted R and empirical correlation of Z_train.
+        # Forces the model to actively read correlation structure from support Z rather
+        # than converging to a constant-predictor local optimum.
+        with torch.no_grad():
+            Z_tc = Z_train - Z_train.mean(dim=1, keepdim=True)
+            cov_emp = (Z_tc.transpose(-2, -1) @ Z_tc) / max(N - 1, 1)
+            std_emp = cov_emp.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+            R_emp   = cov_emp / (std_emp.unsqueeze(-1) * std_emp.unsqueeze(-2))
+            R_emp   = R_emp.clamp(-1 + 1e-6, 1 - 1e-6)
+
+        Sigma_train = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-2, -1)
+        ri_a, ci_a  = torch.triu_indices(d, d, offset=1, device=device)
+        # Average prediction over query instances; R_emp is constant per episode
+        R_pred_off  = Sigma_train[..., ri_a, ci_a].mean(dim=-2)  # (B, npairs)
+        R_emp_off   = R_emp[..., ri_a, ci_a]                     # (B, npairs)
+        loss_aux    = F.mse_loss(R_pred_off, R_emp_off)
+
+        LAMBDA_AUX  = 0.3
+        loss        = loss_nll + LAMBDA_AUX * loss_aux
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -489,9 +506,9 @@ def main():
 
         if step % LOG_EVERY == 0:
             with torch.no_grad():
-                mse_val  = loss.item()
-                div_val  = prediction_diversity(Sigma_pred)
-                gate_val = torch.sigmoid(model.icl_gate).item()
+                mse_val  = loss_nll.item() - indep_normal_nll(Z_test).item()  # copula NLL
+                div_val  = prediction_diversity(Sigma_train)
+                gate_val = torch.sigmoid(model.icl_gate_sup).mean().item()
             steps_log.append(step)
             mse_log.append(mse_val)
             div_log.append(div_val)
@@ -509,12 +526,12 @@ def main():
                 alpha_a_log[i].append(aa[i])
                 alpha_f_log[i].append(af[i])
 
-            gate_v  = torch.sigmoid(model.icl_gate).item()
+            gate_v  = torch.sigmoid(model.icl_gate_sup).mean().item()
             elapsed = time.perf_counter() - t0
             h_str   = " ".join(f"b{i}={h_vals[i]:.3f}" for i in range(n_s3))
             print(
-                f"[{step:>6d}]  mse={mse_log[-1] if mse_log else float('nan'):.5f}  "
-                f"div={div_log[-1] if div_log else float('nan'):.4f}  "
+                f"[{step:>6d}]  nll={mse_log[-1] if mse_log else float('nan'):.5f}  "
+                f"aux={loss_aux.item():.4f}  div={div_log[-1] if div_log else float('nan'):.4f}  "
                 f"gate={gate_v:.3f}  H_norm=[{h_str}]  t={elapsed:.0f}s"
             )
             model.train()
@@ -558,7 +575,7 @@ def main():
     has_rezero = hasattr(model.s3_blocks[0], "alpha_attn")
     if not has_rezero:
         print("ReZero: removed (standard pre-norm residuals)")
-    print(f"ICL gate: {torch.sigmoid(model.icl_gate).item():.4f}")
+    print(f"ICL gate: {torch.sigmoid(model.icl_gate_sup).mean().item():.4f}")
     print(f"{'='*70}")
 
     # ---------------------------------------------------------------------------

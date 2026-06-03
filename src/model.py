@@ -812,10 +812,12 @@ class CopulaTabICLv2(nn.Module):
         self.embed_tae = nn.Linear(d_max + d_vech, d_model)
         # Embed_ICL: same input → d_icl
         self.embed_icl = nn.Linear(d_max + d_vech, d_icl)
-        # Gate on ICL injection: sigmoid(0) = 0.50 at init.
-        # Starting at 0.5 gives Stage 3 immediate access to ICL embeddings,
-        # roughly doubling the effective gradient signal vs sigmoid(-1)≈0.27.
-        self.icl_gate = nn.Parameter(torch.tensor(0.0))
+        # Per-dimension gates (d_icl-vector) instead of a single scalar.
+        # A scalar gate aggregates its gradient over B × N_sup × d_icl terms —
+        # signs cancel across dimensions, leaving near-zero grad → gate never
+        # opens, embed_icl never trains.  A vector gate avoids this: each
+        # element's gradient sums over B × N_sup only, no cross-dim cancellation.
+        self.icl_gate_sup = nn.Parameter(torch.ones(d_icl))   # support injection, sigmoid(1)≈0.73
 
         # ---- Feature embedding -----------------------------------------------
         self.phi_X = nn.Linear(1, d_model, bias=False)
@@ -877,24 +879,34 @@ class CopulaTabICLv2(nn.Module):
     def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.cls_tokens, std=0.02)
         nn.init.trunc_normal_(self.row_pos_emb, std=0.02)
-        # Orthogonal init for dim_emb so each target dimension starts with a
-        # distinct direction in embedding space, preventing all U rows from
-        # collapsing to the same direction (which causes R ≈ 11^T at init).
+        # Orthogonal init for dim_emb: each dimension gets a distinct direction.
+        # Scale to match query_emb contribution through fc_V.fc1 so that the
+        # per-dimension signal is competitive with the shared query signal.
+        # query_emb magnitude at fc1 ≈ 0.1 * sqrt(d_icl); dim_emb should match:
+        # norm_target = sqrt(d_icl) so scale = sqrt(d_icl) / (orthogonal_row_norm).
         nn.init.orthogonal_(self.dim_emb)
-        self.dim_emb.data *= 0.5
+        ortho_row_norm = math.sqrt(self.d_dim_emb / self.d_max)  # orthogonal row norm
+        scale = math.sqrt(self.d_icl) / ortho_row_norm
+        self.dim_emb.data *= scale * 0.25  # 0.25 keeps dim contribution at ~25% of query
         for block in self.s1_blocks:
             nn.init.trunc_normal_(block.inducing_points, std=0.02)
-        nn.init.normal_(self.embed_tae.weight, std=0.02)
+        # embed_tae: stronger init (0.1 vs default 0.02) so the Z-target signal
+        # is competitive with X features through Stages 1+2.
+        nn.init.normal_(self.embed_tae.weight, std=0.1)
         nn.init.zeros_(self.embed_tae.bias)
-        nn.init.normal_(self.embed_icl.weight, std=0.02)
+        nn.init.normal_(self.embed_icl.weight, std=0.1)
         nn.init.zeros_(self.embed_icl.bias)
-        # fc_V readout: calibrate output variance so ||U_i||² ≈ rank at init.
-        # fc1 std=0.1 is standard; fc2 uses 1/sqrt(d_ff_head) (variance-preserving)
-        # to prevent variance explosion that would cause all U rows to collapse
-        # to the same direction and produce R ≈ 11^T.
+        # fc_V readout: calibrate output variance so ||U_i||² ≈ 1 at init,
+        # independent of rank_max.  Without rank-aware scaling, ||U_i||² grows
+        # linearly with rank_max (each extra component adds variance), causing
+        # C_diag → 0 and R → 11^T for large ranks.
+        # Fix: fc2 std = 1/sqrt(d_ff_head * rank_max) keeps ||U_i||² ≈ const.
         nn.init.normal_(self.fc_V.fc1.weight, std=0.1)
         nn.init.zeros_(self.fc_V.fc1.bias)
-        nn.init.normal_(self.fc_V.fc2.weight, std=1.0 / math.sqrt(self.fc_V.fc2.in_features))
+        nn.init.normal_(
+            self.fc_V.fc2.weight,
+            std=1.0 / math.sqrt(self.fc_V.fc2.in_features * self.rank_max),
+        )
         nn.init.zeros_(self.fc_V.fc2.bias)
 
     def forward(
@@ -997,7 +1009,10 @@ class CopulaTabICLv2(nn.Module):
         # 4. Stage 3: TF_icl — ICL over row embeddings
         # ------------------------------------------------------------------
         row_emb = row_emb.clone()
-        row_emb[:, :n_support, :] += torch.sigmoid(self.icl_gate) * icl_emb
+
+        # Support rows: inject per-instance Z embedding (vector gate, no cancellation)
+        gate_sup = torch.sigmoid(self.icl_gate_sup)  # (d_icl,)
+        row_emb[:, :n_support, :] = row_emb[:, :n_support, :] + gate_sup * icl_emb
 
         for block in self.s3_blocks:
             row_emb = block(row_emb, n_support)

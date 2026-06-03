@@ -551,8 +551,25 @@ def run_val_pit(
 
     if wandb_run is not None:
         if plot_figs:
+            import io
             import wandb as _wandb
-            metrics["val/plot"] = [_wandb.Image(f) for f in plot_figs]
+            from PIL import Image as PILImage
+
+            def _fig_to_pil(fig, dpi=100):
+                buf = io.BytesIO()
+                fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+                buf.seek(0)
+                return PILImage.open(buf).copy()
+
+            pil_imgs = [_fig_to_pil(f) for f in plot_figs]
+            max_w = max(im.width for im in pil_imgs)
+            max_h = max(im.height for im in pil_imgs)
+            padded = []
+            for im in pil_imgs:
+                canvas = PILImage.new("RGB", (max_w, max_h), (255, 255, 255))
+                canvas.paste(im, (0, 0))
+                padded.append(canvas)
+            metrics["val/plot"] = [_wandb.Image(im) for im in padded]
         wandb_run.log(metrics, step=step)
         for f in plot_figs:
             plt.close(f)
