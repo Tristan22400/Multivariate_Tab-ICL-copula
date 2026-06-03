@@ -26,6 +26,7 @@ Both X and Y are z-normalised feature-by-feature after sampling.
 from __future__ import annotations
 
 import math
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -160,6 +161,156 @@ def sample_tabular_x(
 # ---------------------------------------------------------------------------
 
 _KERNEL_NAMES = ["rbf", "exponential", "matern32", "rational_quadratic", "periodic"]
+
+
+# ---------------------------------------------------------------------------
+# Stationary isotropic kernel functions  (for IsotropicModulatedKernel)
+# ---------------------------------------------------------------------------
+# Signature: (r: Tensor[...,d,d], l: Tensor[...,1,1]) -> Tensor[...,d,d]
+# All satisfy k(0, l) = 1, so C has unit diagonal by construction.
+
+
+def _rbf_kernel(r: torch.Tensor, l: torch.Tensor) -> torch.Tensor:
+    """Matern-∞ / RBF: exp(−r²/(2l²))."""
+    return torch.exp(-(r**2) / (2 * l**2))
+
+
+def _matern12_kernel(r: torch.Tensor, l: torch.Tensor) -> torch.Tensor:
+    """Matern-½ (Ornstein-Uhlenbeck): exp(−r/l)."""
+    return torch.exp(-r / l)
+
+
+def _matern32_kernel(r: torch.Tensor, l: torch.Tensor) -> torch.Tensor:
+    """Matern-³⁄₂: (1 + √3 r/l) exp(−√3 r/l)."""
+    rs = math.sqrt(3) * r / l
+    return (1.0 + rs) * torch.exp(-rs)
+
+
+def _matern52_kernel(r: torch.Tensor, l: torch.Tensor) -> torch.Tensor:
+    """Matern-⁵⁄₂: (1 + √5 r/l + 5r²/(3l²)) exp(−√5 r/l)."""
+    rs = math.sqrt(5) * r / l
+    return (1.0 + rs + rs**2 / 3.0) * torch.exp(-rs)
+
+
+_STATIONARY_KERNEL_FNS: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
+    "rbf": _rbf_kernel,
+    "matern12": _matern12_kernel,
+    "matern32": _matern32_kernel,
+    "matern52": _matern52_kernel,
+}
+_ISO_KERNEL_NAMES: list[str] = list(_STATIONARY_KERNEL_FNS)
+
+
+# ---------------------------------------------------------------------------
+# Dataset 1 — Isotropic Modulated Kernel  →  Elliptope
+# ---------------------------------------------------------------------------
+
+
+class IsotropicModulatedKernel:
+    """Dataset 1: hierarchical isotropic kernel mapping x_i to the Elliptope.
+
+    Produces per-instance **correlation** matrices C(x_i) ∈ R^{d×d} (unit
+    diagonal, strict PD) and returns their Cholesky factors.  Shares the same
+    call interface as KernelCovGen so it can be passed as `kernel_cov_gen` to
+    `generate_episode`.
+
+    Class attribute `is_copula_gen = True` signals `generate_episode` to
+    suppress the extra diagonal noise term (which would break the unit-diagonal
+    / copula structure).
+
+    Generative process (all priors sampled fresh each episode):
+
+      Step 1 — Spatial geometry (static per episode)
+        k      ~ U{1,...,d}                — latent rank
+        σ_E    ~ LogU(1e-2, 1e1)          — embedding scale
+        E      ~ N(0, σ_E² I)  ∈ R^{d×k} — target latent positions
+        D_{mn} = ‖E_m − E_n‖²             — pairwise squared distance
+
+      Step 2 — Covariate projection (1-D bottleneck)
+        α_w    ~ LogU(1e-2, 1e1)
+        w      ~ N(0, α_w I)  ∈ R^p
+        δ      ~ U(0.1, 1.0)
+        l(x_i) = softplus(wᵀ x_i) + δ    — strictly positive scalar
+
+      Step 3 — Kernel pushforward + nugget regularization
+        K_{mn}(x_i) = kernel_fn(√D_{mn}, l(x_i))
+        C(x_i)      = (1−ε) K(x_i) + ε I_d      (diagonal = 1 exactly)
+
+    Supported kernels (see _STATIONARY_KERNEL_FNS):
+        rbf      — Matern-∞:  exp(−r²/(2l²))
+        matern12 — Matern-½:  exp(−r/l)
+        matern32 — Matern-³⁄₂: (1 + √3 r/l) exp(−√3 r/l)
+        matern52 — Matern-⁵⁄₂: (1 + √5 r/l + 5r²/(3l²)) exp(−√5 r/l)
+        random   — one of the above, chosen uniformly per episode
+    """
+
+    KERNELS: list[str] = _ISO_KERNEL_NAMES
+    is_copula_gen: bool = True  # tells generate_episode to zero diag noise
+
+    def __init__(self, kernel_type: str = "rbf", nugget: float = 1e-4) -> None:
+        if kernel_type not in self.KERNELS + ["random"]:
+            raise ValueError(
+                f"Unknown kernel_type {kernel_type!r}. "
+                f"Choose from {self.KERNELS + ['random']}"
+            )
+        self.kernel_type = kernel_type
+        self.nugget = nugget
+
+    def __call__(self, X: torch.Tensor, d: int) -> torch.Tensor:
+        """Build per-instance Cholesky factors L(x_i) of the correlation matrix C(x_i).
+
+        Args:
+            X : (B, T, p) — z-normalised input features
+            d : target dimension
+
+        Returns:
+            L : (B, T, d, d) — lower-triangular Cholesky factor of C(x_i)
+        """
+        B, T, p = X.shape
+        device = X.device
+        eps = self.nugget
+
+        kernel_name = (
+            _ISO_KERNEL_NAMES[torch.randint(len(_ISO_KERNEL_NAMES), (1,)).item()]
+            if self.kernel_type == "random"
+            else self.kernel_type
+        )
+        kernel_fn = _STATIONARY_KERNEL_FNS[kernel_name]
+
+        # Step 1: PER-BATCH spatial geometry — each dataset gets independent priors.
+        # k_b ~ U{1,...,d}: variable latent rank per dataset.
+        k_each = torch.randint(1, d + 1, (B,), device=device)           # (B,)
+        # E_b ∈ R^{d × d}; columns beyond k_b are zeroed so the effective rank is k_b.
+        sigma_E = torch.empty(B, device=device).uniform_(
+            math.log(1e-2), math.log(1e1)
+        ).exp().view(B, 1, 1)                                            # (B, 1, 1)
+        col_mask = (
+            torch.arange(d, device=device).unsqueeze(0) < k_each.unsqueeze(1)
+        ).float()                                                         # (B, d)
+        E = torch.randn(B, d, d, device=device) * sigma_E               # (B, d, d)
+        E = E * col_mask.unsqueeze(1)                                    # zero cols > k_b
+        diff_E = E.unsqueeze(2) - E.unsqueeze(1)                        # (B, d, d, d)
+        r_dist = (diff_E**2).sum(-1).clamp(min=0).sqrt()               # (B, d, d)
+
+        # Step 2: PER-BATCH covariate projection → per-instance lengthscale.
+        alpha_w = torch.empty(B, device=device).uniform_(
+            math.log(1e-2), math.log(1e1)
+        ).exp()                                                           # (B,)
+        w = torch.randn(B, p, device=device) * alpha_w.sqrt().unsqueeze(1)  # (B, p)
+        delta = torch.empty(B, device=device).uniform_(0.1, 1.0)        # (B,)
+
+        proj = torch.einsum("btp,bp->bt", X, w)                         # (B, T)
+        l_x = F.softplus(proj) + delta.unsqueeze(1)                     # (B, T), > 0
+        l = l_x.unsqueeze(-1).unsqueeze(-1)                             # (B, T, 1, 1)
+
+        # Step 3: kernel evaluation and nugget regularization → correlation matrix
+        r_d = r_dist.unsqueeze(1)                                        # (B, 1, d, d)
+        K = kernel_fn(r_d, l)                                            # (B, T, d, d)
+        C = (1.0 - eps) * K + eps * torch.eye(d, device=device).view(1, 1, d, d)
+
+        # Cholesky — C is strictly PD by construction (nugget ε > 0, K PSD)
+        L = torch.linalg.cholesky(C.reshape(B * T, d, d)).reshape(B, T, d, d)
+        return L
 
 
 class KernelCovGen:
@@ -470,11 +621,11 @@ def generate_episode(
     fixed_nets: GlobalFixedNets | None = None,
     anchor_gen: GlobalAnchorCovGen | None = None,
     kernel_cov_gen: KernelCovGen | None = None,
-    diag_alpha: float = 0.0,
+    diag_alpha: float | torch.Tensor = 0.0,
     return_norm_stats: bool = False,
-    hyperplane_bimodal: bool = False,
-    hyperplane_bimodal_scale_lo: float = 0.3,
-    hyperplane_bimodal_scale_hi: float = 3.0,
+    hyperplane_multimodal: bool = False,
+    hyperplane_multimodal_scale_lo: float = 0.1,
+    hyperplane_multimodal_scale_hi: float = 6.0,
 ) -> tuple:
     """Generate one training episode (one gradient step worth of data).
 
@@ -482,14 +633,15 @@ def generate_episode(
     initialised (and frozen) V_net network that defines the ground-truth
     conditional distribution for that dataset.
 
-    The target covariance is purely low-rank (diagonal set to zero):
+    The target covariance is low-rank plus diagonal noise:
 
-        Sigma(x_i) = V_net(x_i) @ V_net(x_i)^T
+        Sigma(x_i) = diag(diag_alpha) + V_net(x_i) @ V_net(x_i)^T
 
     Y is sampled via the reparameterisation:
 
         eps_low ~ N(0, I_r)
-        y_i = V_net(x_i) @ eps_low_i
+        eps_diag ~ N(0, I_d)
+        y_i = diag_alpha^{1/2} * eps_diag_i + V_net(x_i) @ eps_low_i
 
     Both X (feature-wise) and Y (dimension-wise) are z-normalised across
     all T = n_train + n_test instances within each batch element.
@@ -520,55 +672,73 @@ def generate_episode(
 
     # 1. Sample x from the tabular prior (z-normalised using train-split stats)
     X = sample_tabular_x(B, T, p, device, n_train=n_train)  # (B, T, p)
+    diag_alpha_t = torch.as_tensor(diag_alpha, device=device, dtype=X.dtype)
+    if diag_alpha_t.ndim == 1:
+        if diag_alpha_t.numel() != B:
+            raise ValueError(
+                f"diag_alpha has {diag_alpha_t.numel()} values, "
+                f"expected one per batch element ({B})"
+            )
+        diag_alpha_t = diag_alpha_t.view(B, 1, 1)
 
     with torch.no_grad():
-        if hyperplane_bimodal:
-            # Two random PSD matrices per dataset (Σ₁ weak, Σ₂ strong), separated by a
-            # random hyperplane in X-space.  The hyperplane threshold is the per-dataset
-            # median of the training-split projections so the split is exactly ~50/50 in
-            # the context set regardless of the X distribution.
-            scale1 = hyperplane_bimodal_scale_lo / math.sqrt(r)
-            scale2 = hyperplane_bimodal_scale_hi / math.sqrt(r)
+        if hyperplane_multimodal:
+            # K-group multimodal covariance: K ~ Uniform{2,...,6}.
+            # A pool of 6 log-spaced scales between scale_lo and scale_hi is built;
+            # K evenly-spread scales are selected so the extremes are always included.
+            # Each instance is assigned to the group whose random hyperplane normal
+            # it projects onto most strongly (argmax over K projections).
+            K = int(torch.randint(2, 7, (1,)).item())  # K in {2, 3, 4, 5, 6}
 
-            D1 = F.softplus(torch.randn(B, 1, d, device=device)) + 1e-6  # (B, 1, d)
-            V1 = torch.randn(B, 1, d, r, device=device) * scale1  # (B, 1, d, r)
-            D2 = F.softplus(torch.randn(B, 1, d, device=device)) + 1e-6  # (B, 1, d)
-            V2 = torch.randn(B, 1, d, r, device=device) * scale2  # (B, 1, d, r)
+            # 6-value log-spaced pool — endpoints controlled by scale_lo/scale_hi
+            scale_pool = torch.logspace(
+                math.log10(hyperplane_multimodal_scale_lo),
+                math.log10(hyperplane_multimodal_scale_hi),
+                6,
+                device=device,
+            )  # (6,)
 
-            # One unit-norm hyperplane direction per dataset in feature space
-            w = F.normalize(torch.randn(B, p, device=device), dim=-1)  # (B, p)
+            # Select K evenly-spread indices: always keeps lo (idx 0) and hi (idx 5)
+            pool_idx = torch.linspace(0, 5, K).round().long()  # (K,)
+            scales = scale_pool[pool_idx] / math.sqrt(r)       # (K,)
 
-            # Scalar projection of every instance onto the hyperplane normal
-            scores = torch.einsum("btp,bp->bt", X, w)  # (B, T)
+            # Build K covariance structures (D_k, V_k) each with its own scale
+            Ds, Vs = [], []
+            for k in range(K):
+                Ds.append(F.softplus(torch.randn(B, d, device=device)) + 1e-6)    # (B, d)
+                Vs.append(torch.randn(B, d, r, device=device) * scales[k].item()) # (B, d, r)
 
-            # Per-dataset threshold = median of training projections (guarantees ~50/50 split)
-            threshold = scores[:, :n_train].median(dim=1).values.unsqueeze(1)  # (B, 1)
+            D_all = torch.stack(Ds, dim=1)  # (B, K, d)
+            V_all = torch.stack(Vs, dim=1)  # (B, K, d, r)
 
-            # True → group 1 (Σ₁ / weak), False → group 2 (Σ₂ / strong)
-            mask = scores > threshold  # (B, T)
+            # K random unit-norm normals; assign each instance to its argmax group
+            W = F.normalize(torch.randn(B, K, p, device=device), dim=-1)  # (B, K, p)
+            scores = torch.einsum("btp,bkp->btk", X, W)                   # (B, T, K)
+            groups = scores.argmax(dim=-1)                                  # (B, T)
 
-            mask_d = mask.unsqueeze(-1)  # (B, T, 1)
-            mask_v = mask.unsqueeze(-1).unsqueeze(-1)  # (B, T, 1, 1)
-            diag_x = torch.where(
-                mask_d, D1.expand(B, T, d), D2.expand(B, T, d)
-            )  # (B, T, d)
-            V_x = torch.where(
-                mask_v, V1.expand(B, T, d, r), V2.expand(B, T, d, r)
-            )  # (B, T, d, r)
+            # Advanced indexing: for each (b, t), gather covariance of group groups[b, t]
+            b_idx = torch.arange(B, device=device)           # (B,)
+            diag_x = D_all[b_idx.unsqueeze(1), groups]       # (B, T, d)
+            V_x    = V_all[b_idx.unsqueeze(1), groups]       # (B, T, d, r)
             _r = r
             mu_x = torch.zeros(B, T, d, device=device)
 
         elif kernel_cov_gen is not None:
-            # Kernel-based: full x-dependent distribution (mean, diagonal, and full-rank covariance
-            # all vary per instance via frozen random MLPs sampled fresh each episode).
+            # Kernel-based: full x-dependent distribution.
+            # IsotropicModulatedKernel sets is_copula_gen=True, meaning V_x is
+            # the Cholesky of a correlation matrix (diagonal = 1) — no extra
+            # diagonal noise should be added so the copula structure is preserved.
             mu_net = BatchedRandomMLP(
                 B, p_in=p, p_out=d, hidden=mlp_hidden, device=device
             )
-            diag_net = BatchedRandomMLP(
-                B, p_in=p, p_out=d, hidden=mlp_hidden, device=device
-            )
             mu_x = mu_net(X)  # (B, T, d)
-            diag_x = F.softplus(diag_net(X)) * diag_alpha + 1e-6  # (B, T, d)
+            if getattr(kernel_cov_gen, "is_copula_gen", False):
+                diag_x = torch.zeros(B, T, d, device=device, dtype=X.dtype)
+            else:
+                diag_net = BatchedRandomMLP(
+                    B, p_in=p, p_out=d, hidden=mlp_hidden, device=device
+                )
+                diag_x = F.softplus(diag_net(X)) * diag_alpha_t + 1e-6  # (B, T, d)
             V_x = kernel_cov_gen(X, d)  # (B, T, d, d)
             _r = d
         else:
@@ -589,7 +759,9 @@ def generate_episode(
                 mu_x = v_net.get_mean(X)  # (B, T, d)
             else:
                 mu_x = torch.zeros(B, T, d, device=device)  # (B, T, d)
-            diag_x = torch.full((B, T, d), diag_alpha, device=device)  # (B, T, d)
+            diag_x = (
+                torch.ones((B, T, d), device=device, dtype=X.dtype) * diag_alpha_t
+            )
             V_x = v_net(X).reshape(B, T, d, r)  # (B, T, d, r)
             _r = r
 
@@ -650,7 +822,6 @@ def build_val_suite(
     fixed_nets: GlobalFixedNets | None = None,
     anchor_gen: GlobalAnchorCovGen | None = None,
     kernel_cov_gen: KernelCovGen | None = None,
-    fixed_cov_params: tuple | None = None,
 ) -> dict[str, dict]:
     """Pre-generate a fixed validation suite.
 
@@ -670,16 +841,20 @@ def build_val_suite(
     n_test = int(cfg.data.val_n_test)
     r = int(cfg.data.r_data)
     hidden = int(cfg.data.mlp_hidden)
-    fixed_cov = bool(cfg.data.get("fixed_cov", False))
-    fixed_cov_rho = float(cfg.data.get("fixed_cov_rho", 0.8))
-    fixed_cov_n_anchors = int(cfg.data.get("fixed_cov_n_anchors", 4))
-    diag_alpha = float(cfg.data.get("diag_alpha", 0.0))
+    diag_alpha_range = cfg.data.get("diag_alpha_range", [0.05, 2.0])
+    diag_alpha_lo = float(diag_alpha_range[0])
+    diag_alpha_hi = float(diag_alpha_range[1])
 
     for d in cfg.data.val_d_list:
         for n_train in cfg.data.val_n_train_list:
             # Feature dimension p: sample randomly in p_range for each grid point
             p_lo, p_hi = cfg.data.p_range
             p = int(torch.randint(int(p_lo), int(p_hi) + 1, ()).item())
+            diag_alpha = float(
+                torch.empty((), device=device)
+                .uniform_(diag_alpha_lo, diag_alpha_hi)
+                .item()
+            )
 
             key = f"d{d}_p{n_train}"
             X_tr, Y_tr, X_te, Y_te, oracle = generate_episode(
@@ -692,10 +867,6 @@ def build_val_suite(
                 device,
                 mlp_hidden=hidden,
                 return_oracle=True,
-                fixed_cov=fixed_cov,
-                fixed_cov_rho=fixed_cov_rho,
-                fixed_cov_params=fixed_cov_params,
-                fixed_cov_n_anchors=fixed_cov_n_anchors,
                 fixed_nets=fixed_nets,
                 anchor_gen=anchor_gen,
                 kernel_cov_gen=kernel_cov_gen,

@@ -36,7 +36,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _HERE)
 
-from data_gen import GlobalAnchorCovGen, GlobalFixedNets, KernelCovGen, generate_episode
+from data_gen import GlobalAnchorCovGen, GlobalFixedNets, IsotropicModulatedKernel, KernelCovGen, generate_episode
 from pit import load_tabicl, run_pit_batched
 
 # ---------------------------------------------------------------------------
@@ -89,20 +89,26 @@ def main(cfg: DictConfig) -> None:
     nt_lo, nt_hi = int(cfg.data.n_test_range[0]), int(cfg.data.n_test_range[1])
     r_data = int(cfg.data.r_data)
     mlp_hidden = int(cfg.data.mlp_hidden)
-    diag_alpha = float(cfg.data.get("diag_alpha", 0.0))
-    hyperplane_bimodal = bool(cfg.data.get("hyperplane_bimodal", False))
-    hyperplane_bimodal_scale_lo = float(
-        cfg.data.get("hyperplane_bimodal_scale_lo", 0.3)
+    diag_alpha_range = cfg.data.get("diag_alpha_range", [0.05, 2.0])
+    diag_alpha_lo = float(diag_alpha_range[0])
+    diag_alpha_hi = float(diag_alpha_range[1])
+    if not (0.0 < diag_alpha_lo <= diag_alpha_hi):
+        raise ValueError(
+            "data.diag_alpha_range must be positive and ordered as [lo, hi]"
+        )
+    hyperplane_multimodal = bool(cfg.data.get("hyperplane_multimodal", False))
+    hyperplane_multimodal_scale_lo = float(
+        cfg.data.get("hyperplane_multimodal_scale_lo", 0.1)
     )
-    hyperplane_bimodal_scale_hi = float(
-        cfg.data.get("hyperplane_bimodal_scale_hi", 3.0)
+    hyperplane_multimodal_scale_hi = float(
+        cfg.data.get("hyperplane_multimodal_scale_hi", 6.0)
     )
 
     # ---- Covariance generator (persistent across episodes for stability) ----
     fixed_nets: GlobalFixedNets | None = None
     anchor_gen: GlobalAnchorCovGen | None = None
     kernel_cov_gen: KernelCovGen | None = None
-    if not hyperplane_bimodal:
+    if not hyperplane_multimodal:
         cov_type = str(cfg.data.get("cov_type", "mlp"))
         if cov_type == "anchor":
             num_anchors = int(cfg.data.get("num_anchors", 8))
@@ -125,6 +131,17 @@ def main(cfg: DictConfig) -> None:
                 f"KernelCovGen: kernel={kernel_type}, latent_dim={kernel_latent_dim}, "
                 f"nugget={kernel_nugget}"
             )
+        elif cov_type == "iso_kernel":
+            iso_kernel_type = str(cfg.data.get("iso_kernel_type", "rbf"))
+            iso_kernel_nugget = float(cfg.data.get("iso_kernel_nugget", 1e-4))
+            kernel_cov_gen = IsotropicModulatedKernel(
+                kernel_type=iso_kernel_type,
+                nugget=iso_kernel_nugget,
+            )
+            print(
+                f"IsotropicModulatedKernel: kernel={iso_kernel_type}, "
+                f"nugget={iso_kernel_nugget}"
+            )
         else:
             fixed_nets = GlobalFixedNets(r=r_data, hidden=mlp_hidden, device=device)
             print("GlobalFixedNets: mlp covariance generator")
@@ -140,8 +157,8 @@ def main(cfg: DictConfig) -> None:
         "n_train_range": [pt_lo, pt_hi],
         "n_test_range": [nt_lo, nt_hi],
         "r_data": r_data,
-        "hyperplane_bimodal": hyperplane_bimodal,
-        "diag_alpha": diag_alpha,
+        "hyperplane_multimodal": hyperplane_multimodal,
+        "diag_alpha_range": [diag_alpha_lo, diag_alpha_hi],
     }
 
     meta_path = os.path.join(out_dir, "meta.json")
@@ -228,6 +245,14 @@ def main(cfg: DictConfig) -> None:
             n_test = int(torch.randint(nt_lo, nt_hi + 1, ()).item())
 
             actual_K = len(step_ids)  # last step may be smaller
+            diag_alpha_episode = torch.empty(actual_K).uniform_(
+                diag_alpha_lo, diag_alpha_hi
+            )
+            diag_alpha_batch = (
+                diag_alpha_episode.repeat_interleave(B)
+                .to(device)
+                .view(B * actual_K, 1, 1)
+            )
 
             # ---- Generate B*K datasets in one shot ----
             t0 = time.perf_counter()
@@ -244,10 +269,10 @@ def main(cfg: DictConfig) -> None:
                 fixed_nets=fixed_nets,
                 anchor_gen=anchor_gen,
                 kernel_cov_gen=kernel_cov_gen,
-                diag_alpha=diag_alpha,
-                hyperplane_bimodal=hyperplane_bimodal,
-                hyperplane_bimodal_scale_lo=hyperplane_bimodal_scale_lo,
-                hyperplane_bimodal_scale_hi=hyperplane_bimodal_scale_hi,
+                diag_alpha=diag_alpha_batch,
+                hyperplane_multimodal=hyperplane_multimodal,
+                hyperplane_multimodal_scale_lo=hyperplane_multimodal_scale_lo,
+                hyperplane_multimodal_scale_hi=hyperplane_multimodal_scale_hi,
             )
             t1 = time.perf_counter()
             prof["t_datagen"].append(t1 - t0)
@@ -315,6 +340,7 @@ def main(cfg: DictConfig) -> None:
                             "d": d,
                             "n_train": n_train,
                             "n_test": n_test,
+                            "diag_alpha": float(diag_alpha_episode[k].item()),
                         },
                         fpath,
                     )

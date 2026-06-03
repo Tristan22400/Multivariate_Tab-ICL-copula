@@ -11,8 +11,8 @@ p_range: [20, 20]
 d_range: [8,8]
 
 # Context (train) and query (test) sizes
-n_train_range: [256,256]
-n_test_range: [16, 16]
+n_train_range: [512,512]
+n_test_range: [64, 64]
 
 # Low-rank factor r used in DATA generation (ground truth covariance rank)
 # This is independent of model.rank (the readout's approximation rank)
@@ -21,11 +21,11 @@ r_data: 8
 # Hidden width of the three random MLPs used to parameterise f, d_net, V_net
 mlp_hidden: 64
 
-# Constant diagonal added to the ground-truth covariance in every episode.
-# Sigma(x) = diag(diag_alpha) + V(x) @ V(x)^T
-# Setting diag_alpha > 0 ensures D_oracle > 0, preventing the model from
-# collapsing to V≈0 (the saddle point where ∂NLL/∂V = 0 when D >> D_oracle).
-diag_alpha: 0.5
+# Range for the diagonal variance sampled independently for each episode.
+# Sigma(x) = diag(diag_alpha_episode) + V(x) @ V(x)^T
+# Keeping this positive ensures D_oracle > 0, while varying it prevents the
+# model from overfitting to a single diagonal noise level.
+diag_alpha_range: [0.05, 2.0]
 
 # Per-dataset fixed covariance: sample a piecewise-constant mean (fixed_cov_n_anchors Voronoi                                                                                
 # regions) and a random Sigma = diag(D) + V @ V^T independently for each of the B datasets.                                                                                  
@@ -41,7 +41,7 @@ fixed_cov_n_anchors: 4   # K Voronoi regions for the piecewise-constant mean (fi
 #            The kernel hyperparameters l(x) and σ²(x) come from frozen MLPs; a fresh set of
 #            latent embeddings E ∈ R^(d × kernel_latent_dim) is sampled per episode so each
 #            episode presents a distinct x→Σ mapping for the in-context learner to recover.
-cov_type: kernel
+cov_type: iso_kernel
 num_anchors: 2        # K: number of anchor covariance prototypes (cov_type=anchor)
 anchor_temp: 1.0      # τ: softmax temperature for x-to-anchor similarity (cov_type=anchor)
 
@@ -52,12 +52,18 @@ kernel_type: rbf
 kernel_latent_dim: 1  # dimension of latent embeddings e_j for each output dim
 kernel_nugget: 1.0e-4 # jitter added to diagonal for strict PD
 
+# Isotropic Modulated Kernel — Dataset 1 (used when cov_type: iso_kernel)
+# Maps x_i to a correlation matrix (Elliptope) via a 1-D linear projection
+# and a stationary isotropic kernel.  diag_alpha is ignored (zeroed internally).
+# kernel: rbf | matern12 | matern32 | matern52 | random
+iso_kernel_type: rbf
+iso_kernel_nugget: 1.0e-4
+
 # Hyperplane-bimodal debug mode: two random PSD matrices per dataset separated by a
 # random hyperplane in X-space.  Group assignment is ~50/50 (per-dataset median split).
 # Activate with: data.hyperplane_bimodal=true
 # V scale for group 1 (weak correlations, near-independent)
-hyperplane_bimodal: false
-hyperplane_bimodal_scale_lo: 0.3
+hyperplane_multimodal: true
+hyperplane_multimodal_scale_lo: 0.1
 # V scale for group 2 (strong correlations, highly structured)
-hyperplane_bimodal_scale_hi: 3.0
-
+hyperplane_multimodal_scale_hi: 6.0

@@ -1,6 +1,6 @@
 #!/bin/bash
 #OAR -n TabICL_Generate
-#OAR -l gpu=1,walltime=16:00:00
+#OAR -l gpu=1,walltime=24:00:00
 
 
 

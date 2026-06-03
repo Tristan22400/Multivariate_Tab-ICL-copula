@@ -305,7 +305,7 @@ def run_pit_batched(
     Q = logits_test.shape[-1]
     dist_test = tabicl.quantile_dist(logits_test.reshape(B * d * N_test, Q))
 
-    y_test_fused = Y_test.permute(0, 2, 1).reshape(B * d * N_test)
+    y_test_fused = Y_test.permute(0, 2, 1).reshape(B * d * N_test).to(device)
     if dequantize:
         y_test_fused = y_test_fused + torch.rand_like(y_test_fused)
     u_test = dist_test.cdf(y_test_fused).reshape(B, d, N_test).permute(0, 2, 1)
@@ -348,7 +348,7 @@ def run_pit_batched(
 
             dist_fold = tabicl.quantile_dist(logits_fold.reshape(-1, Q))
 
-            y_qry = Y_train[:, fold_idx, :].permute(0, 2, 1).reshape(-1)
+            y_qry = Y_train[:, fold_idx, :].permute(0, 2, 1).reshape(-1).to(device)
             if dequantize:
                 y_qry = y_qry + torch.rand_like(y_qry)
 
@@ -385,7 +385,7 @@ def run_pit_batched(
             fold_times.append(time.perf_counter() - _tf0)
 
             dist_loo = tabicl.quantile_dist(logits_loo[:, 0, :])
-            y_chunk = Y_train[:, chunk_start:chunk_end, :].reshape(B * chunk * d)
+            y_chunk = Y_train[:, chunk_start:chunk_end, :].reshape(B * chunk * d).to(device)
             if dequantize:
                 y_chunk = y_chunk + torch.rand_like(y_chunk)
             u_train[:, chunk_start:chunk_end, :] = dist_loo.cdf(y_chunk).reshape(
