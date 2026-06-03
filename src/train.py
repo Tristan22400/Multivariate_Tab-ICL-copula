@@ -168,7 +168,7 @@ def _corr_all_instances_fig(
     R_ora_np  = R_ora.numpy()
 
     n_cols = max(half, 1)
-    fig, axes = plt.subplots(4, n_cols, figsize=(2.5 * n_cols, 10))
+    fig, axes = plt.subplots(4, n_cols, figsize=(2.5 * n_cols, 10), layout="constrained")
     if n_cols == 1:
         axes = axes[:, np.newaxis]
 
@@ -203,7 +203,6 @@ def _corr_all_instances_fig(
     if label:
         title = f"{label}  |  {title}"
     fig.suptitle(title, fontsize=10)
-    fig.tight_layout()
     return fig, mean_mse
 
 
@@ -538,16 +537,19 @@ def run_val_pit(
         if all_off_pred and all_off_ora:
             off_p = np.concatenate(all_off_pred)
             off_o = np.concatenate(all_off_ora)
-            fig_sc, ax_sc = plt.subplots(figsize=(5, 5))
-            ax_sc.scatter(off_o, off_p, s=2, alpha=0.3, rasterized=True)
             lo = min(float(off_o.min()), float(off_p.min()))
             hi = max(float(off_o.max()), float(off_p.max()))
-            ax_sc.plot([lo, hi], [lo, hi], "r--", lw=1)
-            ax_sc.set_xlabel("Oracle off-diag corr")
-            ax_sc.set_ylabel("Predicted off-diag corr")
-            ax_sc.set_title(f"step {step} — {len(off_p):,} off-diag values")
-            fig_sc.tight_layout()
-            plot_figs.append(fig_sc)
+
+            # — 2D histogram (density) of off-diagonal correlations —
+            fig_den, ax_den = plt.subplots(figsize=(5, 5))
+            hb = ax_den.hexbin(off_o, off_p, gridsize=60, cmap="YlOrRd", mincnt=1, bins="log")
+            fig_den.colorbar(hb, ax=ax_den, label="log10(count)")
+            ax_den.plot([lo, hi], [lo, hi], "b--", lw=1)
+            ax_den.set_xlabel("Oracle off-diag corr")
+            ax_den.set_ylabel("Predicted off-diag corr")
+            ax_den.set_title(f"step {step} — density ({len(off_p):,} values)")
+            fig_den.tight_layout()
+            plot_figs.append(fig_den)
 
     if wandb_run is not None:
         if plot_figs:
@@ -561,12 +563,19 @@ def run_val_pit(
                 buf.seek(0)
                 return PILImage.open(buf).copy()
 
+            TARGET_W = 1200
             pil_imgs = [_fig_to_pil(f) for f in plot_figs]
-            max_w = max(im.width for im in pil_imgs)
-            max_h = max(im.height for im in pil_imgs)
+            resized = [
+                im.resize(
+                    (TARGET_W, max(1, int(im.height * TARGET_W / im.width))),
+                    PILImage.LANCZOS,
+                )
+                for im in pil_imgs
+            ]
+            target_h = max(im.height for im in resized)
             padded = []
-            for im in pil_imgs:
-                canvas = PILImage.new("RGB", (max_w, max_h), (255, 255, 255))
+            for im in resized:
+                canvas = PILImage.new("RGB", (TARGET_W, target_h), (255, 255, 255))
                 canvas.paste(im, (0, 0))
                 padded.append(canvas)
             metrics["val/plot"] = [_wandb.Image(im) for im in padded]
@@ -819,22 +828,20 @@ def main(cfg: DictConfig) -> None:
             progress = min(1.0, step / max(1, anneal_frac * int(cfg.training.steps)))
             alpha = aux_weight * (1.0 - progress)
 
+            # Oracle correlation matrix from ground-truth low-rank factors
+            Sigma_ora = torch.diag_embed(
+                oracle_D_ep
+            ) + oracle_V_ep @ oracle_V_ep.transpose(-1, -2)  # (B, n_test, d, d)
+            std_ora = Sigma_ora.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+            R_ora = Sigma_ora / (std_ora.unsqueeze(-1) * std_ora.unsqueeze(-2))
+
+            # Predicted correlation matrix (diag=1 by Woodbury construction)
+            Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-1, -2)
+
+            ri, ci = torch.triu_indices(d, d, offset=1, device=device)
+            loss_mse = F.mse_loss(Sigma_pred[..., ri, ci], R_ora[..., ri, ci])
             if alpha > 0.0:
-                # Oracle correlation matrix from ground-truth low-rank factors
-                Sigma_ora = torch.diag_embed(
-                    oracle_D_ep
-                ) + oracle_V_ep @ oracle_V_ep.transpose(-1, -2)  # (B, n_test, d, d)
-                std_ora = Sigma_ora.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
-                R_ora = Sigma_ora / (std_ora.unsqueeze(-1) * std_ora.unsqueeze(-2))
-
-                # Predicted correlation matrix (diag=1 by Woodbury construction)
-                Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-1, -2)
-
-                ri, ci = torch.triu_indices(d, d, offset=1, device=device)
-                loss_mse = F.mse_loss(Sigma_pred[..., ri, ci], R_ora[..., ri, ci])
                 loss = loss + alpha * loss_mse
-            else:
-                loss_mse = torch.zeros(1, device=device)
 
         # ---- Backward ----
         scaler.scale(loss / accum_steps).backward()
