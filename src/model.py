@@ -1254,3 +1254,7 @@ def build_copula_tabicl_v2(cfg) -> CopulaTabICLv2:
     )
 
     return model
+
+
+# Backward-compat alias: old train_on_datasets.py imports this name for ICLCorrNetV2
+build_copula_transformer = build_icl_corr_net_v2
