@@ -732,8 +732,8 @@ class ZReadoutCrossAttn(nn.Module):
 
         # SSMax per-head temperature learnable log-scale
         self.ssmax_log_s = nn.Parameter(torch.zeros(n_heads))
-        # Residual gate starts near 0 so the module activates gradually
-        self.gate = nn.Parameter(torch.tensor(-2.0))
+        # Residual gate: sigmoid(-1)≈0.27 at init, opens gradually
+        self.gate = nn.Parameter(torch.tensor(-1.0))
 
     def forward(
         self,
@@ -973,6 +973,13 @@ class CopulaTabICLv2(nn.Module):
         # grows as the gate opens.  std=0.02 keeps the initial row_emb perturbation
         # well below the row_emb magnitude (~1 after s2_norm).
         nn.init.normal_(self.x_route_proj.weight, std=0.02)
+        # ZReadoutCrossAttn: calibrate so V (icl_emb → v_proj → out_proj) has
+        # magnitude ~0.1 at init, matching embed_icl output scale.  With
+        # gate=sigmoid(-1)≈0.27 the module contributes ~2% of query_emb at init.
+        nn.init.normal_(self.zread_xattn.q_proj.weight, std=0.1)
+        nn.init.normal_(self.zread_xattn.k_proj.weight, std=0.1)
+        nn.init.normal_(self.zread_xattn.v_proj.weight, std=0.1)
+        nn.init.normal_(self.zread_xattn.out_proj.weight, std=0.02)
 
     def forward(
         self,
