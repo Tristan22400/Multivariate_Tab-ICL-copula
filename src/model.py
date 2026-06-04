@@ -427,32 +427,135 @@ class InducingPointBlock(nn.Module):
         return data
 
 
-class RowAggregatorBlock(nn.Module):
-    """Stage 2 (TF_row) block: standard non-causal pre-norm transformer.
+# ---------------------------------------------------------------------------
+# Rotary Positional Embedding (RoPE) utilities
+# ---------------------------------------------------------------------------
 
-    Processes per-row token sequences of shape (B*N, S, d_model) where
-    S = n_cls + p_max. All tokens within a row attend freely (no masking).
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Split last dim [a, b] → [-b, a]."""
+    half = x.shape[-1] // 2
+    return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+
+
+def _apply_rope(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """x : (..., S, d_head);  cos/sin : (1, 1, S, d_head)."""
+    return x * cos + _rotate_half(x) * sin
+
+
+class RotaryEmbedding(nn.Module):
+    """Precomputes RoPE cos/sin for the TF_row sequence (S = n_cls + p_max).
+
+    Args:
+        d_head : head dimension (must be even).
+        base   : RoPE base frequency (default 10000).
+    """
+
+    def __init__(self, d_head: int, base: float = 10000.0) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, d_head, 2).float() / d_head))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(
+        self, seq_len: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cos, sin of shape (1, 1, seq_len, d_head) for broadcasting."""
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)           # (S, d_head//2)
+        emb = torch.cat([freqs, freqs], dim=-1)         # (S, d_head)
+        return emb.cos()[None, None], emb.sin()[None, None]
+
+
+class RowAggregatorBlock(nn.Module):
+    """Stage 2 (TF_row) block: pre-norm transformer with RoPE on Q and K.
+
+    Uses manual Q/K/V projections so RoPE can be applied before the dot
+    product.  ``forward`` handles full self-attention; ``forward_cls_cross_attn``
+    handles the last-block CLS-only readout (q=CLS, k=v=all).
     """
 
     def __init__(
         self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.0
     ) -> None:
         super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.dropout_p = dropout
         self.norm1 = RMSNorm(d_model)
-        self.attn = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True
-        )
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.norm2 = RMSNorm(d_model)
         self.ffn = SwiGLUFFN(d_model, d_ff, dropout=dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Args:
-        x : (B_N, S, d_model) — flattened batch×instance token sequences.
+    def _qkv(
+        self, x_n: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project to (B_N, h, S, dh)."""
+        B_N, S, _ = x_n.shape
+        h, dh = self.n_heads, self.d_head
+        Q = self.q_proj(x_n).reshape(B_N, S, h, dh).transpose(1, 2)
+        K = self.k_proj(x_n).reshape(B_N, S, h, dh).transpose(1, 2)
+        V = self.v_proj(x_n).reshape(B_N, S, h, dh).transpose(1, 2)
+        return Q, K, V
+
+    def _attn(
+        self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor
+    ) -> torch.Tensor:
+        """Scaled dot-product attention → (B_N, h, Sq, dh)."""
+        scale = 1.0 / math.sqrt(self.d_head)
+        attn_w = (Q @ K.transpose(-2, -1)) * scale
+        attn_w = attn_w.softmax(dim=-1)
+        if self.training and self.dropout_p > 0.0:
+            attn_w = F.dropout(attn_w, p=self.dropout_p)
+        return attn_w @ V
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Full self-attention with RoPE.
+        x   : (B_N, S, d_model)
+        cos : (1, 1, S, d_head)
+        sin : (1, 1, S, d_head)
         """
+        B_N, S, d = x.shape
         x_n = self.norm1(x)
-        x = x + self.attn(x_n, x_n, x_n)[0]
+        Q, K, V = self._qkv(x_n)
+        Q = _apply_rope(Q, cos, sin)
+        K = _apply_rope(K, cos, sin)
+        attn_out = self._attn(Q, K, V).transpose(1, 2).reshape(B_N, S, d)
+        x = x + self.out_proj(attn_out)
         x = x + self.ffn(self.norm2(x))
         return x
+
+    def forward_cls_cross_attn(
+        self,
+        x: torch.Tensor,
+        n_cls: int,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Last-block CLS cross-attention: q=CLS, k=v=all.
+        x   : (B_N, S, d_model)
+        cos : (1, 1, S, d_head)
+        sin : (1, 1, S, d_head)
+        Returns: (B_N, n_cls, d_model)
+        """
+        B_N, S, d = x.shape
+        x_n = self.norm1(x)
+        Q, K, V = self._qkv(x_n)
+        Q_cls = _apply_rope(Q[:, :, :n_cls, :], cos[:, :, :n_cls, :], sin[:, :, :n_cls, :])
+        K = _apply_rope(K, cos, sin)
+        attn_out = self._attn(Q_cls, K, V).transpose(1, 2).reshape(B_N, n_cls, d)
+        cls_out = x[:, :n_cls, :] + self.out_proj(attn_out)
+        cls_out = cls_out + self.ffn(self.norm2(cls_out))
+        return cls_out
 
 
 class ICLBlock(nn.Module):
@@ -460,19 +563,33 @@ class ICLBlock(nn.Module):
 
     Operates on row embeddings (B, N, d_icl) where d_icl = n_cls * d_model.
     Test rows (n_support..N-1) are blocked as keys so they are never attended to.
-    The (N, N) attn_mask broadcasts over B automatically with batch_first=True.
+
+    Uses SSMax (Scalable Softmax, TabICLv2): the attention temperature is
+    scaled by a learnable per-head factor s times log(N), so the softmax
+    entropy does not collapse when the sequence length grows.
+    Effective scale = softplus(ssmax_log_s) * log(N) / sqrt(d_head).
     """
 
     def __init__(
         self, d_icl: int, n_heads: int, d_ff: int, dropout: float = 0.0
     ) -> None:
         super().__init__()
-        self.norm1 = RMSNorm(d_icl)
-        self.attn = nn.MultiheadAttention(
-            d_icl, n_heads, dropout=dropout, batch_first=True
-        )
+        self.n_heads = n_heads
+        self.d_head  = d_icl // n_heads
+        self.dropout = dropout
+
+        self.norm1   = RMSNorm(d_icl)
+        # Manual Q/K/V projections so we can intercept before softmax.
+        self.q_proj  = nn.Linear(d_icl, d_icl, bias=False)
+        self.k_proj  = nn.Linear(d_icl, d_icl, bias=False)
+        self.v_proj  = nn.Linear(d_icl, d_icl, bias=False)
+        self.out_proj = nn.Linear(d_icl, d_icl, bias=False)
+        # SSMax: one learnable log-scale per head.  softplus(0) ≈ 0.693, so the
+        # initial effective scale is ~0.693 * log(N) / sqrt(d_head).
+        self.ssmax_log_s = nn.Parameter(torch.zeros(n_heads))
+
         self.norm2 = RMSNorm(d_icl)
-        self.ffn = SwiGLUFFN(d_icl, d_ff, dropout=dropout)
+        self.ffn   = SwiGLUFFN(d_icl, d_ff, dropout=dropout)
 
     def forward(
         self,
@@ -486,22 +603,48 @@ class ICLBlock(nn.Module):
         return_attn_weights: if True, return (x, attn_weights) where
                              attn_weights is (B, N, N) averaged over heads.
         """
-        N = x.shape[1]
+        B, N, d = x.shape
+        h, dh = self.n_heads, self.d_head
+
+        # Build causal mask: query instances cannot be keys.
         mask = torch.zeros(N, N, dtype=x.dtype, device=x.device)
         if n_support < N:
             mask[:, n_support:] = float("-inf")
 
         x_n = self.norm1(x)
-        attn_out, attn_w = self.attn(
-            x_n, x_n, x_n,
-            attn_mask=mask,
-            need_weights=return_attn_weights,
-            average_attn_weights=True,
-        )
+
+        # Project and reshape to (B, h, N, dh)
+        def _proj(lin):
+            return lin(x_n).reshape(B, N, h, dh).transpose(1, 2)
+
+        Q = _proj(self.q_proj)   # (B, h, N, dh)
+        K = _proj(self.k_proj)
+        V = _proj(self.v_proj)
+
+        # SSMax scale: softplus(s) * log(N) replaces the standard 1/sqrt(dh).
+        # This increases the attention temperature with sequence length, preventing
+        # softmax collapse on long contexts.
+        s     = F.softplus(self.ssmax_log_s).view(1, h, 1, 1)  # (1, h, 1, 1)
+        scale = s * math.log(max(N, 1)) / math.sqrt(dh)        # (1, h, 1, 1)
+
+        # Attention logits with SSMax scale
+        attn_logits = (Q @ K.transpose(-2, -1)) * scale        # (B, h, N, N)
+        attn_logits = attn_logits + mask                        # broadcast (N,N)
+        attn_w_full = attn_logits.softmax(dim=-1)              # (B, h, N, N)
+
+        if self.training and self.dropout > 0.0:
+            attn_w_full = F.dropout(attn_w_full, p=self.dropout)
+
+        attn_out = attn_w_full @ V                              # (B, h, N, dh)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, d)
+        attn_out = self.out_proj(attn_out)
+
         x = x + attn_out
         x = x + self.ffn(self.norm2(x))
+
         if return_attn_weights:
-            return x, attn_w
+            # Average over heads for compatibility
+            return x, attn_w_full.mean(dim=1)
         return x
 
 
@@ -605,7 +748,10 @@ class CopulaTabICLv2(nn.Module):
         self.icl_gate_sup = nn.Parameter(torch.ones(d_icl))   # support injection, sigmoid(1)≈0.73
 
         # ---- Feature embedding -----------------------------------------------
-        self.phi_X = nn.Linear(1, d_model, bias=False)
+        # Group features in circular triplets (k, k+1, k+2) mod p_max — adapted from
+        # TabICLv2's col_feature_group="same" with group_size=3.  Each token already
+        # sees two neighbours before TF_col, providing local inductive bias.
+        self.phi_X = nn.Linear(3, d_model, bias=False)
 
         # ---- Stage 1: TF_col — per-column inducing-point blocks ---------------
         # Each block owns its own inducing_points; no shared state across blocks
@@ -618,11 +764,9 @@ class CopulaTabICLv2(nn.Module):
 
         # ---- Stage 2: TF_row — row-wise aggregation via CLS tokens ------------
         self.cls_tokens = nn.Parameter(torch.empty(n_cls, d_model))
-        # Per-slot position embeddings: break the shared-CLS symmetry so each
-        # of the n_cls+p_max token positions gets a distinct starting point.
-        # Without this, all row embeddings start identical after Stage 2 and
-        # Stage 3's Q·K dot products are uniformly zero.
-        self.row_pos_emb = nn.Parameter(torch.empty(n_cls + p_max, d_model))
+        # RoPE provides positional information for Stage 2 tokens (CLS at 0..n_cls-1,
+        # features at n_cls..n_cls+p_max-1), replacing the fixed row_pos_emb.
+        self.rope = RotaryEmbedding(d_model // n_heads)
         self.s2_blocks = nn.ModuleList(
             [
                 RowAggregatorBlock(d_model, n_heads, d_ff, dropout)
@@ -663,7 +807,6 @@ class CopulaTabICLv2(nn.Module):
 
     def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.cls_tokens, std=0.02)
-        nn.init.trunc_normal_(self.row_pos_emb, std=0.02)
         # Orthogonal init for dim_emb: each dimension gets a distinct direction.
         # Scale to match query_emb contribution through fc_V.fc1 so that the
         # per-dimension signal is competitive with the shared query signal.
@@ -755,7 +898,14 @@ class CopulaTabICLv2(nn.Module):
         else:
             X_in = X_all
 
-        E1 = self.phi_X(X_in.unsqueeze(-1)) * self.phi_x_scale  # (B, N, p_max, d_model)
+        # Circular triplet grouping: token k sees (x_k, x_{k+1}, x_{k+2}) mod p_max
+        _idx = torch.arange(self.p_max, device=X_in.device)
+        X_grouped = torch.stack([
+            X_in,
+            X_in[..., (_idx + 1) % self.p_max],
+            X_in[..., (_idx + 2) % self.p_max],
+        ], dim=-1)                                                   # (B, N, p_max, 3)
+        E1 = self.phi_X(X_grouped) * self.phi_x_scale               # (B, N, p_max, d_model)
 
         # Add target-aware embedding to all feature tokens of support rows
         E2 = E1.clone()
@@ -779,16 +929,26 @@ class CopulaTabICLv2(nn.Module):
         # ------------------------------------------------------------------
         cls_exp = self.cls_tokens.unsqueeze(0).unsqueeze(0).expand(B, N, -1, -1)
         row_tok = torch.cat([cls_exp, feat_emb], dim=2)  # (B, N, n_cls+p_max, D)
-        row_tok = row_tok + self.row_pos_emb  # break shared-CLS symmetry
         S = row_tok.shape[2]
         row_tok = row_tok.reshape(B * N, S, self.d_model)
 
-        for block in self.s2_blocks:
-            row_tok = block(row_tok)
+        # RoPE cos/sin for sequence length S = n_cls + p_max.
+        # CLS tokens at positions 0..n_cls-1, feature tokens at n_cls..S-1.
+        cos, sin = self.rope(S, row_tok.device)                 # (1,1,S,d_head)
 
-        row_tok = row_tok.reshape(B, N, S, self.d_model)
-        cls_out = self.s2_norm(row_tok[:, :, : self.n_cls, :])  # (B, N, n_cls, D)
-        row_emb = cls_out.reshape(B, N, self.d_icl)  # (B, N, d_icl)
+        # All blocks except the last: full self-attention with RoPE.
+        # Last block: q = CLS tokens only, k = v = full sequence — adapted from
+        # TabICLv2's RowInteraction.  RoPE is applied with matching position indices.
+        for block in self.s2_blocks[:-1]:
+            row_tok = block(row_tok, cos, sin)
+
+        cls_out_raw = self.s2_blocks[-1].forward_cls_cross_attn(
+            row_tok, self.n_cls, cos, sin
+        )                                                       # (B*N, n_cls, D)
+
+        cls_out_raw = cls_out_raw.reshape(B, N, self.n_cls, self.d_model)
+        cls_out = self.s2_norm(cls_out_raw)                     # (B, N, n_cls, D)
+        row_emb = cls_out.reshape(B, N, self.d_icl)            # (B, N, d_icl)
 
         # ------------------------------------------------------------------
         # 4. Stage 3: TF_icl — ICL over row embeddings
