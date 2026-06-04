@@ -220,6 +220,7 @@ def run_val_pit(
     do_plot: bool = False,
     amp_dtype: torch.dtype = torch.bfloat16,
     use_amp: bool = False,
+    n_think: int = 0,
 ) -> dict[str, float]:
     """Validate on held-out PIT episodes.  All NLL metrics are in copula-NLL units.
 
@@ -293,6 +294,13 @@ def run_val_pit(
             X_tr_qry = X_tr[:, perm_tr[n_sup:], :]
             Z_tr_qry = Z_tr[:, perm_tr[n_sup:], :]
             n_tr_qry = X_tr_qry.shape[1]
+
+            if n_think > 0:
+                think_X = torch.zeros(B, n_think, X_sup.shape[-1], device=device, dtype=X_sup.dtype)
+                think_Z = torch.zeros(B, n_think, Z_sup.shape[-1], device=device, dtype=Z_sup.dtype)
+                X_sup = torch.cat([think_X, X_sup], dim=1)
+                Z_sup = torch.cat([think_Z, Z_sup], dim=1)
+                n_sup = n_sup + n_think
 
             X_fwd = torch.cat([X_sup, X_tr_qry, X_te], dim=1)
             Z_fwd = torch.cat(
@@ -799,6 +807,14 @@ def main(cfg: DictConfig) -> None:
 
         B, N, d = Z_train.shape
 
+        n_think = int(cfg.training.get("n_think", 0))
+        if n_think > 0:
+            think_X = torch.zeros(B, n_think, X_train.shape[-1], device=device, dtype=X_train.dtype)
+            think_Z = torch.zeros(B, n_think, Z_train.shape[-1], device=device, dtype=Z_train.dtype)
+            X_train = torch.cat([think_X, X_train], dim=1)
+            Z_train = torch.cat([think_Z, Z_train], dim=1)
+            N += n_think
+
         # ---- Single forward: full X_train as support, X_test as queries ----
         X_fwd = torch.cat([X_train, X_test_ep], dim=1)  # (B, N+n_test, p)
         Z_fwd = torch.cat([Z_train, Z_test_ep], dim=1)  # (B, N+n_test, d)
@@ -933,6 +949,7 @@ def main(cfg: DictConfig) -> None:
                 do_plot=do_plot,
                 amp_dtype=amp_dtype,
                 use_amp=use_amp,
+                n_think=int(cfg.training.get("n_think", 0)),
             )
             model.train()
 
@@ -963,6 +980,7 @@ def main(cfg: DictConfig) -> None:
         device,
         amp_dtype=amp_dtype,
         use_amp=use_amp,
+        n_think=int(cfg.training.get("n_think", 0)),
     )
 
     if wandb_run is not None:
