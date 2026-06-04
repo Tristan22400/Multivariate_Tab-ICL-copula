@@ -734,17 +734,25 @@ class ZReadoutCrossAttn(nn.Module):
         self.ssmax_log_s = nn.Parameter(torch.zeros(n_heads))
         # Residual gate: sigmoid(-1)≈0.27 at init, opens gradually
         self.gate = nn.Parameter(torch.tensor(-1.0))
+        # X-similarity bias scale: softplus(0)≈0.693 gives a moderate initial
+        # contribution from cosine similarity so routing works from step 0,
+        # before the learned Q·K has converged.
+        self.xsim_logit_scale = nn.Parameter(torch.tensor(0.0))
 
     def forward(
         self,
         query_emb:     torch.Tensor,
         support_x_key: torch.Tensor,
         support_z_val: torch.Tensor,
+        x_sim_bias:    Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         query_emb     : (B, n_query, d_icl) — Stage-3 query output.
         support_x_key : (B, n_sup, d_icl)   — X-only routing keys (row_emb_route).
         support_z_val : (B, n_sup, d_icl)   — Z-correlation content (icl_emb).
+        x_sim_bias    : (B, n_query, n_sup) — optional cosine-similarity bias,
+                        added to attention logits so region routing works from
+                        step 0 without requiring the learned Q·K to converge first.
 
         Returns (B, n_query, d_icl) updated query embedding.
         """
@@ -764,8 +772,15 @@ class ZReadoutCrossAttn(nn.Module):
         s     = F.softplus(self.ssmax_log_s).view(1, h, 1, 1)
         scale = s * math.log(max(n_sup, 2)) / math.sqrt(dh)
 
-        attn_w = (Q @ K.transpose(-2, -1)) * scale         # (B, h, nq, ns)
-        attn_w = attn_w.softmax(dim=-1)
+        attn_logits = (Q @ K.transpose(-2, -1)) * scale    # (B, h, nq, ns)
+
+        # X-similarity inductive bias: region-routes queries to same-region
+        # support without requiring the learned Q·K to converge first.
+        if x_sim_bias is not None:
+            xs = F.softplus(self.xsim_logit_scale)          # scalar > 0
+            attn_logits = attn_logits + xs * x_sim_bias.unsqueeze(1)
+
+        attn_w = attn_logits.softmax(dim=-1)
 
         out = (attn_w @ V).transpose(1, 2).reshape(B, n_query, d)
         out = self.out_proj(out)
@@ -1138,10 +1153,13 @@ class CopulaTabICLv2(nn.Module):
 
         # Q = query Stage-3 output, K = X-only support routing keys,
         # V = raw Z-correlation embeddings (icl_emb, not Z-injected row_emb)
+        # x_sim_bias feeds cosine-similarity routing so the cross-attn produces
+        # per-instance outputs from step 0, before learned Q·K converges.
         query_emb = self.zread_xattn(
             query_emb,
             row_emb_route[:, :n_support],   # X-only K for region routing
             icl_emb,                         # Z-correlation V for content
+            x_sim_bias=x_sim_bias,           # direct X routing bias
         )
 
         # ------------------------------------------------------------------
