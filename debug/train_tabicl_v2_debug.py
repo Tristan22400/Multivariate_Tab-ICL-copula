@@ -77,7 +77,7 @@ def get_s3_attn_entropy(model, X_fwd, Z_fwd, n_support):
         orig_forwards.append(blk.forward)
         def _patch(idx, orig):
             def _f(x, ns, **kw):
-                out, w = orig(x, ns, return_attn_weights=True)
+                out, w = orig(x, ns, return_attn_weights=True, **kw)
                 captured[idx] = w.detach().cpu()
                 return out
             return _f
@@ -479,22 +479,18 @@ def main():
         # NLL loss on query Z values (copula training objective)
         loss_nll = woodbury_nll(Z_test, mu_Z, d_Z, V_Z)
 
-        # Auxiliary loss: MSE between predicted R and empirical correlation of Z_train.
-        # Forces the model to actively read correlation structure from support Z rather
-        # than converging to a constant-predictor local optimum.
+        # Per-instance auxiliary loss: MSE between predicted R and per-instance oracle correlation.
+        # Using oracle_D/oracle_V directly avoids the "mean over instances" that was training
+        # toward a constant predictor.
         with torch.no_grad():
-            Z_tc = Z_train - Z_train.mean(dim=1, keepdim=True)
-            cov_emp = (Z_tc.transpose(-2, -1) @ Z_tc) / max(N - 1, 1)
-            std_emp = cov_emp.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
-            R_emp   = cov_emp / (std_emp.unsqueeze(-1) * std_emp.unsqueeze(-2))
-            R_emp   = R_emp.clamp(-1 + 1e-6, 1 - 1e-6)
+            S_oracle = torch.diag_embed(oD) + oV @ oV.transpose(-2, -1)
+            std_o = S_oracle.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+            R_oracle = S_oracle / (std_o.unsqueeze(-1) * std_o.unsqueeze(-2))
+            R_oracle = R_oracle.clamp(-1 + 1e-6, 1 - 1e-6)
 
-        Sigma_train = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-2, -1)
-        ri_a, ci_a  = torch.triu_indices(d, d, offset=1, device=device)
-        # Average prediction over query instances; R_emp is constant per episode
-        R_pred_off  = Sigma_train[..., ri_a, ci_a].mean(dim=-2)  # (B, npairs)
-        R_emp_off   = R_emp[..., ri_a, ci_a]                     # (B, npairs)
-        loss_aux    = F.mse_loss(R_pred_off, R_emp_off)
+        Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-2, -1)
+        ri_a, ci_a = torch.triu_indices(d, d, offset=1, device=device)
+        loss_aux = F.mse_loss(Sigma_pred[..., ri_a, ci_a], R_oracle[..., ri_a, ci_a])
 
         LAMBDA_AUX  = 0.3
         loss        = loss_nll + LAMBDA_AUX * loss_aux
@@ -507,7 +503,7 @@ def main():
         if step % LOG_EVERY == 0:
             with torch.no_grad():
                 mse_val  = loss_nll.item() - indep_normal_nll(Z_test).item()  # copula NLL
-                div_val  = prediction_diversity(Sigma_train)
+                div_val  = prediction_diversity(Sigma_pred)
                 gate_val = torch.sigmoid(model.icl_gate_sup).mean().item()
             steps_log.append(step)
             mse_log.append(mse_val)

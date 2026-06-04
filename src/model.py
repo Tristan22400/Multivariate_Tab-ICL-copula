@@ -587,6 +587,9 @@ class ICLBlock(nn.Module):
         # SSMax: one learnable log-scale per head.  softplus(0) ≈ 0.693, so the
         # initial effective scale is ~0.693 * log(N) / sqrt(d_head).
         self.ssmax_log_s = nn.Parameter(torch.zeros(n_heads))
+        # X-similarity bias scale: softplus(-2) ≈ 0.127, starts small so the
+        # model first learns a reasonable Q·K similarity before relying on X routing.
+        self.x_sim_scale = nn.Parameter(torch.tensor(-2.0))
 
         self.norm2 = RMSNorm(d_icl)
         self.ffn   = SwiGLUFFN(d_icl, d_ff, dropout=dropout)
@@ -595,13 +598,23 @@ class ICLBlock(nn.Module):
         self,
         x: torch.Tensor,
         n_support: int,
+        x_sim_bias: Optional[torch.Tensor] = None,
         return_attn_weights: bool = False,
+        route_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Args:
         x                  : (B, N, d_icl).
         n_support          : number of support instances.
+        x_sim_bias         : (B, n_query, n_support) cosine similarity in X-space.
+                             Added as an additive bias to query→support logits,
+                             encouraging each query to attend same-region support.
         return_attn_weights: if True, return (x, attn_weights) where
                              attn_weights is (B, N, N) averaged over heads.
+        route_emb          : (B, N, d_icl) optional X-only row embedding used as K
+                             instead of x. When provided, K is projected from
+                             route_emb (pre-Z-injection) so that Q·K routing stays
+                             in X-space, avoiding the Q–K semantic mismatch caused
+                             by Z injection contaminating support keys.
         """
         B, N, d = x.shape
         h, dh = self.n_heads, self.d_head
@@ -618,7 +631,15 @@ class ICLBlock(nn.Module):
             return lin(x_n).reshape(B, N, h, dh).transpose(1, 2)
 
         Q = _proj(self.q_proj)   # (B, h, N, dh)
-        K = _proj(self.k_proj)
+
+        # K: use X-only route_emb when provided (pre-Z-injection Stage-2 row embedding)
+        # so that Q·K routing happens in X-space and is not contaminated by Z injection.
+        if route_emb is not None:
+            route_n = self.norm1(route_emb)  # reuse norm1 for route_emb
+            K = self.k_proj(route_n).reshape(B, N, h, dh).transpose(1, 2)
+        else:
+            K = _proj(self.k_proj)
+
         V = _proj(self.v_proj)
 
         # SSMax scale: softplus(s) * log(N) replaces the standard 1/sqrt(dh).
@@ -629,6 +650,19 @@ class ICLBlock(nn.Module):
 
         # Attention logits with SSMax scale
         attn_logits = (Q @ K.transpose(-2, -1)) * scale        # (B, h, N, N)
+
+        # X-similarity bias: encourage each query to attend same-region support.
+        # x_sim_bias is (B, n_query, n_support); we pad it to (B, 1, N, N) so
+        # it broadcasts over heads and leaves support-self and query-query logits
+        # unchanged (zero padding).
+        if x_sim_bias is not None and n_support < N:
+            xs = F.softplus(self.x_sim_scale)                  # scalar ≥ 0
+            # pad: right by N-n_support (q-to-q columns), top by n_support (sup rows)
+            attn_logits = attn_logits + F.pad(
+                xs * x_sim_bias.unsqueeze(1),                  # (B, 1, n_query, n_support)
+                (0, N - n_support, n_support, 0),
+            )
+
         attn_logits = attn_logits + mask                        # broadcast (N,N)
         attn_w_full = attn_logits.softmax(dim=-1)              # (B, h, N, N)
 
@@ -781,6 +815,16 @@ class CopulaTabICLv2(nn.Module):
         )
         self.s3_norm = RMSNorm(d_icl)
 
+        # ---- X-routing injection for Stage-3 ---------------------------------
+        # Additive bias on row embeddings before the S3 ICL loop.  Gives Stage-3
+        # Q·K attention a learnable X-based signal to route queries to same-region
+        # support instances.  Raw cosine similarity in p_max-dim X space captures
+        # only ~1/p fraction of the region signal; a learned projection finds the
+        # discriminating direction and amplifies it.
+        # Gate init -2.0 → sigmoid≈0.12: small at init, grows via gradient.
+        self.x_route_proj = nn.Linear(p_max, d_icl, bias=False)
+        self.x_route_gate = nn.Parameter(torch.tensor(0.0))   # was -2.0; sigmoid(0)=0.5 stronger X routing
+
         # ---- Per-dimension conditioning for readout --------------------------
         # Learnable embedding for each target dimension index, concatenated with
         # the row embedding before fc_V. This breaks the symmetry that forces all
@@ -836,6 +880,10 @@ class CopulaTabICLv2(nn.Module):
             std=1.0 / math.sqrt(self.fc_V.fc2.in_features * self.rank_max),
         )
         nn.init.zeros_(self.fc_V.fc2.bias)
+        # x_route_proj: small init so the routing signal starts negligible and
+        # grows as the gate opens.  std=0.02 keeps the initial row_emb perturbation
+        # well below the row_emb magnitude (~1 after s2_norm).
+        nn.init.normal_(self.x_route_proj.weight, std=0.02)
 
     def forward(
         self,
@@ -955,12 +1003,34 @@ class CopulaTabICLv2(nn.Module):
         # ------------------------------------------------------------------
         row_emb = row_emb.clone()
 
+        # Save X-only routing embedding BEFORE Z injection contaminates support rows.
+        # This is used as K in Stage-3 attention so Q·K routing happens in X-space.
+        row_emb_route = row_emb.clone()
+
         # Support rows: inject per-instance Z embedding (vector gate, no cancellation)
         gate_sup = torch.sigmoid(self.icl_gate_sup)  # (d_icl,)
         row_emb[:, :n_support, :] = row_emb[:, :n_support, :] + gate_sup * icl_emb
 
+        # X-cosine similarity: (B, n_query, n_support).
+        # Gives Stage-3 attention a region-routing inductive bias — same-region
+        # support instances are nearby in X space, so their cosine similarity with
+        # a query is higher than that of opposite-region support.
+        # F.normalize eps handles zero-X think tokens (X=0 → zero similarity).
+        X_sup_n = F.normalize(X_in[:, :n_support], p=2, dim=-1, eps=1e-8)
+        X_qry_n = F.normalize(X_in[:, n_support:], p=2, dim=-1, eps=1e-8)
+        x_sim_bias = X_qry_n @ X_sup_n.transpose(-2, -1)      # (B, n_query, n_support)
+
+        # Learned X routing: inject a projected X embedding into row_emb before
+        # Stage-3 so Q·K attention has a stronger, learnable region signal.
+        # Apply the same x_route signal to route_emb so routing keys also benefit
+        # from the learned X projection (but WITHOUT Z injection).
+        x_route = self.x_route_proj(X_in)                     # (B, N, d_icl)
+        x_route_g = torch.sigmoid(self.x_route_gate) * x_route
+        row_emb = row_emb + x_route_g
+        row_emb_route = row_emb_route + x_route_g             # also update routing key with X signal
+
         for block in self.s3_blocks:
-            row_emb = block(row_emb, n_support)
+            row_emb = block(row_emb, n_support, x_sim_bias=x_sim_bias, route_emb=row_emb_route)
 
         row_emb = self.s3_norm(row_emb)
 
