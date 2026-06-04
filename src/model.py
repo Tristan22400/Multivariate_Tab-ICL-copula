@@ -694,6 +694,88 @@ class _MLP2(nn.Module):
         return self.fc2(F.gelu(self.fc1(x)))
 
 
+class ZReadoutCrossAttn(nn.Module):
+    """Direct cross-attention that reads Z correlation from X-matched support.
+
+    Called once after Stage-3, before the readout head.  Creates a short,
+    clean gradient path:
+
+        loss → fc_V → query_emb → ZReadoutCrossAttn → icl_emb → embed_icl → Z data
+
+    This bypasses the deep Stage-3 path (4 ICL blocks × attn+FFN) so the
+    readout can learn per-instance Z patterns faster.
+
+    Q = query_emb (Stage-3 output, X + context)
+    K = row_emb_route[:, :n_sup] (X-only support keys, clean routing)
+    V = icl_emb  (raw support Z-correlation content, [Z, vech(Z⊗Z)] embedded)
+
+    The attention sharpness uses SSMax: scale = softplus(log_s) * log(n_sup)
+    so entropy does not collapse on large support sets.
+    """
+
+    def __init__(self, d_icl: int, n_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head  = d_icl // n_heads
+
+        self.norm_q   = RMSNorm(d_icl)
+        self.norm_k   = RMSNorm(d_icl)
+        self.norm_v   = RMSNorm(d_icl)
+        self.q_proj   = nn.Linear(d_icl, d_icl, bias=False)
+        self.k_proj   = nn.Linear(d_icl, d_icl, bias=False)
+        self.v_proj   = nn.Linear(d_icl, d_icl, bias=False)
+        self.out_proj = nn.Linear(d_icl, d_icl, bias=False)
+
+        d_ff = max(round(8 / 3 * d_icl / 64) * 64, 64)
+        self.norm2 = RMSNorm(d_icl)
+        self.ffn   = SwiGLUFFN(d_icl, d_ff, dropout)
+
+        # SSMax per-head temperature learnable log-scale
+        self.ssmax_log_s = nn.Parameter(torch.zeros(n_heads))
+        # Residual gate starts near 0 so the module activates gradually
+        self.gate = nn.Parameter(torch.tensor(-2.0))
+
+    def forward(
+        self,
+        query_emb:     torch.Tensor,
+        support_x_key: torch.Tensor,
+        support_z_val: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        query_emb     : (B, n_query, d_icl) — Stage-3 query output.
+        support_x_key : (B, n_sup, d_icl)   — X-only routing keys (row_emb_route).
+        support_z_val : (B, n_sup, d_icl)   — Z-correlation content (icl_emb).
+
+        Returns (B, n_query, d_icl) updated query embedding.
+        """
+        B, n_query, d = query_emb.shape
+        n_sup = support_x_key.shape[1]
+        h, dh = self.n_heads, self.d_head
+
+        Q = self.q_proj(self.norm_q(query_emb))
+        K = self.k_proj(self.norm_k(support_x_key))
+        V = self.v_proj(self.norm_v(support_z_val))
+
+        Q = Q.reshape(B, n_query, h, dh).transpose(1, 2)  # (B, h, nq, dh)
+        K = K.reshape(B, n_sup,   h, dh).transpose(1, 2)  # (B, h, ns, dh)
+        V = V.reshape(B, n_sup,   h, dh).transpose(1, 2)  # (B, h, ns, dh)
+
+        # SSMax: sharpen attention with sequence length
+        s     = F.softplus(self.ssmax_log_s).view(1, h, 1, 1)
+        scale = s * math.log(max(n_sup, 2)) / math.sqrt(dh)
+
+        attn_w = (Q @ K.transpose(-2, -1)) * scale         # (B, h, nq, ns)
+        attn_w = attn_w.softmax(dim=-1)
+
+        out = (attn_w @ V).transpose(1, 2).reshape(B, n_query, d)
+        out = self.out_proj(out)
+
+        # Pre-norm residual + FFN (standard transformer block)
+        x = query_emb + torch.sigmoid(self.gate) * out
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
 class CopulaTabICLv2(nn.Module):
     """CopulaTabICLv2 — 3-stage architecture adapted from TabICLv2 for copula modelling.
 
@@ -831,6 +913,13 @@ class CopulaTabICLv2(nn.Module):
         # d rows of U to be identical projections of the same row embedding.
         d_dim_emb = d_icl // 4  # 128 for default d_icl=512
         self.dim_emb = nn.Parameter(torch.empty(d_max, d_dim_emb))
+
+        # ---- Z-readout cross-attention (after Stage-3, before fc_V) ----------
+        # Provides a direct, short gradient path: loss → fc_V → query_emb →
+        # ZReadoutCrossAttn → icl_emb → embed_icl → Z data.  Queries attend to
+        # support using X-only routing keys (row_emb_route) to match their region,
+        # then aggregate Z-correlation content (icl_emb) from same-region support.
+        self.zread_xattn = ZReadoutCrossAttn(d_icl, n_heads, dropout)
 
         # ---- Readout head (2-layer MLP) --------------------------------------
         # Input: row embedding (d_icl) + dimension embedding (d_dim_emb)
@@ -1035,9 +1124,22 @@ class CopulaTabICLv2(nn.Module):
         row_emb = self.s3_norm(row_emb)
 
         # ------------------------------------------------------------------
-        # 5. Readout: per-dimension MLP on query row embeddings
+        # 5. Z-readout cross-attention: query reads Z correlation from
+        #    X-matched support (direct gradient path, complements Stage-3)
         # ------------------------------------------------------------------
         query_emb = row_emb[:, n_support:, :]  # (B, n_query, d_icl)
+
+        # Q = query Stage-3 output, K = X-only support routing keys,
+        # V = raw Z-correlation embeddings (icl_emb, not Z-injected row_emb)
+        query_emb = self.zread_xattn(
+            query_emb,
+            row_emb_route[:, :n_support],   # X-only K for region routing
+            icl_emb,                         # Z-correlation V for content
+        )
+
+        # ------------------------------------------------------------------
+        # 6. Readout: per-dimension MLP on query row embeddings
+        # ------------------------------------------------------------------
 
         # Tile row embedding over d_max dimensions, then concat per-dim embedding.
         # This breaks the symmetry: each dimension gets a distinct input to fc_V,
