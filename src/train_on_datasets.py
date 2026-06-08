@@ -886,7 +886,6 @@ def main() -> None:
     fig_grid = plot_corr_grid(
         estimators=estimators,
         oracle_R=R_oracle,
-        n_instances=3,
         title=f"Correlation estimator comparison — episode {args.episode_idx}",
     )
 
