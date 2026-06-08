@@ -40,6 +40,57 @@ from data_gen import GlobalAnchorCovGen, GlobalFixedNets, IsotropicModulatedKern
 from pit import load_tabicl, run_pit_batched
 
 # ---------------------------------------------------------------------------
+# Auto dataset name
+# ---------------------------------------------------------------------------
+
+
+def _auto_dataset_name(cfg) -> str:
+    """Build a human-readable dataset folder name from config parameters."""
+    data, ds = cfg.data, cfg.dataset
+    hyp_mm = bool(data.get("hyperplane_multimodal", False))
+    fixed   = bool(data.get("fixed_cov", False))
+
+    if hyp_mm:
+        mode = "hyp_mm"
+    elif fixed:
+        n_anch = int(data.get("fixed_cov_n_anchors", 4))
+        mode = f"fixed_cov{n_anch}"
+    else:
+        cov_type = str(data.get("cov_type", "mlp"))
+        if cov_type == "iso_kernel":
+            mode = f"iso_{data.get('iso_kernel_type', 'rbf')}"
+        elif cov_type == "kernel":
+            mode = f"kernel_{data.get('kernel_type', 'random')}"
+        elif cov_type == "anchor":
+            mode = f"anchor{data.get('num_anchors', 2)}"
+        else:
+            mode = "mlp"
+
+    def rng(lo, hi):
+        return str(lo) if lo == hi else f"{lo}-{hi}"
+
+    p_lo, p_hi   = int(data.p_range[0]),      int(data.p_range[1])
+    d_lo, d_hi   = int(data.d_range[0]),       int(data.d_range[1])
+    pt_lo, pt_hi = int(data.n_train_range[0]), int(data.n_train_range[1])
+    nt_lo, nt_hi = int(data.n_test_range[0]),  int(data.n_test_range[1])
+    r_data       = int(data.r_data)
+    B            = int(ds.batch_size)
+    k_folds      = ds.get("k_folds", None)
+
+    name = (
+        f"pit_{mode}"
+        f"_p{rng(p_lo, p_hi)}"
+        f"_d{rng(d_lo, d_hi)}"
+        f"_nt{rng(pt_lo, pt_hi)}"
+        f"_ntest{rng(nt_lo, nt_hi)}"
+        f"_r{r_data}_B{B}"
+    )
+    if k_folds:
+        name += f"_K{int(k_folds)}"
+    return name
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -53,7 +104,12 @@ def main(cfg: DictConfig) -> None:
     print(f"Device : {device}")
 
     # ---- Output directory ----
-    out_dir = cfg.dataset.output_dir
+    out_dir = cfg.dataset.get("output_dir", None)
+    if out_dir is None or str(out_dir).strip().lower() in ("null", "none", "auto", ""):
+        dataset_name = _auto_dataset_name(cfg)
+        out_dir = os.path.join("./data", dataset_name)
+        print(f"Auto-generated output dir : {out_dir}")
+        print(f"  → set training.dataset_dir={out_dir}  when training on this dataset")
     os.makedirs(out_dir, exist_ok=True)
     n_episodes = int(cfg.dataset.n_episodes)
     resume = bool(cfg.dataset.resume)
@@ -103,6 +159,8 @@ def main(cfg: DictConfig) -> None:
     hyperplane_multimodal_scale_hi = float(
         cfg.data.get("hyperplane_multimodal_scale_hi", 6.0)
     )
+    fixed_cov = bool(cfg.data.get("fixed_cov", False))
+    fixed_cov_n_anchors = int(cfg.data.get("fixed_cov_n_anchors", 4))
 
     # ---- Covariance generator (persistent across episodes for stability) ----
     fixed_nets: GlobalFixedNets | None = None
@@ -158,6 +216,8 @@ def main(cfg: DictConfig) -> None:
         "n_test_range": [nt_lo, nt_hi],
         "r_data": r_data,
         "hyperplane_multimodal": hyperplane_multimodal,
+        "fixed_cov": fixed_cov,
+        "fixed_cov_n_anchors": fixed_cov_n_anchors,
         "diag_alpha_range": [diag_alpha_lo, diag_alpha_hi],
     }
 
@@ -273,6 +333,8 @@ def main(cfg: DictConfig) -> None:
                 hyperplane_multimodal=hyperplane_multimodal,
                 hyperplane_multimodal_scale_lo=hyperplane_multimodal_scale_lo,
                 hyperplane_multimodal_scale_hi=hyperplane_multimodal_scale_hi,
+                fixed_cov=fixed_cov,
+                fixed_cov_n_anchors=fixed_cov_n_anchors,
             )
             t1 = time.perf_counter()
             prof["t_datagen"].append(t1 - t0)

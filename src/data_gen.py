@@ -626,6 +626,8 @@ def generate_episode(
     hyperplane_multimodal: bool = False,
     hyperplane_multimodal_scale_lo: float = 0.1,
     hyperplane_multimodal_scale_hi: float = 6.0,
+    fixed_cov: bool = False,
+    fixed_cov_n_anchors: int = 4,
 ) -> tuple:
     """Generate one training episode (one gradient step worth of data).
 
@@ -722,6 +724,28 @@ def generate_episode(
             V_x    = V_all[b_idx.unsqueeze(1), groups]       # (B, T, d, r)
             _r = r
             mu_x = torch.zeros(B, T, d, device=device)
+
+        elif fixed_cov:
+            # Fixed-per-dataset covariance: D_b and V_b are sampled once per
+            # dataset and held constant across all T instances (not x-dependent).
+            # Mean is piecewise-constant via Voronoi assignment over anchors.
+            # Broadcast diag_alpha correctly: scalar or (B, 1, 1) → (B, 1).
+            da = diag_alpha_t.view(B, 1) if diag_alpha_t.numel() == B else diag_alpha_t
+            D_b = F.softplus(torch.randn(B, d, device=device)) * da + 1e-6   # (B, d)
+            V_b = torch.randn(B, d, r, device=device) / math.sqrt(r)          # (B, d, r)
+            diag_x = D_b.unsqueeze(1).expand(B, T, d)     # (B, T, d)
+            V_x    = V_b.unsqueeze(1).expand(B, T, d, r)   # (B, T, d, r)
+            _r = r
+            if fixed_cov_n_anchors > 0:
+                n_anch  = fixed_cov_n_anchors
+                C       = F.normalize(torch.randn(B, n_anch, p, device=device), dim=-1)  # (B, K, p)
+                mu_anch = torch.randn(B, n_anch, d, device=device)                        # (B, K, d)
+                dots    = torch.einsum("btp,bkp->btk", X, C)                             # (B, T, K)
+                k_star  = dots.argmax(dim=-1)                                              # (B, T)
+                b_idx   = torch.arange(B, device=device)
+                mu_x    = mu_anch[b_idx.unsqueeze(1), k_star]                            # (B, T, d)
+            else:
+                mu_x = torch.zeros(B, T, d, device=device)
 
         elif kernel_cov_gen is not None:
             # Kernel-based: full x-dependent distribution.
