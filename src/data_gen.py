@@ -626,6 +626,8 @@ def generate_episode(
     hyperplane_multimodal: bool = False,
     hyperplane_multimodal_scale_lo: float = 0.1,
     hyperplane_multimodal_scale_hi: float = 6.0,
+    hyperplane_multimodal_n_groups: int | None = None,
+    hyperplane_multimodal_use_mean: bool = False,
     fixed_cov: bool = False,
     fixed_cov_n_anchors: int = 4,
 ) -> tuple:
@@ -685,12 +687,13 @@ def generate_episode(
 
     with torch.no_grad():
         if hyperplane_multimodal:
-            # K-group multimodal covariance: K ~ Uniform{2,...,6}.
-            # A pool of 6 log-spaced scales between scale_lo and scale_hi is built;
-            # K evenly-spread scales are selected so the extremes are always included.
-            # Each instance is assigned to the group whose random hyperplane normal
-            # it projects onto most strongly (argmax over K projections).
-            K = int(torch.randint(2, 7, (1,)).item())  # K in {2, 3, 4, 5, 6}
+            # K-group multimodal covariance.
+            # K is fixed when hyperplane_multimodal_n_groups is set, otherwise random in {2..6}.
+            K = (
+                int(hyperplane_multimodal_n_groups)
+                if hyperplane_multimodal_n_groups is not None
+                else int(torch.randint(2, 7, (1,)).item())
+            )
 
             # 6-value log-spaced pool — endpoints controlled by scale_lo/scale_hi
             scale_pool = torch.logspace(
@@ -723,7 +726,13 @@ def generate_episode(
             diag_x = D_all[b_idx.unsqueeze(1), groups]       # (B, T, d)
             V_x    = V_all[b_idx.unsqueeze(1), groups]       # (B, T, d, r)
             _r = r
-            mu_x = torch.zeros(B, T, d, device=device)
+
+            if hyperplane_multimodal_use_mean:
+                # Piecewise-constant mean: each group k gets its own random mean vector.
+                mu_all = torch.randn(B, K, d, device=device)  # (B, K, d)
+                mu_x = mu_all[b_idx.unsqueeze(1), groups]     # (B, T, d)
+            else:
+                mu_x = torch.zeros(B, T, d, device=device)
 
         elif fixed_cov:
             # Fixed-per-dataset covariance: D_b and V_b are sampled once per
@@ -822,6 +831,9 @@ def generate_episode(
             "mu": mu_oracle[:, n_train:].detach(),
             "D": D_oracle[:, n_train:].detach(),
             "V": V_oracle[:, n_train:].detach(),
+            "mu_train": mu_oracle[:, :n_train].detach(),
+            "D_train": D_oracle[:, :n_train].detach(),
+            "V_train": V_oracle[:, :n_train].detach(),
         }
         if return_norm_stats:
             oracle["mu_y"] = mu_y.detach()  # (B, 1, d) in raw Y space (pre-norm)

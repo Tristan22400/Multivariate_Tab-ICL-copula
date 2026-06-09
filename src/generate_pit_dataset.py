@@ -159,6 +159,9 @@ def main(cfg: DictConfig) -> None:
     hyperplane_multimodal_scale_hi = float(
         cfg.data.get("hyperplane_multimodal_scale_hi", 6.0)
     )
+    _n_groups_cfg = cfg.data.get("hyperplane_multimodal_n_groups", None)
+    hyperplane_multimodal_n_groups = int(_n_groups_cfg) if _n_groups_cfg is not None else None
+    hyperplane_multimodal_use_mean = bool(cfg.data.get("hyperplane_multimodal_use_mean", False))
     fixed_cov = bool(cfg.data.get("fixed_cov", False))
     fixed_cov_n_anchors = int(cfg.data.get("fixed_cov_n_anchors", 4))
 
@@ -333,6 +336,8 @@ def main(cfg: DictConfig) -> None:
                 hyperplane_multimodal=hyperplane_multimodal,
                 hyperplane_multimodal_scale_lo=hyperplane_multimodal_scale_lo,
                 hyperplane_multimodal_scale_hi=hyperplane_multimodal_scale_hi,
+                hyperplane_multimodal_n_groups=hyperplane_multimodal_n_groups,
+                hyperplane_multimodal_use_mean=hyperplane_multimodal_use_mean,
                 fixed_cov=fixed_cov,
                 fixed_cov_n_anchors=fixed_cov_n_anchors,
             )
@@ -398,6 +403,9 @@ def main(cfg: DictConfig) -> None:
                             "oracle_mu": oracle["mu"][sl].cpu(),
                             "oracle_D": oracle["D"][sl].cpu(),
                             "oracle_V": oracle["V"][sl].cpu(),
+                            "oracle_mu_train": oracle["mu_train"][sl].cpu(),
+                            "oracle_D_train": oracle["D_train"][sl].cpu(),
+                            "oracle_V_train": oracle["V_train"][sl].cpu(),
                             "p": p,
                             "d": d,
                             "n_train": n_train,

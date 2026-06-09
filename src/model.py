@@ -694,103 +694,6 @@ class _MLP2(nn.Module):
         return self.fc2(F.gelu(self.fc1(x)))
 
 
-class ZReadoutCrossAttn(nn.Module):
-    """Direct cross-attention that reads Z correlation from X-matched support.
-
-    Called once after Stage-3, before the readout head.  Creates a short,
-    clean gradient path:
-
-        loss → fc_V → query_emb → ZReadoutCrossAttn → icl_emb → embed_icl → Z data
-
-    This bypasses the deep Stage-3 path (4 ICL blocks × attn+FFN) so the
-    readout can learn per-instance Z patterns faster.
-
-    Q = query_emb (Stage-3 output, X + context)
-    K = row_emb_route[:, :n_sup] (X-only support keys, clean routing)
-    V = icl_emb  (raw support Z-correlation content, [Z, vech(Z⊗Z)] embedded)
-
-    The attention sharpness uses SSMax: scale = softplus(log_s) * log(n_sup)
-    so entropy does not collapse on large support sets.
-    """
-
-    def __init__(self, d_icl: int, n_heads: int, dropout: float = 0.0) -> None:
-        super().__init__()
-        self.n_heads = n_heads
-        self.d_head  = d_icl // n_heads
-
-        self.norm_q   = RMSNorm(d_icl)
-        self.norm_k   = RMSNorm(d_icl)
-        self.norm_v   = RMSNorm(d_icl)
-        self.q_proj   = nn.Linear(d_icl, d_icl, bias=False)
-        self.k_proj   = nn.Linear(d_icl, d_icl, bias=False)
-        self.v_proj   = nn.Linear(d_icl, d_icl, bias=False)
-        self.out_proj = nn.Linear(d_icl, d_icl, bias=False)
-
-        d_ff = max(round(8 / 3 * d_icl / 64) * 64, 64)
-        self.norm2 = RMSNorm(d_icl)
-        self.ffn   = SwiGLUFFN(d_icl, d_ff, dropout)
-
-        # SSMax per-head temperature learnable log-scale
-        self.ssmax_log_s = nn.Parameter(torch.zeros(n_heads))
-        # Residual gate: sigmoid(-1)≈0.27 at init, opens gradually
-        self.gate = nn.Parameter(torch.tensor(-1.0))
-        # X-similarity bias scale: softplus(0)≈0.693 gives a moderate initial
-        # contribution from cosine similarity so routing works from step 0,
-        # before the learned Q·K has converged.
-        self.xsim_logit_scale = nn.Parameter(torch.tensor(0.0))
-
-    def forward(
-        self,
-        query_emb:     torch.Tensor,
-        support_x_key: torch.Tensor,
-        support_z_val: torch.Tensor,
-        x_sim_bias:    Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        query_emb     : (B, n_query, d_icl) — Stage-3 query output.
-        support_x_key : (B, n_sup, d_icl)   — X-only routing keys (row_emb_route).
-        support_z_val : (B, n_sup, d_icl)   — Z-correlation content (icl_emb).
-        x_sim_bias    : (B, n_query, n_sup) — optional cosine-similarity bias,
-                        added to attention logits so region routing works from
-                        step 0 without requiring the learned Q·K to converge first.
-
-        Returns (B, n_query, d_icl) updated query embedding.
-        """
-        B, n_query, d = query_emb.shape
-        n_sup = support_x_key.shape[1]
-        h, dh = self.n_heads, self.d_head
-
-        Q = self.q_proj(self.norm_q(query_emb))
-        K = self.k_proj(self.norm_k(support_x_key))
-        V = self.v_proj(self.norm_v(support_z_val))
-
-        Q = Q.reshape(B, n_query, h, dh).transpose(1, 2)  # (B, h, nq, dh)
-        K = K.reshape(B, n_sup,   h, dh).transpose(1, 2)  # (B, h, ns, dh)
-        V = V.reshape(B, n_sup,   h, dh).transpose(1, 2)  # (B, h, ns, dh)
-
-        # SSMax: sharpen attention with sequence length
-        s     = F.softplus(self.ssmax_log_s).view(1, h, 1, 1)
-        scale = s * math.log(max(n_sup, 2)) / math.sqrt(dh)
-
-        attn_logits = (Q @ K.transpose(-2, -1)) * scale    # (B, h, nq, ns)
-
-        # X-similarity inductive bias: region-routes queries to same-region
-        # support without requiring the learned Q·K to converge first.
-        if x_sim_bias is not None:
-            xs = F.softplus(self.xsim_logit_scale)          # scalar > 0
-            attn_logits = attn_logits + xs * x_sim_bias.unsqueeze(1)
-
-        attn_w = attn_logits.softmax(dim=-1)
-
-        out = (attn_w @ V).transpose(1, 2).reshape(B, n_query, d)
-        out = self.out_proj(out)
-
-        # Pre-norm residual + FFN (standard transformer block)
-        x = query_emb + torch.sigmoid(self.gate) * out
-        x = x + self.ffn(self.norm2(x))
-        return x
-
-
 class CopulaTabICLv2(nn.Module):
     """CopulaTabICLv2 — 3-stage architecture adapted from TabICLv2 for copula modelling.
 
@@ -876,7 +779,9 @@ class CopulaTabICLv2(nn.Module):
         # signs cancel across dimensions, leaving near-zero grad → gate never
         # opens, embed_icl never trains.  A vector gate avoids this: each
         # element's gradient sums over B × N_sup only, no cross-dim cancellation.
-        self.icl_gate_sup = nn.Parameter(torch.ones(d_icl))   # support injection, sigmoid(1)≈0.73
+        # Init at 0 → sigmoid(0)=0.5: gentler ramp than ones (sigmoid≈0.73) so
+        # feature representations mature before Z injection dominates.
+        self.icl_gate_sup = nn.Parameter(torch.zeros(d_icl))  # support injection, sigmoid(0)=0.5
 
         # ---- Feature embedding -----------------------------------------------
         # Group features in circular triplets (k, k+1, k+2) mod p_max — adapted from
@@ -928,13 +833,6 @@ class CopulaTabICLv2(nn.Module):
         # d rows of U to be identical projections of the same row embedding.
         d_dim_emb = d_icl // 4  # 128 for default d_icl=512
         self.dim_emb = nn.Parameter(torch.empty(d_max, d_dim_emb))
-
-        # ---- Z-readout cross-attention (after Stage-3, before fc_V) ----------
-        # Provides a direct, short gradient path: loss → fc_V → query_emb →
-        # ZReadoutCrossAttn → icl_emb → embed_icl → Z data.  Queries attend to
-        # support using X-only routing keys (row_emb_route) to match their region,
-        # then aggregate Z-correlation content (icl_emb) from same-region support.
-        self.zread_xattn = ZReadoutCrossAttn(d_icl, n_heads, dropout)
 
         # ---- Readout head (2-layer MLP) --------------------------------------
         # Input: row embedding (d_icl) + dimension embedding (d_dim_emb)
@@ -988,13 +886,6 @@ class CopulaTabICLv2(nn.Module):
         # grows as the gate opens.  std=0.02 keeps the initial row_emb perturbation
         # well below the row_emb magnitude (~1 after s2_norm).
         nn.init.normal_(self.x_route_proj.weight, std=0.02)
-        # ZReadoutCrossAttn: calibrate so V (icl_emb → v_proj → out_proj) has
-        # magnitude ~0.1 at init, matching embed_icl output scale.  With
-        # gate=sigmoid(-1)≈0.27 the module contributes ~2% of query_emb at init.
-        nn.init.normal_(self.zread_xattn.q_proj.weight, std=0.1)
-        nn.init.normal_(self.zread_xattn.k_proj.weight, std=0.1)
-        nn.init.normal_(self.zread_xattn.v_proj.weight, std=0.1)
-        nn.init.normal_(self.zread_xattn.out_proj.weight, std=0.02)
 
     def forward(
         self,
@@ -1145,25 +1036,10 @@ class CopulaTabICLv2(nn.Module):
 
         row_emb = self.s3_norm(row_emb)
 
-        # ------------------------------------------------------------------
-        # 5. Z-readout cross-attention: query reads Z correlation from
-        #    X-matched support (direct gradient path, complements Stage-3)
-        # ------------------------------------------------------------------
         query_emb = row_emb[:, n_support:, :]  # (B, n_query, d_icl)
 
-        # Q = query Stage-3 output, K = X-only support routing keys,
-        # V = raw Z-correlation embeddings (icl_emb, not Z-injected row_emb)
-        # x_sim_bias feeds cosine-similarity routing so the cross-attn produces
-        # per-instance outputs from step 0, before learned Q·K converges.
-        query_emb = self.zread_xattn(
-            query_emb,
-            row_emb_route[:, :n_support],   # X-only K for region routing
-            icl_emb,                         # Z-correlation V for content
-            x_sim_bias=x_sim_bias,           # direct X routing bias
-        )
-
         # ------------------------------------------------------------------
-        # 6. Readout: per-dimension MLP on query row embeddings
+        # 5. Readout: per-dimension MLP on query row embeddings
         # ------------------------------------------------------------------
 
         # Tile row embedding over d_max dimensions, then concat per-dim embedding.
@@ -1262,8 +1138,9 @@ def build_copula_tabicl_v2(cfg) -> CopulaTabICLv2:
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    _mname = getattr(mcfg, "name", "copula_tabicl_v2")
     print(
-        f"[CopulaTabICLv2] d_model={mcfg.d_model}  d_icl={model.d_icl}  "
+        f"[{_mname}] d_model={mcfg.d_model}  d_icl={model.d_icl}  "
         f"n_heads={mcfg.n_heads}  "
         f"s1={mcfg.n_layers_s1}/s2={mcfg.n_layers_s2}/s3={mcfg.n_layers_s3}  "
         f"n_inducing={mcfg.n_inducing}  n_cls={mcfg.n_cls}  "
@@ -1274,5 +1151,97 @@ def build_copula_tabicl_v2(cfg) -> CopulaTabICLv2:
     return model
 
 
-# Backward-compat alias: old train_on_datasets.py imports this name for ICLCorrNetV2
-build_copula_transformer = build_icl_corr_net_v2
+# ---------------------------------------------------------------------------
+# CopulaTabICL adapter — wraps CopulaTabICL to match (X_all, Z_all, n_support) interface
+# ---------------------------------------------------------------------------
+
+
+class _CopulaTabICLWrapper(nn.Module):
+    """Wraps CopulaTabICL so it matches the (mu_Z, d_Z, V_Z) interface used by train.py.
+
+    CopulaTabICL.forward(X, Z_train) → (W_tilde, D_tilde)
+    This wrapper adapts the call to (X_all, Z_all, n_support) → (mu_Z, d_Z, V_Z).
+    """
+
+    def __init__(self, inner) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def forward(
+        self,
+        X_all: torch.Tensor,
+        Z_all: torch.Tensor,
+        n_support: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, N, _ = X_all.shape
+        d = Z_all.shape[-1]
+        n_query = N - n_support
+        Z_train = Z_all[:, :n_support]
+        W_tilde, D_tilde = self.inner(X_all, Z_train)
+        mu_Z = torch.zeros(B, n_query, d, device=X_all.device, dtype=X_all.dtype)
+        return mu_Z, D_tilde, W_tilde
+
+
+def build_copula_tabicl(cfg) -> _CopulaTabICLWrapper:
+    """Instantiate a CopulaTabICL from a Hydra DictConfig, wrapped for train.py.
+
+    Expected config keys under ``cfg.model``:
+      d, k, embed_dim, col_num_blocks, col_nhead, col_num_inds,
+      row_num_blocks, row_nhead, row_num_cls, icl_num_blocks, icl_nhead,
+      dropout (optional), pre_icl_aux (optional).
+    """
+    from copula_tabicl import CopulaTabICL  # imported lazily to avoid TabICL overhead
+
+    mcfg = cfg.model
+    tabicl_kwargs = dict(
+        embed_dim=int(mcfg.embed_dim),
+        col_num_blocks=int(mcfg.col_num_blocks),
+        col_nhead=int(mcfg.col_nhead),
+        col_num_inds=int(mcfg.col_num_inds),
+        row_num_blocks=int(mcfg.row_num_blocks),
+        row_nhead=int(mcfg.row_nhead),
+        row_num_cls=int(mcfg.row_num_cls),
+        icl_num_blocks=int(mcfg.icl_num_blocks),
+        icl_nhead=int(mcfg.icl_nhead),
+        dropout=float(getattr(mcfg, "dropout", 0.0)),
+    )
+    pre_icl_aux = bool(getattr(mcfg, "pre_icl_aux", False))
+
+    inner = CopulaTabICL(
+        d=int(mcfg.d),
+        k=int(mcfg.k),
+        pre_icl_aux=pre_icl_aux,
+        **tabicl_kwargs,
+    )
+
+    model = _CopulaTabICLWrapper(inner)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    d_icl = int(mcfg.embed_dim) * int(mcfg.row_num_cls)
+    print(
+        f"[copula_tabicl]  d={mcfg.d}  k={mcfg.k}  embed_dim={mcfg.embed_dim}  "
+        f"d_icl={d_icl}  col_blocks={mcfg.col_num_blocks}  "
+        f"row_blocks={mcfg.row_num_blocks}  icl_blocks={mcfg.icl_num_blocks}  "
+        f"|  params={n_params:,}"
+    )
+    return model
+
+
+_BUILD_DISPATCH = {
+    "icl_corr_net_v2":    build_icl_corr_net_v2,
+    "copula_tabicl_v2":   build_copula_tabicl_v2,
+    "copula_tabicl":      build_copula_tabicl,
+}
+
+
+def build_copula_transformer(cfg):
+    """Dispatch to the correct builder based on cfg.model.name.
+
+    Falls back to build_icl_corr_net_v2 when name is absent (legacy checkpoints).
+    """
+    name = getattr(cfg.model, "name", "icl_corr_net_v2")
+    builder = _BUILD_DISPATCH.get(name)
+    if builder is None:
+        raise ValueError(
+            f"Unknown model name {name!r}. Known: {list(_BUILD_DISPATCH)}"
+        )
+    return builder(cfg)

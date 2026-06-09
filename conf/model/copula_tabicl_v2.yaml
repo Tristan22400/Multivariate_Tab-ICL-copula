@@ -1,5 +1,5 @@
 name: copula_tabicl_v2
-d_model: 16
+d_model: 32
 n_heads: 4
 n_layers_s1: 2
 n_layers_s2: 2

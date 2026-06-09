@@ -67,3 +67,7 @@ hyperplane_multimodal: true
 hyperplane_multimodal_scale_lo: 0.1
 # V scale for group 2 (strong correlations, highly structured)
 hyperplane_multimodal_scale_hi: 6.0
+# Fix number of groups (null = random in {2..6})
+hyperplane_multimodal_n_groups: null
+# Add a per-group piecewise-constant mean (false = zero mean)
+hyperplane_multimodal_use_mean: false

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import os
 import random
 import sys
@@ -36,6 +37,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
+from loss import woodbury_nll
 from model import build_copula_tabicl_v2, build_copula_transformer
 from viz import plot_corr_grid, plot_prediction_comparison
 
@@ -512,6 +514,7 @@ def main() -> None:
     X_test = ep["X_test"][0].to(device)  # (n_te, p)
     Z_test = ep["Z_test"][0].to(device)  # (n_te, d)
     log_p_test = ep["log_p_test"][0].to(device)
+    Y_test = ep["Y_test"][0].to(device)
     oracle_mu = ep["oracle_mu"][0].to(device)
     oracle_D = ep["oracle_D"][0].to(device)
     oracle_V = ep["oracle_V"][0].to(device)
@@ -746,15 +749,69 @@ def main() -> None:
     R_ct = _woodbury_to_corr(d_ct, V_ct)  # (n_te, d, d)
     R_oracle = _woodbury_to_corr(oracle_D, oracle_V)  # (n_te, d, d)
 
-    # Oracle and CT copula NLL — both use copula_nll_full(Z, R) so they are on
-    # the same scale as all other estimators.  The old formula
-    # (woodbury_nll - indep_z) is only equivalent when diag(D) + ||V||² == 1
-    # element-wise, which holds for the CT output (Woodbury reparameterisation)
-    # but NOT for the oracle whose D/V come from the raw data generator.
+    # Note on "oracle" semantics in this script:
+    #   * pseudo_oracle_corrY_copula_nll = copula_nll_full(Z_test, corr(Σ_Y)) is *not* a hard
+    #     lower bound. Z_test was produced by PIT with TabICL's *estimated* marginals,
+    #     so Z_test is not exactly N(0, corr(Σ_Y)); an in-context model can legitimately
+    #     beat this number by undoing TabICL's marginal distortion or by conditioning
+    #     on x*. We keep it as a reference under the "corr(Σ_Y)" Gaussian-copula model.
+    #   * The only true lower bound on joint Y-NLL is woodbury_nll(Y_test, μ_Y, D_Y, V_Y),
+    #     the negative log of the data-generating density. That is `nll_oracle_y` below.
     nll_ct_z = copula_nll_full(Z_test, R_ct).item()
-    nll_oracle_z = copula_nll_full(Z_test, R_oracle).item()
+    nll_pseudo_oracle_corrY_z = copula_nll_full(Z_test, R_oracle).item()
     marginal_nll_te = -log_p_test.sum(dim=-1).mean().item()
     nll_ct_y = nll_ct_z + marginal_nll_te
+
+    # True Y-space oracle (lower bound on joint-Y NLL). Computed directly from the
+    # data-generating Gaussian on Y_test — bypasses PIT, so TabICL's marginal
+    # estimation error does not enter.
+    nll_oracle_y = woodbury_nll(
+        Y_test.unsqueeze(0),
+        oracle_mu.unsqueeze(0),
+        oracle_D.unsqueeze(0),
+        oracle_V.unsqueeze(0),
+    ).item()
+
+    # ====================================================================
+    # Three-way error decomposition
+    # ====================================================================
+    # Total excess = A (marginal error) + B (pure copula error) + C (bleed)
+    #
+    #   A = marginal_nll_te - marginal_nll_oracle
+    #         → how well TabICL estimates the marginal densities
+    #
+    #   B = copula_nll(R_ct, Z_true) - copula_nll(R_oracle, Z_true)  ≥ 0
+    #         → pure copula error; KL(N(0,R_oracle) || N(0,R_ct)) in expectation
+    #         → zero only when CT predicts R_oracle exactly
+    #
+    #   C = copula_nll(R_ct, Z_hat) - copula_nll(R_ct, Z_true)
+    #         → how much TabICL's marginal distortion inflates the copula NLL
+    #         → ≈ 0 when marginal estimation is accurate
+    #
+    # Z_true  — PIT with oracle (true) marginals: z*_j = (y_j - mu_j) / sigma_j
+    # Z_hat   — current Z_test: PIT with TabICL's estimated marginals
+    #
+    # Sanity: A + B + C = (nll_ct_z + marginal_nll_te) - (nll_oracle_copula + marginal_nll_oracle)
+    #                   = ct_joint_nll_y - (oracle_copula_floor + oracle_marginal_floor)
+
+    # Oracle marginal std:  sigma_j^2 = D_j + ||V_j||^2
+    sigma2_ora = oracle_D + oracle_V.pow(2).sum(-1)       # (n_te, d)
+    sigma_ora  = sigma2_ora.clamp(min=1e-8).sqrt()
+
+    Z_true = (Y_test - oracle_mu) / sigma_ora             # (n_te, d)
+
+    marginal_nll_oracle = 0.5 * (
+        math.log(2.0 * math.pi)
+        + sigma2_ora.log()
+        + (Y_test - oracle_mu).pow(2) / sigma2_ora
+    ).sum(-1).mean().item()
+
+    nll_oracle_copula_truez = copula_nll_full(Z_true, R_oracle).item()  # floor
+    nll_ct_truez            = copula_nll_full(Z_true, R_ct).item()
+
+    err_A_marginal     = marginal_nll_te    - marginal_nll_oracle   # TabICL marginal error
+    err_B_copula_pure  = nll_ct_truez       - nll_oracle_copula_truez  # KL(R_oracle||R_ct) ≥ 0
+    err_C_bleed        = nll_ct_z           - nll_ct_truez           # marginal→copula bleed
 
     # ====================================================================
     # Phase 4 — Log final metrics
@@ -771,7 +828,8 @@ def main() -> None:
         "eval/nw_laplace_copula_nll": nw_nll["laplace"],
         "eval/attn_copula_nll": attn_nll,
         "eval/ct_copula_nll": nll_ct_z,
-        "eval/oracle_copula_nll": nll_oracle_z,
+        # corr(Σ_Y) Gaussian copula on PIT-Z — NOT a hard lower bound (see note above).
+        "eval/pseudo_oracle_corrY_copula_nll": nll_pseudo_oracle_corrY_z,
         # ---- Joint NLL (y-space) = copula_nll + marginal_nll_te ------------
         "eval/moment_joint_nll_y": moment_nll + marginal_nll_te,
         "eval/shrunk_moment_joint_nll_y": shrunk_nll + marginal_nll_te,
@@ -780,9 +838,25 @@ def main() -> None:
         "eval/nw_laplace_joint_nll_y": nw_nll["laplace"] + marginal_nll_te,
         "eval/attn_joint_nll_y": attn_nll + marginal_nll_te,
         "eval/ct_joint_nll_y": nll_ct_y,
-        "eval/oracle_joint_nll_y": nll_oracle_z + marginal_nll_te,
+        # Sklar route: biased by TabICL's marginal density (log_p_test) — not tight.
+        "eval/pseudo_oracle_corrY_joint_nll_y": nll_pseudo_oracle_corrY_z + marginal_nll_te,
+        # True Y-space oracle: hard lower bound on any joint-Y NLL.
+        "eval/oracle_joint_nll_y": nll_oracle_y,
         # ---- Shared marginal term (same for all copula methods) -------------
         "eval/marginal_nll_te": marginal_nll_te,
+        # ---- Three-way error decomposition ----------------------------------
+        # CT copula NLL evaluated on oracle-PIT Z_true (removes marginal distortion)
+        "eval/ct_copula_nll_truez":       nll_ct_truez,
+        # Oracle copula floor on Z_true  (= 0.5*log|R_oracle| in expectation)
+        "eval/oracle_copula_nll_truez":   nll_oracle_copula_truez,
+        # True oracle marginal NLL (lower bound on marginal term)
+        "eval/marginal_nll_oracle":       marginal_nll_oracle,
+        # A: TabICL marginal estimation error (independent of copula model)
+        "eval/err_A_marginal":            err_A_marginal,
+        # B: pure CT copula error = KL(N(0,R_oracle)||N(0,R_ct)) in expectation  (≥ 0)
+        "eval/err_B_copula_pure":         err_B_copula_pure,
+        # C: how much TabICL's marginal distortion inflates the copula NLL
+        "eval/err_C_marginal_bleed":      err_C_bleed,
         # ---- Diagnostics ----------------------------------------------------
         "eval/attn_R_cond_num_mean": cond_nums.mean().item(),
         "eval/attn_gamma_final": gamma_f,

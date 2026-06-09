@@ -57,7 +57,7 @@ from sklearn.covariance import OAS
 
 from dataset import infinite_episode_iter, make_episode_loader, split_episode_files
 from loss import indep_normal_nll, woodbury_nll
-from model import build_copula_tabicl_v2, build_icl_corr_net_v2
+from model import build_copula_tabicl, build_copula_tabicl_v2, build_icl_corr_net_v2
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -129,80 +129,76 @@ def _energy_score_batched(
 # ---------------------------------------------------------------------------
 
 
+_MAX_PLOT_INSTANCES = 16
+
+
 def _corr_all_instances_fig(
-    d_pred: torch.Tensor,   # (B, n_test, d)
-    V_pred: torch.Tensor,   # (B, n_test, d, r)
-    oracle_D: torch.Tensor, # (B, n_test, d)
-    oracle_V: torch.Tensor, # (B, n_test, d, r)
-    batch_idx: int = 0,
+    R_pred_np: np.ndarray,  # (n_plot, d, d) — pre-computed, already sliced
+    R_ora_np: np.ndarray,   # (n_plot, d, d)
     label: str = "",
 ) -> tuple[plt.Figure, float]:
     """Grid of oracle vs predicted correlation matrices for all test instances.
 
-    Layout mirrors the debug script's make_all_instances_plot:
-      row 0: oracle    instances 0 .. half-1
-      row 1: predicted instances 0 .. half-1
-      row 2: oracle    instances half .. n_test-1
-      row 3: predicted instances half .. n_test-1
+    Renders a single composite numpy image (one imshow) instead of N×M subplots
+    for fast matplotlib rendering.
     Returns (fig, mean_mse).
     """
-    b = batch_idx
+    n_plot, d, _ = R_pred_np.shape
+    half = max(n_plot // 2, 1)
+    n_cols = half
 
-    Sigma_pred = torch.diag_embed(d_pred[b]) + V_pred[b] @ V_pred[b].transpose(-2, -1)
-    std_p = Sigma_pred.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
-    R_pred = (Sigma_pred / (std_p.unsqueeze(-1) * std_p.unsqueeze(-2))).float().cpu()
+    # Batched MSE over upper triangle (vectorised — no Python loop)
+    ri, ci = np.triu_indices(d, k=1)
+    mse_per = np.mean((R_pred_np[:, ri, ci] - R_ora_np[:, ri, ci]) ** 2, axis=1)
+    mean_mse = float(mse_per.mean())
 
-    Sigma_ora = torch.diag_embed(oracle_D[b]) + oracle_V[b] @ oracle_V[b].transpose(-2, -1)
-    std_o = Sigma_ora.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
-    R_ora = (Sigma_ora / (std_o.unsqueeze(-1) * std_o.unsqueeze(-2))).float().cpu()
+    # Build single composite image: 4 block-rows × n_cols block-columns
+    #   row 0: oracle   inst 0 .. half-1
+    #   row 1: pred     inst 0 .. half-1
+    #   row 2: oracle   inst half .. n_plot-1
+    #   row 3: pred     inst half .. n_plot-1
+    sep = max(1, d // 16)
+    row_starts = [g * (d + sep) for g in range(4)]
+    H = 4 * d + 3 * sep
+    W = n_cols * d + max(n_cols - 1, 0) * sep
+    composite = np.full((H, W), np.nan)
 
-    d = R_pred.shape[-1]
-    ri, ci = torch.triu_indices(d, d, offset=1)
-    n_test = R_pred.shape[0]
-    half = max(n_test // 2, 1)
-
-    mse_per = [F.mse_loss(R_pred[i, ri, ci], R_ora[i, ri, ci]).item() for i in range(n_test)]
-    mean_mse = float(np.mean(mse_per))
-
-    R_pred_np = R_pred.numpy()
-    R_ora_np  = R_ora.numpy()
-
-    n_cols = max(half, 1)
-    fig, axes = plt.subplots(4, n_cols, figsize=(2.5 * n_cols, 10), layout="constrained")
-    if n_cols == 1:
-        axes = axes[:, np.newaxis]
-
-    im = None
-    for i in range(half):
+    for i in range(n_cols):
+        x0 = i * (d + sep)
         for grp in range(2):
             inst = i + grp * half
-            if inst >= n_test:
+            if inst >= n_plot:
                 continue
-            for row_off, is_oracle in enumerate([True, False]):
-                row = grp * 2 + row_off
-                ax = axes[row, i]
-                R = R_ora_np[inst] if is_oracle else R_pred_np[inst]
-                im = ax.imshow(R, vmin=-1, vmax=1, cmap="RdBu_r")
-                if is_oracle:
-                    ax.set_title(f"Oracle #{inst}", fontsize=7)
-                else:
-                    ax.set_title(f"MSE={mse_per[inst]:.3f}", fontsize=7, color="darkred")
-                ax.set_xticks([])
-                ax.set_yticks([])
+            composite[row_starts[grp * 2]:row_starts[grp * 2] + d, x0:x0 + d] = R_ora_np[inst]
+            composite[row_starts[grp * 2 + 1]:row_starts[grp * 2 + 1] + d, x0:x0 + d] = R_pred_np[inst]
 
-    for row, lbl in enumerate([
-        f"Oracle  0–{half-1}", f"Pred  0–{half-1}",
-        f"Oracle  {half}–{n_test-1}", f"Pred  {half}–{n_test-1}",
-    ]):
-        axes[row, 0].set_ylabel(lbl, fontsize=8)
+    fig, ax = plt.subplots(figsize=(max(n_cols * 0.9, 3), 4))
+    im = ax.imshow(composite, vmin=-1, vmax=1, cmap="RdBu_r",
+                   interpolation="nearest", aspect="auto")
 
-    if im is not None:
-        fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.35, pad=0.02)
+    for i in range(n_cols):
+        for grp in range(2):
+            inst = i + grp * half
+            if inst >= n_plot:
+                continue
+            y_c = row_starts[grp * 2 + 1] + d // 2
+            x_c = i * (d + sep) + d // 2
+            ax.text(x_c, y_c, f"{mse_per[inst]:.2f}",
+                    ha="center", va="center", fontsize=5, color="k")
 
-    title = f"All {n_test} instances — mean MSE={mean_mse:.4f}"
+    ax.set_yticks([r + d // 2 for r in row_starts])
+    ax.set_yticklabels([
+        f"Oracle 0–{half-1}", f"Pred 0–{half-1}",
+        f"Oracle {half}–{n_plot-1}", f"Pred {half}–{n_plot-1}",
+    ], fontsize=7)
+    ax.set_xticks([])
+    fig.colorbar(im, ax=ax, shrink=0.5, pad=0.02)
+
+    title = f"All {n_plot} instances — mean MSE={mean_mse:.4f}"
     if label:
         title = f"{label}  |  {title}"
-    fig.suptitle(title, fontsize=10)
+    ax.set_title(title, fontsize=9)
+    fig.tight_layout()
     return fig, mean_mse
 
 
@@ -497,16 +493,16 @@ def run_val_pit(
                 all_off_pred.append(R_pp[..., ri_p, ci_p].float().cpu().numpy().flatten())
                 all_off_ora.append(R_oo[..., ri_p, ci_p].float().cpu().numpy().flatten())
 
-                # Store up to 2 episodes for the all-instances grid plot
+                # Store up to 2 episodes for the all-instances grid plot.
+                # R_pp / R_oo are already computed above — reuse them directly
+                # so _corr_all_instances_fig doesn't redo Sigma/std/matmul work.
                 if len(plot_episodes) < 2:
+                    n_p = min(_MAX_PLOT_INSTANCES, R_pp.shape[1])
                     plot_episodes.append(
                         {
                             "key": f"pit_ep{i_ep}",
-                            "d_pred": d_Z.clone(),
-                            "V_pred": V_Z.clone(),
-                            "oracle_D": oracle_D,
-                            "oracle_V": oracle_V,
-                            "n_test": n_test,
+                            "R_pred": R_pp[:, :n_p].float().cpu().numpy(),  # (B, n_p, d, d)
+                            "R_ora": R_oo[:, :n_p].float().cpu().numpy(),
                         }
                     )
 
@@ -531,12 +527,11 @@ def run_val_pit(
     if do_plot and wandb_run is not None:
         # — All-instances correlation grids (one per stored episode, up to 2 batch elems each) —
         for ep in plot_episodes:
-            B_ep = ep["d_pred"].shape[0]
+            B_ep = ep["R_pred"].shape[0]
             for b_idx in range(min(2, B_ep)):
                 fig, _ = _corr_all_instances_fig(
-                    ep["d_pred"], ep["V_pred"],
-                    ep["oracle_D"], ep["oracle_V"],
-                    batch_idx=b_idx,
+                    ep["R_pred"][b_idx],
+                    ep["R_ora"][b_idx],
                     label=f"{ep['key']} b={b_idx}",
                 )
                 plot_figs.append(fig)
@@ -674,10 +669,12 @@ def main(cfg: DictConfig) -> None:
         model: nn.Module = build_copula_tabicl_v2(cfg).to(device)
     elif _model_name == "icl_corr_net_v2":
         model: nn.Module = build_icl_corr_net_v2(cfg).to(device)
+    elif _model_name == "tabicl-archi":
+        model: nn.Module = build_copula_tabicl(cfg).to(device)
     else:
         raise ValueError(
             f"Unknown model.name={_model_name!r}. "
-            "Use 'copula_tabicl_v2' or 'icl_corr_net_v2'."
+            "Use 'copula_tabicl_v2', 'icl_corr_net_v2', or 'tabicl-archi'."
         )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters : {n_params:,}")
@@ -711,13 +708,22 @@ def main(cfg: DictConfig) -> None:
         _data_tag = Path(cfg.training.dataset_dir).name
         _lr = cfg.training.lr
         _lr_str = f"{_lr:.0e}".replace("e-0", "e-").replace("e+0", "e")
-        # n_layers key differs across model configs
-        _n_layers = getattr(cfg.model, "n_layers",
-                            f"{getattr(cfg.model, 'n_layers_s1', '?')}/"
-                            f"{getattr(cfg.model, 'n_layers_s2', '?')}/"
-                            f"{getattr(cfg.model, 'n_layers_s3', '?')}")
-        _d_hidden = getattr(cfg.model, "d_hidden", getattr(cfg.model, "d_model", "?"))
-        _rank = getattr(cfg.model, "rank", "?")
+        # n_layers / d_hidden / rank key names differ across model configs
+        if _model_name == "tabicl-archi":
+            _n_layers = (
+                f"c{getattr(cfg.model, 'col_num_blocks', '?')}/"
+                f"r{getattr(cfg.model, 'row_num_blocks', '?')}/"
+                f"i{getattr(cfg.model, 'icl_num_blocks', '?')}"
+            )
+            _d_hidden = getattr(cfg.model, "embed_dim", "?")
+            _rank = getattr(cfg.model, "k", "?")
+        else:
+            _n_layers = getattr(cfg.model, "n_layers",
+                                f"{getattr(cfg.model, 'n_layers_s1', '?')}/"
+                                f"{getattr(cfg.model, 'n_layers_s2', '?')}/"
+                                f"{getattr(cfg.model, 'n_layers_s3', '?')}")
+            _d_hidden = getattr(cfg.model, "d_hidden", getattr(cfg.model, "d_model", "?"))
+            _rank = getattr(cfg.model, "rank", "?")
         _aux_w = float(cfg.training.get("aux_mse_weight", 0.0))
         _nll_w = float(cfg.training.get("nll_weight", 1.0))
         _run_name = (
@@ -805,6 +811,20 @@ def main(cfg: DictConfig) -> None:
         oracle_D_ep = episode["oracle_D"].to(device)  # (B, n_test, d)
         oracle_V_ep = episode["oracle_V"].to(device)  # (B, n_test, d, r)
 
+        if cfg.training.get("use_oracle_z", False):
+            oracle_mu_ep = episode["oracle_mu"].to(device)
+            Y_test_ep = episode["Y_test"].to(device)
+            sigma_ora = (oracle_D_ep + oracle_V_ep.pow(2).sum(-1)).sqrt()
+            Z_test_ep = (Y_test_ep - oracle_mu_ep) / sigma_ora
+
+            if "oracle_mu_train" in episode:
+                oracle_mu_tr = episode["oracle_mu_train"].to(device)
+                oracle_D_tr = episode["oracle_D_train"].to(device)
+                oracle_V_tr = episode["oracle_V_train"].to(device)
+                Y_train_ep = episode["Y_train"].to(device)
+                sigma_ora_tr = (oracle_D_tr + oracle_V_tr.pow(2).sum(-1)).sqrt()
+                Z_train = (Y_train_ep - oracle_mu_tr) / sigma_ora_tr
+
         B, N, d = Z_train.shape
 
         n_think = int(cfg.training.get("n_think", 0))
@@ -877,7 +897,12 @@ def main(cfg: DictConfig) -> None:
         # ---- Logging ----
         if step % int(cfg.training.log_every) == 0:
             with torch.no_grad():
-                wnll = loss_nll.item()
+                # loss_nll is zeroed out when nll_weight==0 to avoid bfloat16 NaN
+                # corrupting the backward pass; recompute here for accurate logging.
+                if nll_weight > 0.0:
+                    wnll = loss_nll.item()
+                else:
+                    wnll = woodbury_nll(Z_query, mu_Z, d_Z, V_Z).item()
                 indep_z_train = indep_normal_nll(Z_query).item()
                 cnll_train = wnll - indep_z_train  # copula NLL
                 copula_gain = (
