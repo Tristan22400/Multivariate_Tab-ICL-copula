@@ -72,6 +72,9 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    # Warn (don't error) when a non-deterministic op is used, so training
+    # stays functional but we can detect remaining sources of variance.
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +665,10 @@ def main(cfg: DictConfig) -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     if use_amp:
         torch.backends.cudnn.benchmark = True
+        # benchmark=True speeds up fixed-shape workloads but allows cuDNN to pick
+        # different algorithms across runs.  Set deterministic=True to override at
+        # the cost of ~10% throughput when strict reproducibility is required.
+        torch.backends.cudnn.deterministic = False
         print(f"AMP enabled  dtype={amp_dtype}  cudnn.benchmark=True")
 
     # ---- Validate required config ----
@@ -796,6 +803,7 @@ def main(cfg: DictConfig) -> None:
         files=train_files,
         shuffle=True,
         num_workers=int(cfg.dataset.num_workers),
+        seed=int(cfg.seed),
     )
     episode_iter = infinite_episode_iter(loader)
 

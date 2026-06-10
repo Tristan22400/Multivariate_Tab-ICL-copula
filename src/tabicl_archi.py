@@ -25,7 +25,7 @@ _TABICL_SRC = os.path.join(_HERE, "..", "tabicl_upstream", "src")
 if _TABICL_SRC not in sys.path:
     sys.path.insert(0, _TABICL_SRC)
 
-from tabicl._model.tabicl import TabICL  # noqa: E402
+from tabicl.model.tabicl import TabICL  # noqa: E402
 
 
 class _ZEncoder(nn.Module):

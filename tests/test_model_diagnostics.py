@@ -15,8 +15,9 @@ Each test class targets a specific failure hypothesis:
                               tabicl-archi is expected to be far less sensitive
                               because the outer-product covariance signal is absent.
 4. TestXSensitivity         — sensitivity of R_test to changes in X_query.
-                              tabicl-archi has NO X-routing mechanism; copula-tabICL
-                              has x_sim_bias + x_route_proj.
+                              Neither model has an explicit X-routing mechanism;
+                              X reaches Stage-3 only through the Stage 1-2 row
+                              embeddings and must be discriminated via Q·K attention.
 5. TestGradientFlow         — gradient magnitude at every Z-injection weight.
                               Reveals dead/saturated components and the scalar-gate
                               cancellation present in tabicl-archi.
@@ -615,18 +616,15 @@ class TestXSensitivity:
     In the hyperplane dataset, X encodes which correlation REGION an instance
     belongs to.  The model must route each query to the correct support region.
 
-    copula-tabICL mechanisms for X-routing:
-      1. x_sim_bias = X_qry @ X_sup^T  (cosine similarity, additive ICL bias)
-      2. x_route_proj: learned projection of X into d_icl, gated by x_route_gate
-      Both together make Stage-3 attention X-aware from the very first step.
-
-    tabicl-archi mechanisms:
-      NONE.  The ICL transformer in the TabICL backbone has no X-routing signal.
-      It must implicitly learn to route via Q·K attention in the row embedding
-      space, which is a much harder inductive problem.
+    X-routing has been removed from copula-tabICL: the Stage-3 ICL transformer is
+    now a plain masked self-attention block (K, Q, V all from the same row
+    embedding), matching the tabicl-archi route.  X therefore reaches Stage 3 only
+    through the Stage 1-2 row embeddings and must be discriminated implicitly via
+    Q·K attention — a harder inductive problem than the previous explicit routing.
 
     Test: fix Z_support, swap X_query between two contrasting X distributions.
-    copula-tabICL should show a large change in R; tabicl-archi much smaller or zero.
+    R should still change because query row embeddings differ in X, but the change
+    is no longer amplified by a dedicated X-routing signal.
     """
 
     @pytest.fixture(scope="class")
@@ -674,8 +672,10 @@ class TestXSensitivity:
     def test_copula_tabicl_v2_x_sensitive(self, episode_pair):
         """copula-tabICL must respond to X_query change.
 
-        x_sim_bias routes attention; different X_query → different attention
-        pattern over support → different aggregated Z signal → different R.
+        Different X_query → different Stage 1-2 row embeddings → different Q·K
+        attention pattern over support → different aggregated Z signal → different R.
+        (X-routing has been removed; sensitivity now comes only from the row
+        embeddings and Q·K attention.)
         """
         ep1, ep2 = episode_pair
         stats = self._x_sensitivity(
@@ -683,15 +683,17 @@ class TestXSensitivity:
         )
         assert stats["mean_diff"] > 1e-5, (
             "copula_tabicl_v2: R_test did not change after flipping X_query. "
-            "x_sim_bias and x_route_proj should make R sensitive to X_query."
+            "Query row embeddings depend on X (Stage 1-2), so Q·K attention should "
+            "still make R sensitive to X_query even without explicit X-routing."
         )
 
     def test_tabicl_archi_x_sensitivity_vs_copula(self, episode_pair):
-        """tabicl-archi is expected to have lower X-sensitivity.
+        """Compare X-sensitivity of both models (informational).
 
-        Prints a comparison table to quantify the routing gap.
-        If tabicl-archi has near-zero X-sensitivity, it confirms the
-        'constant correlation matrix per dataset' failure mode.
+        X-routing has been removed from copula-tabICL, so both models now route X
+        the same way — implicitly via Q·K attention over Stage 1-2 row embeddings.
+        A large routing gap is therefore no longer expected; this test prints the
+        comparison so the ablation's effect on X-sensitivity can be inspected.
         """
         ep1, ep2 = episode_pair
         stats_v2 = self._x_sensitivity(
@@ -706,20 +708,13 @@ class TestXSensitivity:
 
         ratio = stats_v2["mean_diff"] / max(stats_ta["mean_diff"], 1e-12)
         print(
-            f"\n  ROUTING GAP:\n"
+            f"\n  X-SENSITIVITY COMPARISON (no explicit X-routing in either model):\n"
             f"    copula_tabicl_v2  mean|ΔR| = {stats_v2['mean_diff']:.4e}\n"
             f"    tabicl_archi      mean|ΔR| = {stats_ta['mean_diff']:.4e}\n"
-            f"    v2 / tabicl ratio = {ratio:.2f}x more X-sensitive\n"
-            "\n  ROOT CAUSE: tabicl-archi has no X-routing:\n"
-            "    • No x_sim_bias (cosine similarity routing)\n"
-            "    • No x_route_proj (learned X projection into ICL space)\n"
-            "    The ICL attention must learn X discrimination purely via Q·K in\n"
-            "    the row embedding space — a much harder inductive problem."
-        )
-        # copula-tabICL must be at least as X-sensitive
-        assert stats_v2["mean_diff"] >= stats_ta["mean_diff"], (
-            "copula_tabicl_v2 should be more X-sensitive than tabicl_archi. "
-            "Something unexpected is happening."
+            f"    v2 / tabicl ratio = {ratio:.2f}x\n"
+            "\n  Both models must learn X discrimination purely via Q·K attention\n"
+            "  in the row embedding space — a hard inductive problem with no\n"
+            "  dedicated X-routing signal to amplify it."
         )
 
 
@@ -875,10 +870,12 @@ class TestConstantOutputDiagnosis:
         the decoder outputs the same R for all instances in a dataset.
       • This manifests as off_diag_std_across_inst ≈ 0 throughout training.
 
-    copula-tabICL:
-      • x_sim_bias + x_route_proj differentiates queries by their X location.
+    copula-tabICL (X-routing removed):
+      • Query row embeddings differ by X location (Stage 1-2), so Q·K attention can
+        still differentiate region-A vs region-B queries — but with no explicit
+        X-routing signal to amplify it.
       • dim_emb differentiates target dimensions.
-      • Both ensure off_diag_std > 0 even at init.
+      • The vech(Z⊗Z) outer-product signal and dim_emb keep off_diag_std > 0 at init.
     """
 
     @pytest.fixture(scope="class")
@@ -935,7 +932,8 @@ class TestConstantOutputDiagnosis:
         )
         assert info["off_diag_std_across_inst"] > 1e-6, (
             "copula_tabicl_v2: all query instances have identical R on two-region data. "
-            "x_sim_bias should produce different routing for region-A vs region-B queries."
+            "X-dependent row embeddings (Stage 1-2) should still drive different Q·K "
+            "routing for region-A vs region-B queries even without explicit X-routing."
         )
 
     def test_tabicl_archi_documents_low_variation_multimodal(self, episode_multimodal):
@@ -965,8 +963,8 @@ class TestConstantOutputDiagnosis:
             "    2. R=I at init: D_tilde=1, W_tilde=0 (dead D-branch gradient)\n"
             "    3. No outer product: can't see pairwise Z covariance signal\n"
             "    4. No dim_emb: all d target dims get same projection → limited rank-1 R\n"
-            "\n  copula-tabICL fixes:\n"
-            "    1. x_sim_bias + x_route_proj: direct X-based routing bias\n"
+            "\n  copula-tabICL fixes (X-routing removed for this ablation):\n"
+            "    1. X reaches Stage 3 only via Stage 1-2 row embeddings + Q·K attention\n"
             "    2. readout_U std=0.1 init: ||U||²≈0.32 → non-trivial W at t=0\n"
             "    3. vech(Z⊗Z) in both embed_tae and embed_icl: pairwise signal\n"
             "    4. dim_emb (orthogonal init): per-dim symmetry-breaking\n"

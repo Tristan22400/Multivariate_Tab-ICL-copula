@@ -56,6 +56,7 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def _build_ICL_model(cfg) -> nn.Module:
@@ -306,7 +307,9 @@ def _load_comms_crime(
     from ucimlrepo import fetch_ucirepo
 
     ds = fetch_ucirepo(id=211)
-    X_df = ds.data.features.fillna(ds.data.features.median())
+    X_df = ds.data.features
+    num_cols = X_df.select_dtypes(include="number").columns
+    X_df = X_df[num_cols].fillna(X_df[num_cols].median())
     target_cols = ["murders", "rapes", "robberies", "assaults", "burglaries"]
     y_df = ds.data.targets[target_cols].dropna()
     X_df = X_df.loc[y_df.index]
