@@ -1229,7 +1229,7 @@ def build_copula_tabicl(cfg) -> _CopulaTabICLWrapper:
 _BUILD_DISPATCH = {
     "icl_corr_net_v2":    build_icl_corr_net_v2,
     "copula_tabicl_v2":   build_copula_tabicl_v2,
-    "copula_tabicl":      build_copula_tabicl,
+    "tabicl-archi":       build_copula_tabicl,
 }
 
 

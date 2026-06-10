@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import argparse
 import copy
+import io
 import math
 import os
 import random
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -55,10 +57,7 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _build_ct_model(cfg) -> nn.Module:
-    mcfg = cfg.model
-    if hasattr(mcfg, "n_layers_s1"):
-        return build_copula_tabicl_v2(cfg)
+def _build_ICL_model(cfg) -> nn.Module:
     return build_copula_transformer(cfg)
 
 
@@ -473,95 +472,57 @@ class AttentionCopulaEstimator(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Worker: train + eval one dataset (runs in a thread on the shared device)
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Attention copula estimator vs pretrained CopulaTransformer"
-    )
-    parser.add_argument("--config", default="conf/config.yaml")
-    parser.add_argument("--ckpt", required=True)
-    parser.add_argument("--episode_idx", type=int, default=0)
-    parser.add_argument(
-        "--steps", type=int, default=None, help="Override attn_copula.steps"
-    )
-    parser.add_argument("--log_every", type=int, default=100)
-    parser.add_argument("--wandb_project", default="copula-attn-vs-ct")
-    parser.add_argument("--wandb_name", default="")
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
+def _run_dataset(
+    ds_idx: int,
+    ep_path: str,
+    cfg: object,
+    ICL_model: nn.Module,
+    n_steps: int,
+    seed: int,
+    device: torch.device,
+) -> tuple[int, dict[str, float]]:
+    """Train AttentionCopulaEstimator and evaluate all methods for one episode.
 
-    set_seed(args.seed)
+    Shares the pre-loaded ICL_model (eval-only, no grad) with other threads.
+    Returns (ds_idx, metrics_dict).
+    """
+    torch.manual_seed(seed + ds_idx)
 
-    device = (
-        "cuda"
-        if (args.device == "auto" and torch.cuda.is_available())
-        else (args.device if args.device != "auto" else "cpu")
-    )
-    print(f"Device: {device}")
-
-    cfg = OmegaConf.load(args.config)
     acfg = cfg.attn_copula
-    dataset_dir = cfg.training.dataset_dir
-    ep_path = os.path.join(dataset_dir, f"episode_{args.episode_idx:06d}.pt")
-    print(f"Loading episode: {ep_path}")
 
+    # ---- Load episode -------------------------------------------------------
     ep = torch.load(ep_path, map_location=device, weights_only=True)
     X_train = ep["X_train"][0].to(device)  # (256, p)
     Z_train = ep["Z_train"][0].to(device)  # (256, d)
-    X_test = ep["X_test"][0].to(device)  # (n_te, p)
-    Z_test = ep["Z_test"][0].to(device)  # (n_te, d)
+    X_test  = ep["X_test"][0].to(device)   # (n_te, p)
+    Z_test  = ep["Z_test"][0].to(device)   # (n_te, d)
     log_p_test = ep["log_p_test"][0].to(device)
-    Y_test = ep["Y_test"][0].to(device)
-    oracle_mu = ep["oracle_mu"][0].to(device)
-    oracle_D = ep["oracle_D"][0].to(device)
-    oracle_V = ep["oracle_V"][0].to(device)
+    Y_test     = ep["Y_test"][0].to(device)
+    oracle_mu  = ep["oracle_mu"][0].to(device)
+    oracle_D   = ep["oracle_D"][0].to(device)
+    oracle_V   = ep["oracle_V"][0].to(device)
 
     n_train, p = X_train.shape
-    n_test, d = Z_test.shape
-    print(
-        f"Episode {args.episode_idx}: n_train={n_train}, n_test={n_test}, p={p}, d={d}"
-    )
+    n_test,  d = Z_test.shape
 
     # ---- Fixed data splits ------------------------------------------------
     # 20% held-out val from training set (fixed once for the whole run)
     n_val = max(1, int(round(0.2 * n_train)))
     perm = torch.randperm(n_train, device=device)
-    val_idx = perm[:n_val]
+    val_idx  = perm[:n_val]
     pool_idx = perm[n_val:]
 
-    X_val, Z_val = X_train[val_idx], Z_train[val_idx]  # (~51, .)
+    X_val,  Z_val  = X_train[val_idx],  Z_train[val_idx]   # (~51, .)
     X_pool, Z_pool = X_train[pool_idx], Z_train[pool_idx]  # (~205, .)
     n_pool = X_pool.shape[0]
-
-    # ---- W&B ---------------------------------------------------------------
-    wandb_run = None
-    try:
-        import wandb
-
-        run_name = args.wandb_name or (
-            f"ep{args.episode_idx}_m{acfg.m}_L{acfg.n_layers}_drop{acfg.dropout}"
-        )
-        wandb_run = wandb.init(
-            project=args.wandb_project,
-            name=run_name,
-            config=dict(OmegaConf.to_container(acfg, resolve=True)),
-        )
-        print(f"W&B run: {wandb_run.url}")
-    except Exception as e:
-        print(f"W&B unavailable ({e}), logging to console only.")
 
     # ====================================================================
     # Phase 1 — Train AttentionCopulaEstimator
     # ====================================================================
-    n_steps = args.steps if args.steps is not None else int(acfg.steps)
-    print(
-        f"\n--- Training AttentionCopulaEstimator ({n_steps} steps, early stopping) ---"
-    )
-
     model = AttentionCopulaEstimator(
         p=p,
         d=d,
@@ -574,9 +535,6 @@ def main() -> None:
         lambda_max=float(acfg.lambda_max),
         include_outer=bool(acfg.include_outer),
     ).to(device)
-
-    n_params = sum(p_.numel() for p_ in model.parameters())
-    print(f"AttentionCopulaEstimator parameters: {n_params:,}")
 
     optimizer = Adam(
         model.parameters(),
@@ -601,7 +559,7 @@ def main() -> None:
     best_val_nll = float("inf")
     best_state = copy.deepcopy(model.state_dict())
     steps_since_improvement = 0
-    patience = int(acfg.patience)
+    patience  = int(acfg.patience)
     val_every = int(acfg.val_every)
     clip_grad = float(acfg.clip_grad)
 
@@ -628,64 +586,27 @@ def main() -> None:
         if step % val_every == 0:
             model.eval()
             with torch.no_grad():
-                R_val, gamma_val, lam_val = model(
-                    X_pool, Z_pool, X_val, return_gates=True
-                )
+                R_val, _, _ = model(X_pool, Z_pool, X_val, return_gates=True)
                 val_nll = copula_nll_full(Z_val, R_val).item()
-                gamma_mean = gamma_val.mean().item()
-                lam_mean = lam_val.mean().item()
             model.train()
 
-            improved = val_nll < best_val_nll
-            if improved:
+            if val_nll < best_val_nll:
                 best_val_nll = val_nll
                 best_state = copy.deepcopy(model.state_dict())
                 steps_since_improvement = 0
             else:
                 steps_since_improvement += val_every
 
-            # --- xi-conditioning diagnostics on val set ---
-            xi_val = _xi_cond_stats(R_val)
-
-            lr_now = scheduler.get_last_lr()[0]
-            print(
-                f"[step {step:>5d}]  train={loss.item():.4f}  val={val_nll:.4f}"
-                f"{'*' if improved else ' '}  γ={gamma_mean:.3f}  λ={lam_mean:.3f}"
-                f"  lr={lr_now:.2e}"
-                f"  |ρ|={xi_val['mean_abs_offdiag']:.3f}"
-                f"  std_ξ={xi_val['std_offdiag_xi']:.4f}"
-            )
-            if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "attn/train_copula_nll": loss.item(),
-                        "attn/val_copula_nll": val_nll,
-                        "attn/gamma_mean": gamma_mean,
-                        "attn/lambda_mean": lam_mean,
-                        "attn/lr": lr_now,
-                        "attn/val_mean_abs_offdiag": xi_val["mean_abs_offdiag"],
-                        "attn/val_std_offdiag_xi": xi_val["std_offdiag_xi"],
-                        "attn/val_var_frob_from_I": xi_val["var_frob_from_I"],
-                    },
-                    step=step,
-                )
-
             if steps_since_improvement >= patience:
-                print(
-                    f"Early stopping at step {step} (no improvement for {patience} steps)."
-                )
                 break
 
     # Restore best checkpoint
     model.load_state_dict(best_state)
-    print(f"Restored best checkpoint (val_nll={best_val_nll:.4f})")
+    model.eval()
 
     # ====================================================================
     # Phase 2 — Evaluate all estimators on Z_test
     # ====================================================================
-    print("\n--- Evaluating all estimators on test set ---")
-    model.eval()
-
     with torch.no_grad():
         # Attention estimator: full Z_train as context
         R_attn, gamma_final, lam_final = model(
@@ -715,27 +636,15 @@ def main() -> None:
         nw_R[kern] = R_nw
 
     # ====================================================================
-    # Phase 3 — Pretrained CopulaTransformer
+    # Phase 3 — Pretrained ICL model
     # ====================================================================
-    print(f"\n--- Loading CopulaTransformer from {args.ckpt} ---")
-    ct_ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    ct_cfg = ct_ckpt.get("cfg", cfg)
-    if isinstance(ct_cfg, dict):
-        ct_cfg = OmegaConf.create(ct_cfg)
-
-    ct_model = _build_ct_model(ct_cfg).to(device)
-    ct_model.load_state_dict(ct_ckpt["model_state"])
-    ct_model.eval()
-    n_ct_params = sum(p_.numel() for p_ in ct_model.parameters())
-    print(f"CopulaTransformer parameters: {n_ct_params:,}")
-
     with torch.no_grad():
         X_all = torch.cat([X_train, X_test], dim=0).unsqueeze(0)
         Z_all = torch.cat([Z_train, torch.zeros_like(Z_test)], dim=0).unsqueeze(0)
-        mu_ct, d_ct, V_ct = ct_model(X_all, Z_all, n_support=n_train)
-        mu_ct = mu_ct.squeeze(0)
-        d_ct = d_ct.squeeze(0)
-        V_ct = V_ct.squeeze(0)
+        mu_ICL, d_ICL, V_ICL = ICL_model(X_all, Z_all, n_support=n_train)
+        mu_ICL = mu_ICL.squeeze(0)
+        d_ICL  = d_ICL.squeeze(0)
+        V_ICL  = V_ICL.squeeze(0)
 
     marginal_nll_te = -log_p_test.sum(dim=-1).mean().item()
 
@@ -747,7 +656,7 @@ def main() -> None:
         R = Sigma / (std.unsqueeze(-1) * std.unsqueeze(-2))
         return R
 
-    R_ct = _woodbury_to_corr(d_ct, V_ct)  # (n_te, d, d)
+    R_ICL    = _woodbury_to_corr(d_ICL, V_ICL)   # (n_te, d, d)
     R_oracle = _woodbury_to_corr(oracle_D, oracle_V)  # (n_te, d, d)
 
     # Note on "oracle" semantics in this script:
@@ -758,10 +667,9 @@ def main() -> None:
     #     on x*. We keep it as a reference under the "corr(Σ_Y)" Gaussian-copula model.
     #   * The only true lower bound on joint Y-NLL is woodbury_nll(Y_test, μ_Y, D_Y, V_Y),
     #     the negative log of the data-generating density. That is `nll_oracle_y` below.
-    nll_ct_z = copula_nll_full(Z_test, R_ct).item()
+    nll_ICL_z = copula_nll_full(Z_test, R_ICL).item()
     nll_pseudo_oracle_corrY_z = copula_nll_full(Z_test, R_oracle).item()
-    marginal_nll_te = -log_p_test.sum(dim=-1).mean().item()
-    nll_ct_y = nll_ct_z + marginal_nll_te
+    nll_ICL_y = nll_ICL_z + marginal_nll_te
 
     # True Y-space oracle (lower bound on joint-Y NLL). Computed directly from the
     # data-generating Gaussian on Y_test — bypasses PIT, so TabICL's marginal
@@ -781,19 +689,19 @@ def main() -> None:
     #   A = marginal_nll_te - marginal_nll_oracle
     #         → how well TabICL estimates the marginal densities
     #
-    #   B = copula_nll(R_ct, Z_true) - copula_nll(R_oracle, Z_true)  ≥ 0
-    #         → pure copula error; KL(N(0,R_oracle) || N(0,R_ct)) in expectation
-    #         → zero only when CT predicts R_oracle exactly
+    #   B = copula_nll(R_ICL, Z_true) - copula_nll(R_oracle, Z_true)  ≥ 0
+    #         → pure copula error; KL(N(0,R_oracle) || N(0,R_ICL)) in expectation
+    #         → zero only when ICL predicts R_oracle exactly
     #
-    #   C = copula_nll(R_ct, Z_hat) - copula_nll(R_ct, Z_true)
+    #   C = copula_nll(R_ICL, Z_hat) - copula_nll(R_ICL, Z_true)
     #         → how much TabICL's marginal distortion inflates the copula NLL
     #         → ≈ 0 when marginal estimation is accurate
     #
     # Z_true  — PIT with oracle (true) marginals: z*_j = (y_j - mu_j) / sigma_j
     # Z_hat   — current Z_test: PIT with TabICL's estimated marginals
     #
-    # Sanity: A + B + C = (nll_ct_z + marginal_nll_te) - (nll_oracle_copula + marginal_nll_oracle)
-    #                   = ct_joint_nll_y - (oracle_copula_floor + oracle_marginal_floor)
+    # Sanity: A + B + C = (nll_ICL_z + marginal_nll_te) - (nll_oracle_copula + marginal_nll_oracle)
+    #                   = ICL_joint_nll_y - (oracle_copula_floor + oracle_marginal_floor)
 
     # Oracle marginal std:  sigma_j^2 = D_j + ||V_j||^2
     sigma2_ora = oracle_D + oracle_V.pow(2).sum(-1)       # (n_te, d)
@@ -808,18 +716,17 @@ def main() -> None:
     ).sum(-1).mean().item()
 
     nll_oracle_copula_truez = copula_nll_full(Z_true, R_oracle).item()  # floor
-    nll_ct_truez            = copula_nll_full(Z_true, R_ct).item()
+    nll_ICL_truez           = copula_nll_full(Z_true, R_ICL).item()
 
     err_A_marginal     = marginal_nll_te    - marginal_nll_oracle   # TabICL marginal error
-    err_B_copula_pure  = nll_ct_truez       - nll_oracle_copula_truez  # KL(R_oracle||R_ct) ≥ 0
-    err_C_bleed        = nll_ct_z           - nll_ct_truez           # marginal→copula bleed
+    err_B_copula_pure  = nll_ICL_truez      - nll_oracle_copula_truez  # KL(R_oracle||R_ICL) ≥ 0
+    err_C_bleed        = nll_ICL_z          - nll_ICL_truez           # marginal→copula bleed
 
     # ====================================================================
-    # Phase 4 — Log final metrics
+    # Phase 4 — Collect metrics
     # ====================================================================
-    # joint_nll_y = copula_nll_z + marginal_nll_te  (same decomposition as CT)
+    # joint_nll_y = copula_nll_z + marginal_nll_te  (same decomposition as ICL)
     # marginal_nll_te is the same for all copula methods (it depends only on marginals)
-    final_step = n_steps
     eval_metrics = {
         # ---- Copula NLL (z-space, copula component only) --------------------
         "eval/moment_copula_nll": moment_nll,
@@ -828,7 +735,7 @@ def main() -> None:
         "eval/nw_epan_copula_nll": nw_nll["epanechnikov"],
         "eval/nw_laplace_copula_nll": nw_nll["laplace"],
         "eval/attn_copula_nll": attn_nll,
-        "eval/ct_copula_nll": nll_ct_z,
+        "eval/ICL_copula_nll": nll_ICL_z,
         # corr(Σ_Y) Gaussian copula on PIT-Z — NOT a hard lower bound (see note above).
         "eval/pseudo_oracle_corrY_copula_nll": nll_pseudo_oracle_corrY_z,
         # ---- Joint NLL (y-space) = copula_nll + marginal_nll_te ------------
@@ -838,7 +745,7 @@ def main() -> None:
         "eval/nw_epan_joint_nll_y": nw_nll["epanechnikov"] + marginal_nll_te,
         "eval/nw_laplace_joint_nll_y": nw_nll["laplace"] + marginal_nll_te,
         "eval/attn_joint_nll_y": attn_nll + marginal_nll_te,
-        "eval/ct_joint_nll_y": nll_ct_y,
+        "eval/ICL_joint_nll_y": nll_ICL_y,
         # Sklar route: biased by TabICL's marginal density (log_p_test) — not tight.
         "eval/pseudo_oracle_corrY_joint_nll_y": nll_pseudo_oracle_corrY_z + marginal_nll_te,
         # True Y-space oracle: hard lower bound on any joint-Y NLL.
@@ -846,15 +753,15 @@ def main() -> None:
         # ---- Shared marginal term (same for all copula methods) -------------
         "eval/marginal_nll_te": marginal_nll_te,
         # ---- Three-way error decomposition ----------------------------------
-        # CT copula NLL evaluated on oracle-PIT Z_true (removes marginal distortion)
-        "eval/ct_copula_nll_truez":       nll_ct_truez,
+        # ICL copula NLL evaluated on oracle-PIT Z_true (removes marginal distortion)
+        "eval/ICL_copula_nll_truez":      nll_ICL_truez,
         # Oracle copula floor on Z_true  (= 0.5*log|R_oracle| in expectation)
         "eval/oracle_copula_nll_truez":   nll_oracle_copula_truez,
         # True oracle marginal NLL (lower bound on marginal term)
         "eval/marginal_nll_oracle":       marginal_nll_oracle,
         # A: TabICL marginal estimation error (independent of copula model)
         "eval/err_A_marginal":            err_A_marginal,
-        # B: pure CT copula error = KL(N(0,R_oracle)||N(0,R_ct)) in expectation  (≥ 0)
+        # B: pure ICL copula error = KL(N(0,R_oracle)||N(0,R_ICL)) in expectation  (≥ 0)
         "eval/err_B_copula_pure":         err_B_copula_pure,
         # C: how much TabICL's marginal distortion inflates the copula NLL
         "eval/err_C_marginal_bleed":      err_C_bleed,
@@ -877,14 +784,14 @@ def main() -> None:
     R_shrunk_exp_stat = R_shrunk.unsqueeze(0).expand(n_test, -1, -1)
 
     xi_corr_models: dict[str, torch.Tensor] = {
-        "moment":      R_mom_exp_stat,
-        "shrunk_mom":  R_shrunk_exp_stat,
-        "nw_rbf":      nw_R["rbf"],
-        "nw_epan":     nw_R["epanechnikov"],
-        "nw_laplace":  nw_R["laplace"],
-        "attn":        R_attn,
-        "ct":          R_ct,
-        "oracle":      R_oracle,
+        "moment":     R_mom_exp_stat,
+        "shrunk_mom": R_shrunk_exp_stat,
+        "nw_rbf":     nw_R["rbf"],
+        "nw_epan":    nw_R["epanechnikov"],
+        "nw_laplace": nw_R["laplace"],
+        "attn":       R_attn,
+        "ICL":        R_ICL,
+        "oracle":     R_oracle,
     }
     xi_corr_stats: dict[str, dict[str, float]] = {
         name: _xi_cond_stats(R) for name, R in xi_corr_models.items()
@@ -892,10 +799,9 @@ def main() -> None:
     # Woodbury (D, V) models have actual diagonal variances per xi
     xi_wb_stats: dict[str, dict[str, float]] = {
         "oracle": _woodbury_diag_stats(oracle_D, oracle_V),
-        "ct":     _woodbury_diag_stats(d_ct, V_ct),
+        "ICL":    _woodbury_diag_stats(d_ICL, V_ICL),
     }
 
-    # Flatten into eval_metrics for W&B
     for name, s in xi_corr_stats.items():
         for k, v in s.items():
             eval_metrics[f"xi_cond/{name}_{k}"] = v
@@ -903,102 +809,265 @@ def main() -> None:
         for k, v in s.items():
             eval_metrics[f"xi_cond/{name}_{k}"] = v
 
-    print("\n--- Summary ---")
-    col_w = max(len(k) for k in eval_metrics) + 2
-    copula_keys = [k for k in eval_metrics if "copula_nll" in k]
-    joint_keys = [k for k in eval_metrics if "joint_nll_y" in k]
-    xi_keys = [k for k in eval_metrics if k.startswith("xi_cond/")]
-    diag_keys = [
-        k for k in eval_metrics
-        if k not in copula_keys and k not in joint_keys and k not in xi_keys
-    ]
+    return ds_idx, eval_metrics, (
+        ep, R_mom_full, R_shrunk, nw_R, R_attn, R_oracle,
+        mu_ICL, d_ICL, V_ICL, R_ICL, Z_train, X_train,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Parallel per-dataset AttentionCopulaEstimator vs pretrained ICL model"
+    )
+    parser.add_argument("--config", default="conf/config.yaml")
+    parser.add_argument("--ckpt", required=True)
+    parser.add_argument("--episode_idx", type=int, default=0,
+                        help="Starting episode index; comparison.n_datasets episodes are used")
+    parser.add_argument(
+        "--steps", type=int, default=None, help="Override attn_copula.steps"
+    )
+    parser.add_argument("--wandb_project", default="copula-attn-vs-ICL")
+    parser.add_argument("--wandb_name", default="")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--n_workers", type=int, default=None,
+        help="Concurrent threads per device (default: 4 on GPU, cpu_count on CPU)"
+    )
+    parser.add_argument("--no_plots", action="store_true",
+                        help="Skip covariance plot generation (faster for testing)")
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+
+    device = torch.device(
+        "cuda" if (args.device == "auto" and torch.cuda.is_available())
+        else (args.device if args.device != "auto" else "cpu")
+    )
+    print(f"Device: {device}")
+
+    cfg = OmegaConf.load(args.config)
+    acfg = cfg.attn_copula
+    n_comparison_datasets = int(cfg.get("comparison", {}).get("n_datasets", 50))
+    n_steps = args.steps if args.steps is not None else int(acfg.steps)
+    dataset_dir = cfg.training.dataset_dir
+
+    # Default: 4 concurrent threads on GPU (small models fit easily), cpu_count on CPU
+    if args.n_workers is not None:
+        n_workers = args.n_workers
+    elif device.type == "cuda":
+        n_workers = 4
+    else:
+        n_workers = os.cpu_count() or 4
+
+    print(f"Comparing {n_comparison_datasets} datasets | {n_workers} concurrent threads on {device}")
+
+    # ---- Load ICL model once (shared read-only across threads) -------------
+    print(f"\n--- Loading ICL model from {args.ckpt} ---")
+    ICL_ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+    ICL_cfg  = ICL_ckpt.get("cfg", cfg)
+    if isinstance(ICL_cfg, dict):
+        ICL_cfg = OmegaConf.create(ICL_cfg)
+
+    ICL_model = _build_ICL_model(ICL_cfg).to(device)
+    ICL_model.load_state_dict(ICL_ckpt["model_state"])
+    ICL_model.eval()
+    n_ICL_params = sum(p_.numel() for p_ in ICL_model.parameters())
+    print(f"ICL model parameters: {n_ICL_params:,}")
+
+    # Warm-up: trigger lazy initialisations of torch.linalg and ICL_model before
+    # threads start.  torch.linalg ops (cholesky, cond) use a lazy-wrapper that
+    # raises "should be called at most once" if two threads hit it simultaneously.
+    with torch.no_grad():
+        _d = ICL_ckpt["cfg"].model.d if hasattr(ICL_ckpt.get("cfg", {}), "model") else 8
+        _dummy = torch.eye(_d, device=device).unsqueeze(0)
+        torch.linalg.cholesky(_dummy)
+        torch.linalg.cond(_dummy)
+        del _dummy
+    _ep0 = torch.load(
+        os.path.join(cfg.training.dataset_dir, f"episode_{args.episode_idx:06d}.pt"),
+        map_location=device, weights_only=True,
+    )
+    with torch.no_grad():
+        _X = torch.cat([_ep0["X_train"][0], _ep0["X_test"][0]], dim=0).to(device).unsqueeze(0)
+        _Z = torch.cat([_ep0["Z_train"][0], torch.zeros_like(_ep0["Z_test"][0])], dim=0).to(device).unsqueeze(0)
+        ICL_model(_X, _Z, n_support=_ep0["X_train"].shape[1])
+    del _ep0, _X, _Z
+
+    # ---- W&B ---------------------------------------------------------------
+    wandb_run = None
+    try:
+        import wandb
+
+        run_name = args.wandb_name or (
+            f"N{n_comparison_datasets}_m{acfg.m}_L{acfg.n_layers}_drop{acfg.dropout}"
+        )
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            config={
+                **dict(OmegaConf.to_container(acfg, resolve=True)),
+                "n_comparison_datasets": n_comparison_datasets,
+                "episode_start": args.episode_idx,
+            },
+        )
+        print(f"W&B run: {wandb_run.url}")
+    except Exception as e:
+        print(f"W&B unavailable ({e}), logging to console only.")
+
+    # ====================================================================
+    # Parallel training and evaluation across datasets
+    # ====================================================================
+    episode_indices = list(range(args.episode_idx, args.episode_idx + n_comparison_datasets))
+    all_metrics: list[dict[str, float]] = [{}] * n_comparison_datasets
+    plot_artifacts = None  # kept only from dataset 0
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {
+            pool.submit(
+                _run_dataset,
+                ds_idx=i,
+                ep_path=os.path.join(dataset_dir, f"episode_{ep_i:06d}.pt"),
+                cfg=cfg,
+                ICL_model=ICL_model,
+                n_steps=n_steps,
+                seed=args.seed,
+                device=device,
+            ): i
+            for i, ep_i in enumerate(episode_indices)
+        }
+
+        completed = 0
+        for future in as_completed(futures):
+            local_i = futures[future]
+            try:
+                ds_idx, metrics, artifacts = future.result()
+            except Exception as exc:
+                import traceback
+                print(f"[dataset {local_i}] FAILED: {exc}")
+                traceback.print_exc()
+                continue
+
+            all_metrics[ds_idx] = metrics
+            if ds_idx == 0:
+                plot_artifacts = artifacts
+            completed += 1
+
+            # Log per-dataset metrics to W&B
+            if wandb_run is not None:
+                prefixed = {f"ds{ds_idx:03d}/{k}": v for k, v in metrics.items()}
+                wandb_run.log(prefixed, step=ds_idx)
+
+            attn_nll = metrics.get("eval/attn_copula_nll", float("nan"))
+            ICL_nll  = metrics.get("eval/ICL_copula_nll",  float("nan"))
+            print(
+                f"[{completed:>3d}/{n_comparison_datasets}] ds={ds_idx:03d}"
+                f"  attn={attn_nll:.4f}  ICL={ICL_nll:.4f}"
+            )
+
+    # ====================================================================
+    # Aggregate metrics across datasets
+    # ====================================================================
+    valid = [m for m in all_metrics if m]
+    if not valid:
+        print("No datasets completed successfully.")
+        return
+
+    metric_keys = list(valid[0].keys())
+    agg_metrics: dict[str, float] = {}
+    for k in metric_keys:
+        vals = [m[k] for m in valid if k in m]
+        if vals:
+            agg_metrics[f"agg/mean_{k}"] = float(np.mean(vals))
+            agg_metrics[f"agg/std_{k}"]  = float(np.std(vals))
+
+    print(f"\n--- Aggregate summary over {len(valid)} datasets ---")
+    copula_keys = [k for k in agg_metrics if "copula_nll" in k and k.startswith("agg/mean")]
+    joint_keys  = [k for k in agg_metrics if "joint_nll_y" in k and k.startswith("agg/mean")]
+    col_w = max((len(k) for k in copula_keys + joint_keys), default=0) + 2
     for header, keys in [
-        ("Copula NLL (z-space)", copula_keys),
-        ("Joint NLL  (y-space)", joint_keys),
-        ("Diagnostics         ", diag_keys),
+        ("Copula NLL (z-space) — mean ± std", copula_keys),
+        ("Joint  NLL (y-space) — mean ± std", joint_keys),
     ]:
         print(f"\n  [{header}]")
         for k in keys:
-            print(f"  {k:<{col_w}}: {eval_metrics[k]:.4f}")
-
-    # ---- Xi-conditioning table (console only — more readable as a table) ----
-    model_names = list(xi_corr_stats.keys())
-    print(f"\n  [Xi-conditioning: does the predicted covariance vary with xi?]")
-    print(f"  {'model':<14}  {'|ρ|_mean':>9}  {'std_ξ(ρ)':>10}  {'var_frob':>10}", end="")
-    print(f"  {'mean_var':>10}  {'std_var_ξ':>10}")
-    print("  " + "-" * 68)
-    for name in model_names:
-        cs = xi_corr_stats[name]
-        wb = xi_wb_stats.get(name, {})
-        mv = wb.get("mean_diag_var", float("nan"))
-        sv = wb.get("std_diag_var_xi", float("nan"))
-        print(
-            f"  {name:<14}  {cs['mean_abs_offdiag']:>9.4f}  {cs['std_offdiag_xi']:>10.5f}"
-            f"  {cs['var_frob_from_I']:>10.5f}  {mv:>10.4f}  {sv:>10.5f}"
-        )
+            k_std  = k.replace("agg/mean_", "agg/std_")
+            mean_v = agg_metrics[k]
+            std_v  = agg_metrics.get(k_std, float("nan"))
+            print(f"  {k:<{col_w}}: {mean_v:.4f} ± {std_v:.4f}")
 
     if wandb_run is not None:
-        wandb_run.log(eval_metrics, step=final_step)
+        wandb_run.log(agg_metrics, step=n_comparison_datasets)
 
     # ====================================================================
-    # Phase 5 — Covariance plots
+    # Phase 5 — Covariance plots (dataset 0 only)
     # ====================================================================
-    import matplotlib.pyplot as plt
+    if not args.no_plots and plot_artifacts is not None:
+        import matplotlib.pyplot as plt
+        from sklearn.covariance import OAS
 
-    print("\n--- Generating covariance plots ---")
+        print("\n--- Generating covariance plots (dataset 0) ---")
+        ep, R_mom_full, R_shrunk, nw_R, R_attn, R_oracle, \
+            mu_ICL, d_ICL, V_ICL, R_ICL, Z_train, X_train = plot_artifacts
 
-    # All estimators in ablation order
-    estimators = {
-        "Moment": R_mom_full,  # (d, d) — broadcast
-        "ShrunkMom": R_shrunk,  # (d, d) — broadcast
-        "NW-RBF": nw_R["rbf"],  # (n_te, d, d)
-        "NW-Epan": nw_R["epanechnikov"],  # (n_te, d, d)
-        "NW-Lap": nw_R["laplace"],  # (n_te, d, d)
-        "Attention": R_attn,  # (n_te, d, d)
-        "Copula Transformer": R_ct,  # (n_te, d, d)
-    }
+        # All estimators in ablation order
+        estimators = {
+            "Moment":      R_mom_full,            # (d, d) — broadcast
+            "ShrunkMom":   R_shrunk,              # (d, d) — broadcast
+            "NW-RBF":      nw_R["rbf"],           # (n_te, d, d)
+            "NW-Epan":     nw_R["epanechnikov"],  # (n_te, d, d)
+            "NW-Lap":      nw_R["laplace"],       # (n_te, d, d)
+            "Attention":   R_attn,                # (n_te, d, d)
+            "ICL model":   R_ICL,                 # (n_te, d, d)
+        }
 
-    fig_grid = plot_corr_grid(
-        estimators=estimators,
-        oracle_R=R_oracle,
-        title=f"Correlation estimator comparison — episode {args.episode_idx}",
-    )
-
-    # Also keep the detailed CT Woodbury plot for reference
-    from sklearn.covariance import OAS
-
-    oas_z = OAS().fit(Z_train.cpu().numpy())
-    oracle_groups_raw = ep.get("oracle_groups", None)  # (B, n_test) or None
-    groups_b0 = oracle_groups_raw[0] if oracle_groups_raw is not None else None
-    ct_instance_indices = select_group_representative_indices(
-        groups_b0, max_n=3, n_total=n_test
-    )
-    fig_ct = plot_prediction_comparison(
-        mu_pred=mu_ct.unsqueeze(0),
-        D_pred=d_ct.unsqueeze(0),
-        V_pred=V_ct.unsqueeze(0),
-        mu_true=oracle_mu.unsqueeze(0),
-        D_true=oracle_D.unsqueeze(0),
-        V_true=oracle_V.unsqueeze(0),
-        sigma_oas=oas_z.covariance_,
-        dataset_label="CopulaTransformer — predicted vs oracle (Z-space)",
-        instance_indices=ct_instance_indices,
-    )
-
-    if wandb_run is not None:
-        import wandb as wandb_mod
-
-        wandb_run.log(
-            {
-                "eval/corr_grid": wandb_mod.Image(fig_grid),
-                "eval/ct_detail": wandb_mod.Image(fig_ct),
-            },
-            step=final_step,
+        n_test = R_attn.shape[0]
+        fig_grid = plot_corr_grid(
+            estimators=estimators,
+            oracle_R=R_oracle,
+            title=f"Correlation estimator comparison — episode {args.episode_idx}",
         )
-        print("Covariance plots logged to W&B.")
 
-    plt.close(fig_grid)
-    plt.close(fig_ct)
+        # Also keep the detailed ICL Woodbury plot for reference
+        oas_z = OAS().fit(Z_train.cpu().numpy())
+        oracle_groups_raw = ep.get("oracle_groups", None)  # (B, n_test) or None
+        groups_b0 = oracle_groups_raw[0] if oracle_groups_raw is not None else None
+        ICL_instance_indices = select_group_representative_indices(
+            groups_b0, max_n=3, n_total=n_test
+        )
+        oracle_mu = ep["oracle_mu"][0].to(device)
+        oracle_D  = ep["oracle_D"][0].to(device)
+        oracle_V  = ep["oracle_V"][0].to(device)
+        fig_ICL = plot_prediction_comparison(
+            mu_pred=mu_ICL.unsqueeze(0),
+            D_pred=d_ICL.unsqueeze(0),
+            V_pred=V_ICL.unsqueeze(0),
+            mu_true=oracle_mu.unsqueeze(0),
+            D_true=oracle_D.unsqueeze(0),
+            V_true=oracle_V.unsqueeze(0),
+            sigma_oas=oas_z.covariance_,
+            dataset_label="ICL model — predicted vs oracle (Z-space)",
+            instance_indices=ICL_instance_indices,
+        )
+
+        if wandb_run is not None:
+            import wandb as wandb_mod
+
+            wandb_run.log(
+                {
+                    "eval/corr_grid":  wandb_mod.Image(fig_grid),
+                    "eval/ICL_detail": wandb_mod.Image(fig_ICL),
+                },
+                step=n_comparison_datasets,
+            )
+            print("Covariance plots logged to W&B.")
+
+        plt.close(fig_grid)
+        plt.close(fig_ICL)
 
     if wandb_run is not None:
         wandb_run.finish()
