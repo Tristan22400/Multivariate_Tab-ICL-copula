@@ -1,0 +1,18 @@
+name: tabicl-archi
+
+# CopulaTabICL copula head
+d: 8          # number of target features (Z dimension)
+k: 4          # low-rank factor rank
+
+# TabICL backbone (mirrors upstream defaults)
+embed_dim: 32
+col_num_blocks: 3
+col_nhead: 8
+col_num_inds: 128
+row_num_blocks: 3
+row_nhead: 8
+row_num_cls: 4
+icl_num_blocks: 12
+icl_nhead: 8
+dropout: 0.0
+pre_icl_aux: false
