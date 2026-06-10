@@ -37,6 +37,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
+from data_gen import select_group_representative_indices
 from loss import woodbury_nll
 from model import build_copula_tabicl_v2, build_copula_transformer
 from viz import plot_corr_grid, plot_prediction_comparison
@@ -967,6 +968,11 @@ def main() -> None:
     from sklearn.covariance import OAS
 
     oas_z = OAS().fit(Z_train.cpu().numpy())
+    oracle_groups_raw = ep.get("oracle_groups", None)  # (B, n_test) or None
+    groups_b0 = oracle_groups_raw[0] if oracle_groups_raw is not None else None
+    ct_instance_indices = select_group_representative_indices(
+        groups_b0, max_n=3, n_total=n_test
+    )
     fig_ct = plot_prediction_comparison(
         mu_pred=mu_ct.unsqueeze(0),
         D_pred=d_ct.unsqueeze(0),
@@ -976,6 +982,7 @@ def main() -> None:
         V_true=oracle_V.unsqueeze(0),
         sigma_oas=oas_z.covariance_,
         dataset_label="CopulaTransformer — predicted vs oracle (Z-space)",
+        instance_indices=ct_instance_indices,
     )
 
     if wandb_run is not None:

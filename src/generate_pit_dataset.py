@@ -406,6 +406,7 @@ def main(cfg: DictConfig) -> None:
                             "oracle_mu_train": oracle["mu_train"][sl].cpu(),
                             "oracle_D_train": oracle["D_train"][sl].cpu(),
                             "oracle_V_train": oracle["V_train"][sl].cpu(),
+                            **({"oracle_groups": oracle["groups"][sl].cpu()} if "groups" in oracle else {}),
                             "p": p,
                             "d": d,
                             "n_train": n_train,

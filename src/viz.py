@@ -117,6 +117,7 @@ def plot_prediction_comparison(
     sigma_oas: np.ndarray | None = None,
     fig: plt.Figure | None = None,
     dataset_label: str = "",
+    instance_indices: list[int] | None = None,
 ) -> plt.Figure:
     """Compare predicted vs oracle covariance for multiple query instances.
 
@@ -157,7 +158,11 @@ def plot_prediction_comparison(
 
     N = D_pred.shape[1]
     n_instances = min(n_instances, N)
-    indices = np.linspace(0, N - 1, n_instances, dtype=int)
+    if instance_indices is not None:
+        indices = np.array(instance_indices, dtype=int)
+        n_instances = len(indices)
+    else:
+        indices = np.linspace(0, N - 1, n_instances, dtype=int)
 
     # ------------------------------------------------------------------ #
     # Pre-collect correlation matrices for the off-diagonal scatter.

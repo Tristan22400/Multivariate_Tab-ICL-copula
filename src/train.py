@@ -55,6 +55,7 @@ sys.path.insert(0, _HERE)
 
 from sklearn.covariance import OAS
 
+from data_gen import select_group_representative_indices
 from dataset import infinite_episode_iter, make_episode_loader, split_episode_files
 from loss import indep_normal_nll, woodbury_nll
 from model import build_copula_tabicl, build_copula_tabicl_v2, build_icl_corr_net_v2
@@ -497,12 +498,20 @@ def run_val_pit(
                 # R_pp / R_oo are already computed above — reuse them directly
                 # so _corr_all_instances_fig doesn't redo Sigma/std/matmul work.
                 if len(plot_episodes) < 2:
-                    n_p = min(_MAX_PLOT_INSTANCES, R_pp.shape[1])
+                    groups_raw = ep.get("oracle_groups", None)  # (B, n_test) or None
+                    R_pred_list, R_ora_list = [], []
+                    for b in range(R_pp.shape[0]):
+                        groups_b = groups_raw[b] if groups_raw is not None else None
+                        idxs = select_group_representative_indices(
+                            groups_b, _MAX_PLOT_INSTANCES, n_total=R_pp.shape[1]
+                        )
+                        R_pred_list.append(R_pp[b, idxs].float().cpu().numpy())
+                        R_ora_list.append(R_oo[b, idxs].float().cpu().numpy())
                     plot_episodes.append(
                         {
                             "key": f"pit_ep{i_ep}",
-                            "R_pred": R_pp[:, :n_p].float().cpu().numpy(),  # (B, n_p, d, d)
-                            "R_ora": R_oo[:, :n_p].float().cpu().numpy(),
+                            "R_pred": np.stack(R_pred_list),  # (B, n_p, d, d)
+                            "R_ora": np.stack(R_ora_list),
                         }
                     )
 
@@ -732,7 +741,7 @@ def main(cfg: DictConfig) -> None:
             f"_steps={cfg.training.steps}"
             f"_dh={_d_hidden}"
             f"_L={_n_layers}"
-            f"_H={cfg.model.n_heads}"
+            f"_H={getattr(cfg.model, 'n_heads', getattr(cfg.model, 'col_nhead', '?'))}"
             f"_r={_rank}"
             f"_nllw={_nll_w}"
             f"_auxw={_aux_w}"

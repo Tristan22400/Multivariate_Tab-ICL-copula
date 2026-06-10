@@ -604,6 +604,45 @@ class GlobalFixedNets:
 
 
 # ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+
+def select_group_representative_indices(
+    groups_b: "torch.Tensor | None",
+    max_n: int,
+    n_total: int | None = None,
+) -> list[int]:
+    """Return up to max_n indices that cover all unique groups.
+
+    One index per unique group (first occurrence) is selected first, then
+    remaining slots are filled in order. Falls back to list(range(min(max_n,
+    n_total))) when groups_b is None (non-multimodal episodes).
+    """
+    if groups_b is None:
+        return list(range(min(max_n, n_total or max_n)))
+    n_test = groups_b.shape[0]
+    groups_np = groups_b.cpu().numpy() if hasattr(groups_b, "cpu") else groups_b
+    seen: set[int] = set()
+    reps: list[int] = []
+    for idx in range(n_test):
+        g = int(groups_np[idx])
+        if g not in seen:
+            seen.add(g)
+            reps.append(idx)
+        if len(reps) >= max_n:
+            break
+    if len(reps) < max_n:
+        rep_set = set(reps)
+        for idx in range(n_test):
+            if idx not in rep_set:
+                reps.append(idx)
+            if len(reps) >= max_n:
+                break
+    return reps[:max_n]
+
+
+# ---------------------------------------------------------------------------
 # Episode generator
 # ---------------------------------------------------------------------------
 
@@ -685,6 +724,7 @@ def generate_episode(
             )
         diag_alpha_t = diag_alpha_t.view(B, 1, 1)
 
+    groups: torch.Tensor | None = None
     with torch.no_grad():
         if hyperplane_multimodal:
             # K-group multimodal covariance.
@@ -835,6 +875,8 @@ def generate_episode(
             "D_train": D_oracle[:, :n_train].detach(),
             "V_train": V_oracle[:, :n_train].detach(),
         }
+        if groups is not None:
+            oracle["groups"] = groups[:, n_train:].detach()  # (B, n_test)
         if return_norm_stats:
             oracle["mu_y"] = mu_y.detach()  # (B, 1, d) in raw Y space (pre-norm)
             oracle["std_y"] = std_y.detach()  # (B, 1, d) in raw Y space (pre-norm)
