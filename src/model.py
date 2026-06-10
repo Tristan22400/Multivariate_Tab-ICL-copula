@@ -1190,7 +1190,7 @@ def build_copula_tabicl(cfg) -> _CopulaTabICLWrapper:
       row_num_blocks, row_nhead, row_num_cls, icl_num_blocks, icl_nhead,
       dropout (optional), pre_icl_aux (optional).
     """
-    from copula_tabicl import CopulaTabICL  # imported lazily to avoid TabICL overhead
+    from tabicl_archi import CopulaTabICL  # imported lazily to avoid TabICL overhead
 
     mcfg = cfg.model
     tabicl_kwargs = dict(

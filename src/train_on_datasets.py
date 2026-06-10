@@ -42,6 +42,7 @@ sys.path.insert(0, _HERE)
 from data_gen import select_group_representative_indices
 from loss import woodbury_nll
 from model import build_copula_tabicl_v2, build_copula_transformer
+from pit import load_tabicl, run_pit
 from viz import plot_corr_grid, plot_prediction_comparison
 
 # ---------------------------------------------------------------------------
@@ -225,6 +226,259 @@ def nw_corr(
     R = R / (std.unsqueeze(-1) * std.unsqueeze(-2))
 
     return R
+
+
+# ---------------------------------------------------------------------------
+# UCI real-world dataset loaders
+# ---------------------------------------------------------------------------
+
+
+def _normalize_X_cols(
+    X_tr: np.ndarray,
+    X_te: np.ndarray,
+    cat_cols: list[int] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Z-normalize continuous columns of X using training mean/std."""
+    n_cols = X_tr.shape[1]
+    cont = [j for j in range(n_cols) if cat_cols is None or j not in cat_cols]
+    X_tr_out = X_tr.copy().astype(np.float32)
+    X_te_out = X_te.copy().astype(np.float32)
+    for j in cont:
+        mu = X_tr[:, j].mean()
+        sigma = X_tr[:, j].std()
+        if sigma < 1e-9:
+            sigma = 1.0
+        X_tr_out[:, j] = (X_tr[:, j] - mu) / sigma
+        X_te_out[:, j] = (X_te[:, j] - mu) / sigma
+    return X_tr_out, X_te_out
+
+
+def _to_f32(arr, device: torch.device) -> torch.Tensor:
+    if hasattr(arr, "values"):
+        arr = arr.values
+    return torch.tensor(arr, dtype=torch.float32, device=device)
+
+
+def _load_enb(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Energy Efficiency — UCI 242, d=2 (Heating Load, Cooling Load)."""
+    from sklearn.model_selection import train_test_split
+    from ucimlrepo import fetch_ucirepo
+
+    ds = fetch_ucirepo(id=242)
+    X = ds.data.features.values.astype(np.float32)
+    y = ds.data.targets.values.astype(np.float32)
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_tr, X_te = _normalize_X_cols(X_tr, X_te)
+    return _to_f32(X_tr, device), _to_f32(y_tr, device), _to_f32(X_te, device), _to_f32(y_te, device), False
+
+
+def _load_student(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Student Performance — UCI 320, d=2 (G1, G2). dequantize=True (integer grades)."""
+    import pandas as pd
+    from sklearn.model_selection import train_test_split
+    from ucimlrepo import fetch_ucirepo
+
+    ds = fetch_ucirepo(id=320)
+    X_df = ds.data.features.copy()
+    y_df = ds.data.targets[["G1", "G2"]].copy()
+    valid = ~(X_df.isnull().any(axis=1) | y_df.isnull().any(axis=1))
+    X_df = X_df[valid].reset_index(drop=True)
+    y_df = y_df[valid].reset_index(drop=True)
+    cat_names = X_df.select_dtypes(include=["object", "category"]).columns.tolist()
+    X_df = pd.get_dummies(X_df, columns=cat_names, drop_first=False).astype(np.float32)
+    X = X_df.values
+    y = y_df.values.astype(np.float32)
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
+    ohe_cols = [j for j in range(X_tr.shape[1]) if set(np.unique(X_tr[:, j])).issubset({0.0, 1.0})]
+    X_tr, X_te = _normalize_X_cols(X_tr, X_te, cat_cols=ohe_cols)
+    return _to_f32(X_tr, device), _to_f32(y_tr, device), _to_f32(X_te, device), _to_f32(y_te, device), True
+
+
+def _load_comms_crime(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Communities & Crime — UCI 211, d=5 (murders, rapes, robberies, assaults, burglaries)."""
+    from sklearn.model_selection import train_test_split
+    from ucimlrepo import fetch_ucirepo
+
+    ds = fetch_ucirepo(id=211)
+    X_df = ds.data.features.fillna(ds.data.features.median())
+    target_cols = ["murders", "rapes", "robberies", "assaults", "burglaries"]
+    y_df = ds.data.targets[target_cols].dropna()
+    X_df = X_df.loc[y_df.index]
+    X = X_df.values.astype(np.float32)
+    y = y_df.values.astype(np.float32)
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_tr, X_te = _normalize_X_cols(X_tr, X_te)
+    return _to_f32(X_tr, device), _to_f32(y_tr, device), _to_f32(X_te, device), _to_f32(y_te, device), False
+
+
+# ---------------------------------------------------------------------------
+# Real-world copula evaluation (no oracle)
+# ---------------------------------------------------------------------------
+
+
+def _run_realworld_dataset(
+    name: str,
+    X_train: torch.Tensor,
+    Z_train: torch.Tensor,
+    X_test: torch.Tensor,
+    Z_test: torch.Tensor,
+    cfg,
+    ICL_model: nn.Module,
+    n_steps: int,
+    seed: int,
+    device: torch.device,
+) -> dict[str, float]:
+    """Train AttentionCopulaEstimator and evaluate all copula estimators on one real-world dataset.
+
+    No oracle is available; the sole metric is the Gaussian copula NLL on the held-out test set,
+    which is a proper scoring rule that requires no ground-truth correlation matrix.
+    """
+    torch.manual_seed(seed)
+
+    acfg = cfg.attn_copula
+    n_train, p = X_train.shape
+    n_test, d  = Z_test.shape
+
+    # ---- Val / pool split ----
+    n_val = max(1, int(round(0.2 * n_train)))
+    perm = torch.randperm(n_train, device=device)
+    val_idx, pool_idx = perm[:n_val], perm[n_val:]
+    X_val,  Z_val  = X_train[val_idx],  Z_train[val_idx]
+    X_pool, Z_pool = X_train[pool_idx], Z_train[pool_idx]
+    n_pool = X_pool.shape[0]
+
+    # ---- Train AttentionCopulaEstimator ----
+    model = AttentionCopulaEstimator(
+        p=p, d=d,
+        m=int(acfg.m),
+        n_heads=int(acfg.n_heads),
+        n_layers=int(acfg.n_layers),
+        dropout=float(acfg.dropout),
+        alpha=float(acfg.alpha),
+        lambda_min=float(acfg.lambda_min),
+        lambda_max=float(acfg.lambda_max),
+        include_outer=bool(acfg.include_outer),
+    ).to(device)
+
+    optimizer = Adam(model.parameters(), lr=float(acfg.lr), weight_decay=float(acfg.weight_decay))
+    warmup_steps = int(acfg.get("warmup_steps", 0))
+    cosine_steps = max(n_steps - warmup_steps, 1)
+    _cosine = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=float(acfg.lr_min))
+    if warmup_steps > 0:
+        _warmup = LinearLR(optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
+        scheduler = SequentialLR(optimizer, schedulers=[_warmup, _cosine], milestones=[warmup_steps])
+    else:
+        scheduler = _cosine
+
+    best_val_nll = float("inf")
+    best_state = copy.deepcopy(model.state_dict())
+    steps_since_improvement = 0
+    patience  = int(acfg.patience)
+    val_every = int(acfg.val_every)
+    clip_grad = float(acfg.clip_grad)
+
+    model.train()
+    for step in range(n_steps):
+        n_sup = max(1, int(round(0.8 * n_pool)))
+        perm_pool = torch.randperm(n_pool, device=device)
+        X_s, Z_s = X_pool[perm_pool[:n_sup]], Z_pool[perm_pool[:n_sup]]
+        X_q, Z_q = X_pool[perm_pool[n_sup:]], Z_pool[perm_pool[n_sup:]]
+        R_pred = model(X_s, Z_s, X_q)
+        loss = copula_nll_full(Z_q, R_pred)
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+        optimizer.step()
+        scheduler.step()
+
+        if step % val_every == 0:
+            model.eval()
+            with torch.no_grad():
+                R_val, _, _ = model(X_pool, Z_pool, X_val, return_gates=True)
+                val_nll = copula_nll_full(Z_val, R_val).item()
+            model.train()
+            if val_nll < best_val_nll:
+                best_val_nll = val_nll
+                best_state = copy.deepcopy(model.state_dict())
+                steps_since_improvement = 0
+            else:
+                steps_since_improvement += val_every
+            if steps_since_improvement >= patience:
+                break
+
+    model.load_state_dict(best_state)
+    model.eval()
+
+    # ---- Evaluate all estimators on Z_test ----
+    with torch.no_grad():
+        R_attn, _, _ = model(X_train, Z_train, X_test, return_gates=True)
+    attn_nll = copula_nll_full(Z_test, R_attn).item()
+
+    R_mom = moment_estimator(Z_train)
+    moment_nll = copula_nll_full(Z_test, R_mom.unsqueeze(0).expand(n_test, -1, -1)).item()
+
+    R_shrunk, _ = shrinkage_grid_cv(Z_train, Z_val)
+    shrunk_nll = copula_nll_full(Z_test, R_shrunk.unsqueeze(0).expand(n_test, -1, -1)).item()
+
+    nw_nll: dict[str, float] = {}
+    for kern in ("rbf", "epanechnikov", "laplace"):
+        nw_nll[kern] = copula_nll_full(Z_test, nw_corr(X_train, Z_train, X_test, kernel=kern)).item()
+
+    # ICL model — ICLCorrNetV2 handles d < d_max by padding Z_sup internally
+    with torch.no_grad():
+        X_all = torch.cat([X_train, X_test], dim=0).unsqueeze(0)
+        Z_all = torch.cat([Z_train, torch.zeros_like(Z_test)], dim=0).unsqueeze(0)
+        _, d_ICL, V_ICL = ICL_model(X_all, Z_all, n_support=n_train)
+    d_ICL, V_ICL = d_ICL.squeeze(0), V_ICL.squeeze(0)
+    Sigma_ICL = torch.diag_embed(d_ICL) + V_ICL @ V_ICL.transpose(-2, -1)
+    std_ICL   = Sigma_ICL.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+    R_ICL     = Sigma_ICL / (std_ICL.unsqueeze(-1) * std_ICL.unsqueeze(-2))
+    ICL_nll   = copula_nll_full(Z_test, R_ICL).item()
+
+    return {
+        "copula_nll/moment":        moment_nll,
+        "copula_nll/shrunk_moment": shrunk_nll,
+        "copula_nll/nw_rbf":        nw_nll["rbf"],
+        "copula_nll/nw_epan":       nw_nll["epanechnikov"],
+        "copula_nll/nw_laplace":    nw_nll["laplace"],
+        "copula_nll/attn":          attn_nll,
+        "copula_nll/ICL":           ICL_nll,
+    }
+
+
+def _print_realworld_table(results: dict[str, dict[str, float]]) -> None:
+    """Print copula NLL comparison table across real-world datasets."""
+    _METHODS = [
+        ("moment",        "Moment"),
+        ("shrunk_moment", "ShrunkMoment"),
+        ("nw_rbf",        "NW-RBF"),
+        ("nw_epan",       "NW-Epan"),
+        ("nw_laplace",    "NW-Lap"),
+        ("attn",          "Attention"),
+        ("ICL",           "ICL model"),
+    ]
+    ds_names = list(results.keys())
+    col_w = 14
+    total_w = 22 + col_w * len(ds_names)
+
+    print(f"\n  {'─' * total_w}")
+    print(f"  Real-world copula NLL (z-space) — lower is better")
+    print(f"  {'─' * total_w}")
+    print(f"  {'Method':<20}" + "".join(f"{n:>{col_w}}" for n in ds_names))
+    print(f"  {'─' * 20}" + "─" * (col_w * len(ds_names)))
+    for key, label in _METHODS:
+        row = f"  {label:<20}"
+        for ds in ds_names:
+            v = results[ds].get(f"copula_nll/{key}", float("nan"))
+            row += f"{v:>{col_w}.4f}"
+        print(row)
+    print(f"  {'─' * total_w}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +1095,8 @@ def main() -> None:
     )
     parser.add_argument("--no_plots", action="store_true",
                         help="Skip covariance plot generation (faster for testing)")
+    parser.add_argument("--tabicl_ckpt", default=None,
+                        help="TabICL checkpoint name for real-world PIT (default: cfg.tabicl.ckpt)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -898,6 +1154,11 @@ def main() -> None:
         _Z = torch.cat([_ep0["Z_train"][0], torch.zeros_like(_ep0["Z_test"][0])], dim=0).to(device).unsqueeze(0)
         ICL_model(_X, _Z, n_support=_ep0["X_train"].shape[1])
     del _ep0, _X, _Z
+
+    # ---- TabICL (for real-world PIT) ----------------------------------------
+    tabicl_ckpt_name = args.tabicl_ckpt or str(cfg.tabicl.ckpt)
+    print(f"\n--- Loading TabICL ({tabicl_ckpt_name}) for real-world PIT ---")
+    tabicl_model = load_tabicl(tabicl_ckpt_name, device)
 
     # ---- W&B ---------------------------------------------------------------
     wandb_run = None
@@ -1002,6 +1263,45 @@ def main() -> None:
 
     if wandb_run is not None:
         wandb_run.log(agg_metrics, step=n_comparison_datasets)
+
+    # ====================================================================
+    # Phase 5a — Real-world dataset evaluation (TabICL PIT)
+    # ====================================================================
+    _RW_LOADERS = [
+        ("ENB",        _load_enb),
+        ("StudentMat", _load_student),
+        ("CommsCrime", _load_comms_crime),
+    ]
+    rw_results: dict[str, dict[str, float]] = {}
+    print("\n--- Real-world dataset evaluation (TabICL PIT) ---")
+    try:
+        for ds_name, loader_fn in _RW_LOADERS:
+            print(f"  [{ds_name}] loading dataset and running PIT...")
+            X_tr, Y_tr, X_te, Y_te, dequantize = loader_fn(device)
+            Z_tr, Z_te, _ = run_pit(
+                tabicl_model, X_tr, Y_tr, X_te, Y_te,
+                pit_batch_size=int(cfg.tabicl.pit_batch_size),
+                eps=float(cfg.tabicl.pit_eps),
+                dequantize=dequantize,
+            )
+            print(f"  [{ds_name}] training AttentionCopulaEstimator and evaluating...")
+            rw_results[ds_name] = _run_realworld_dataset(
+                ds_name, X_tr, Z_tr, X_te, Z_te,
+                cfg, ICL_model, n_steps, args.seed, device,
+            )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {f"realworld/{ds_name}/{k}": v for k, v in rw_results[ds_name].items()},
+                    step=n_comparison_datasets,
+                )
+        _print_realworld_table(rw_results)
+    except ImportError as exc:
+        print(f"  Skipped real-world datasets: missing dependency ({exc})")
+        print("  Install with: conda run -n multivariate-icl pip install ucimlrepo scikit-learn")
+    except Exception as exc:
+        import traceback
+        print(f"  Real-world evaluation failed: {exc}")
+        traceback.print_exc()
 
     # ====================================================================
     # Phase 5 — Covariance plots (dataset 0 only)
