@@ -31,6 +31,9 @@ from __future__ import annotations
 import glob
 import os
 
+import random as _random
+
+import numpy as _np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -77,14 +80,23 @@ def split_episode_files(
     return files[:-n_val], files[-n_val:]
 
 
+def _worker_init_fn(worker_id: int) -> None:
+    """Seed numpy and Python random in each DataLoader worker for reproducibility."""
+    worker_seed = torch.initial_seed() % (2**32)
+    _random.seed(worker_seed)
+    _np.random.seed(worker_seed)
+
+
 def make_episode_loader(
     dataset_dir: str | None = None,
     shuffle: bool = True,
     num_workers: int = 2,
     files: list[str] | None = None,
+    seed: int | None = None,
 ) -> DataLoader:
     """Return a DataLoader that yields one pre-generated episode dict per iteration."""
     dataset = EpisodeDataset(dataset_dir=dataset_dir, files=files)
+    generator = torch.Generator().manual_seed(seed) if seed is not None else None
     return DataLoader(
         dataset,
         batch_size=1,
@@ -93,6 +105,8 @@ def make_episode_loader(
         collate_fn=_collate_episode,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=(num_workers > 0),
+        generator=generator,
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
     )
 
 

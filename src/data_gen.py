@@ -313,6 +313,314 @@ class IsotropicModulatedKernel:
         return L
 
 
+# ---------------------------------------------------------------------------
+# TabICL feature-kernel covariance generator
+# ---------------------------------------------------------------------------
+
+_TABICL_FUNC_NAMES = [
+    "linear",
+    "mlp",
+    "quadratic",
+    "product",
+    "nn_discretize",
+    "tree_ensemble",
+    "rff_gp",
+    "plateau",
+]
+
+
+def _tabicl_apply_func(
+    func_name: str,
+    Xin: torch.Tensor,       # (B, T, c)
+    q: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Apply one random function from the TabICLv2-inspired pool.
+
+    All weight tensors are sampled here (per batch element, per output-dim /
+    feature-slot call) with a leading B dim and NO T dim, enforcing the
+    construction-fixed-per-dataset invariant.
+
+    Args:
+        func_name : one of _TABICL_FUNC_NAMES
+        Xin       : (B, T, c) input
+        q         : output embedding dim
+
+    Returns:
+        out : (B, T, q)
+    """
+    B, T, c = Xin.shape
+
+    if func_name == "linear":
+        # A:(B,q,c), b:(B,q)
+        A = torch.randn(B, q, c, device=device) * math.sqrt(2.0 / max(c, 1))
+        b = torch.zeros(B, q, device=device)
+        return torch.bmm(Xin, A.transpose(-2, -1)) + b.unsqueeze(1)
+
+    elif func_name == "mlp":
+        H = max(q * 2, 8)
+        W1 = torch.randn(B, H, c, device=device) * math.sqrt(2.0 / max(c, 1))
+        b1 = torch.zeros(B, H, device=device)
+        W2 = torch.randn(B, q, H, device=device) * math.sqrt(2.0 / H)
+        b2 = torch.zeros(B, q, device=device)
+        h = F.relu(torch.bmm(Xin, W1.transpose(-2, -1)) + b1.unsqueeze(1))
+        # random activation drawn once per call (not per T)
+        act_choice = torch.randint(3, (1,)).item()
+        if act_choice == 0:
+            h = torch.tanh(h)
+        elif act_choice == 1:
+            h = F.gelu(h)
+        # else keep relu output
+        return torch.bmm(h, W2.transpose(-2, -1)) + b2.unsqueeze(1)
+
+    elif func_name == "quadratic":
+        # linear proj then element-wise square + another linear mix
+        A1 = torch.randn(B, q, c, device=device) * math.sqrt(2.0 / max(c, 1))
+        A2 = torch.randn(B, q, c, device=device) * math.sqrt(2.0 / max(c, 1))
+        lin = torch.bmm(Xin, A1.transpose(-2, -1))
+        sq = torch.bmm(Xin, A2.transpose(-2, -1)) ** 2
+        mix = torch.randn(B, q, device=device) * 0.5
+        return lin + mix.unsqueeze(1) * sq
+
+    elif func_name == "product":
+        # product of 2 random linear projections, each (B,T,q)
+        n_factors = 2
+        out = torch.ones(B, T, q, device=device)
+        for _ in range(n_factors):
+            A = torch.randn(B, q, c, device=device) * math.sqrt(1.0 / max(c, 1))
+            out = out * torch.bmm(Xin, A.transpose(-2, -1))
+        return out
+
+    elif func_name == "nn_discretize":
+        # K random centroids in c-space; nearest-centroid → per-centroid embedding
+        K = max(q, 4)
+        centroids = torch.randn(B, K, c, device=device)   # (B, K, c)
+        embs = torch.randn(B, K, q, device=device) * 0.5  # (B, K, q)
+        # pairwise distances: (B, T, K)
+        diff = Xin.unsqueeze(2) - centroids.unsqueeze(1)   # (B, T, K, c)
+        dists = (diff ** 2).sum(-1)                         # (B, T, K)
+        idx = dists.argmin(dim=-1)                          # (B, T)
+        # gather: for each (b,t) pick embs[b, idx[b,t], :]
+        idx_exp = idx.unsqueeze(-1).expand(B, T, q)
+        embs_exp = embs.unsqueeze(1).expand(B, T, K, q)
+        return embs_exp.gather(2, idx_exp.unsqueeze(2)).squeeze(2)
+
+    elif func_name == "tree_ensemble":
+        # sum of random axis-aligned soft step functions (piecewise-constant surrogate)
+        n_trees = 4
+        feat_idx = torch.randint(c, (B, n_trees), device=device)   # (B, n_trees)
+        thresholds = torch.randn(B, n_trees, device=device)         # (B, n_trees)
+        out_embs = torch.randn(B, n_trees, q, device=device)        # (B, n_trees, q)
+        # extract selected feature for each tree: (B, T, n_trees)
+        feat_vals = Xin.gather(
+            2, feat_idx.unsqueeze(1).expand(B, T, n_trees)
+        )                                                             # (B, T, n_trees)
+        # soft step: sigmoid(50 * (feat - threshold))
+        steps = torch.sigmoid(50.0 * (feat_vals - thresholds.unsqueeze(1)))  # (B, T, n_trees)
+        # weighted sum over trees: (B, T, q)
+        return torch.einsum("btn,bnq->btq", steps, out_embs)
+
+    elif func_name == "rff_gp":
+        # random Fourier features: Σ_k a_k cos(Ω_k · x + φ_k)
+        n_rff = max(q * 4, 16)
+        Omega = torch.randn(B, n_rff, c, device=device)       # (B, n_rff, c)
+        phi = torch.rand(B, n_rff, device=device) * 2 * math.pi
+        proj = torch.bmm(Xin, Omega.transpose(-2, -1)) + phi.unsqueeze(1)  # (B, T, n_rff)
+        feats = torch.cos(proj) * math.sqrt(2.0 / n_rff)                   # (B, T, n_rff)
+        A_out = torch.randn(B, q, n_rff, device=device) * math.sqrt(2.0 / n_rff)
+        return torch.bmm(feats, A_out.transpose(-2, -1))
+
+    elif func_name == "plateau":
+        # sum of a few soft logistic plateaus: a·σ(k·(x−lo)) − a·σ(k·(x−hi))
+        n_plateaus = 3
+        feat_idx = torch.randint(c, (B, n_plateaus), device=device)
+        lo = torch.randn(B, n_plateaus, device=device) - 0.5
+        hi = lo + torch.rand(B, n_plateaus, device=device).clamp(min=0.2)
+        steepness = torch.rand(B, n_plateaus, device=device) * 8 + 2
+        out_embs = torch.randn(B, n_plateaus, q, device=device)
+        feat_vals = Xin.gather(
+            2, feat_idx.unsqueeze(1).expand(B, T, n_plateaus)
+        )                                                              # (B, T, n_plateaus)
+        lo_u = lo.unsqueeze(1)
+        hi_u = hi.unsqueeze(1)
+        k_u = steepness.unsqueeze(1)
+        activations = (
+            torch.sigmoid(k_u * (feat_vals - lo_u))
+            - torch.sigmoid(k_u * (feat_vals - hi_u))
+        )                                                              # (B, T, n_plateaus)
+        return torch.einsum("btn,bnq->btq", activations, out_embs)
+
+    else:
+        raise ValueError(f"Unknown func_name: {func_name!r}")
+
+
+class TabICLFeatureKernel:
+    """Per-instance d×d correlation matrices via instance-dependent output-dim embeddings.
+
+    Generalises IsotropicModulatedKernel: instead of a single scalar lengthscale
+    modulating a fixed per-dataset geometry, each output dimension m gets a
+    q-dim embedding W_m(x) built from a random TabICLv2-style program applied to
+    sampled input features.  The per-instance correlation matrix is then
+
+        Σ_mn(x) = k( ‖W_m(x) − W_n(x)‖₂ ,  l_b )
+
+    where l_b is a per-dataset (per batch element) lengthscale and k is a
+    stationary isotropic kernel.
+
+    **Construction-fixed-per-dataset invariant**: all random structure (feature
+    subsets, function weights, aggregation ops, kernel/lengthscale) is sampled
+    once per __call__ with a leading B dim and no T dim.  W_m(x) varies across
+    instances only because x does, not because the program is re-sampled.
+
+    Generative process (per __call__, all priors fresh per episode):
+
+      For each output dim m (independently):
+        1. Sample n_feat ~ U{1 .. max_feats}, draw feature indices S_m ∈ {0..p-1}^n_feat.
+        2. Sample aggregation mode:
+             concat   — apply ONE function g:(B,T,n_feat)→(B,T,q)
+             separate — apply n_feat functions g_j:(B,T,1)→(B,T,q) then
+                        aggregate element-wise (sum | product | max | logsumexp)
+        3. W[:,  :, m, :] ← result ∈ (B, T, q)
+
+      Standardise W over the T axis per (b,m,q) → W normalised.
+
+      Per-batch lengthscale: l_b ~ LogU(lengthscale_lo, lengthscale_hi).
+
+      Pairwise distance:  r_mn = ‖W_m − W_n‖₂  over q  →  (B, T, d, d).
+
+      Kernel:  K_mn = kernel_fn(r_mn, l_b).
+
+      Correlation + nugget:  C = (1−ε)K + ε I   (unit diagonal by construction).
+
+      Cholesky:  L  s.t.  L Lᵀ = C.
+
+    Supported kernels (same as IsotropicModulatedKernel):
+        rbf      — exp(−r²/(2l²))
+        matern12 — exp(−r/l)
+        matern32 — (1 + √3 r/l) exp(−√3 r/l)
+        matern52 — (1 + √5 r/l + 5r²/(3l²)) exp(−√5 r/l)
+        random   — one of the above chosen uniformly per episode
+
+    Function pool (set func_pool to a subset of _TABICL_FUNC_NAMES to restrict):
+        linear, mlp, quadratic, product, nn_discretize,
+        tree_ensemble, rff_gp, plateau
+    """
+
+    KERNELS: list[str] = _ISO_KERNEL_NAMES
+    is_copula_gen: bool = True
+
+    def __init__(
+        self,
+        kernel_type: str = "random",
+        nugget: float = 1e-4,
+        embed_dim: int = 4,
+        max_feats: int = 3,
+        lengthscale_lo: float = 0.1,
+        lengthscale_hi: float = 10.0,
+        func_pool: list[str] | None = None,
+    ) -> None:
+        if kernel_type not in self.KERNELS + ["random"]:
+            raise ValueError(
+                f"Unknown kernel_type {kernel_type!r}. "
+                f"Choose from {self.KERNELS + ['random']}"
+            )
+        self.kernel_type = kernel_type
+        self.nugget = nugget
+        self.embed_dim = embed_dim
+        self.max_feats = max(1, max_feats)
+        self.lengthscale_lo = lengthscale_lo
+        self.lengthscale_hi = lengthscale_hi
+        self.func_pool = func_pool if func_pool is not None else _TABICL_FUNC_NAMES
+
+    def __call__(self, X: torch.Tensor, d: int) -> torch.Tensor:
+        """Build per-instance Cholesky factors L(x_i) of the correlation matrix C(x_i).
+
+        Args:
+            X : (B, T, p) — z-normalised input features
+            d : target dimension
+
+        Returns:
+            L : (B, T, d, d) — lower-triangular Cholesky factor of C(x_i)
+        """
+        B, T, p = X.shape
+        device = X.device
+        q = self.embed_dim
+        eps = self.nugget
+
+        kernel_name = (
+            _ISO_KERNEL_NAMES[torch.randint(len(_ISO_KERNEL_NAMES), (1,)).item()]
+            if self.kernel_type == "random"
+            else self.kernel_type
+        )
+        kernel_fn = _STATIONARY_KERNEL_FNS[kernel_name]
+
+        # Per-batch lengthscale: l_b ~ LogU(lo, hi),  shape (B, 1, 1, 1)
+        log_lo = math.log(self.lengthscale_lo)
+        log_hi = math.log(self.lengthscale_hi)
+        l_b = torch.empty(B, device=device).uniform_(log_lo, log_hi).exp()
+        l = l_b.view(B, 1, 1, 1)   # broadcast over (T, d, d)
+
+        _AGG_OPS = ["sum", "product", "max", "logsumexp"]
+        pool = self.func_pool
+
+        # Build W ∈ (B, T, d, q) — one embedding per output dim per instance
+        W = torch.zeros(B, T, d, q, device=device)
+        for m in range(d):
+            # Sample number of features and which features (per dataset)
+            n_feat = int(torch.randint(1, self.max_feats + 1, (1,)).item())
+            # Per-batch feature indices: (B, n_feat) — fixed for this dim m
+            feat_idx = torch.stack(
+                [torch.randperm(p, device=device)[:n_feat] for _ in range(B)]
+            )  # (B, n_feat)
+
+            # Gather selected features: (B, T, n_feat)
+            Xsel = X.gather(2, feat_idx.unsqueeze(1).expand(B, T, n_feat))
+
+            agg_mode = "concat" if torch.rand(1).item() < 0.5 else "separate"
+
+            if agg_mode == "concat" or n_feat == 1:
+                func_name = pool[torch.randint(len(pool), (1,)).item()]
+                w_m = _tabicl_apply_func(func_name, Xsel, q, device)  # (B, T, q)
+            else:
+                agg_op = _AGG_OPS[torch.randint(len(_AGG_OPS), (1,)).item()]
+                parts = []
+                for j in range(n_feat):
+                    func_name = pool[torch.randint(len(pool), (1,)).item()]
+                    xj = Xsel[:, :, j : j + 1]   # (B, T, 1)
+                    parts.append(_tabicl_apply_func(func_name, xj, q, device))
+                stacked = torch.stack(parts, dim=0)  # (n_feat, B, T, q)
+                if agg_op == "sum":
+                    w_m = stacked.sum(0)
+                elif agg_op == "product":
+                    w_m = stacked.prod(0)
+                elif agg_op == "max":
+                    w_m = stacked.max(0).values
+                else:  # logsumexp
+                    w_m = stacked.logsumexp(0)
+
+            W[:, :, m, :] = w_m
+
+        # Standardize W over the T axis per (b, m, q) to keep distances O(1)
+        W_mean = W.mean(dim=1, keepdim=True)            # (B, 1, d, q)
+        W_std = W.std(dim=1, keepdim=True).clamp(min=1e-6)
+        W = (W - W_mean) / W_std                        # (B, T, d, q)
+
+        # Pairwise Euclidean distance between output-dim embeddings: (B, T, d, d)
+        # W_m ∈ (B, T, q) for each m; diff[b,t,m,n] = W[b,t,m,:] - W[b,t,n,:]
+        diff = W.unsqueeze(3) - W.unsqueeze(2)          # (B, T, d, d, q)
+        r = (diff ** 2).sum(-1).clamp(min=0).sqrt()     # (B, T, d, d)
+
+        # Kernel evaluation — l broadcasts over (T, d, d)
+        K = kernel_fn(r, l)                              # (B, T, d, d)
+
+        # Nugget → exact unit diagonal (k(0)=1 by construction of stationary kernels)
+        I_d = torch.eye(d, device=device).view(1, 1, d, d)
+        C = (1.0 - eps) * K + eps * I_d                 # (B, T, d, d)
+
+        L = torch.linalg.cholesky(C.reshape(B * T, d, d)).reshape(B, T, d, d)
+        return L
+
+
 class KernelCovGen:
     """Per-instance x-dependent covariance via MLP-parameterized GP kernels.
 
@@ -409,12 +717,12 @@ class KernelCovGen:
             K = s * (1.0 + rs) * torch.exp(-rs)
         elif kernel == "rational_quadratic":
             alpha = math.exp(
-                math.log(0.1) + (math.log(10.0) - math.log(0.1)) * torch.rand(1).item()
+                math.log(0.1) + (math.log(10.0) - math.log(0.1)) * torch.rand(1, device=device).item()
             )
             K = s * (1.0 + sq_d / (2 * alpha * l**2)).pow(-alpha)
         elif kernel == "periodic":
             p_period = math.exp(
-                math.log(0.5) + (math.log(5.0) - math.log(0.5)) * torch.rand(1).item()
+                math.log(0.5) + (math.log(5.0) - math.log(0.5)) * torch.rand(1, device=device).item()
             )
             K = s * torch.exp(-2.0 * torch.sin(math.pi * r_d / p_period).pow(2) / l**2)
         else:

@@ -24,7 +24,10 @@ import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 
+import random as _random
+
 import hydra
+import numpy as _np
 import torch
 from omegaconf import DictConfig
 from tqdm import tqdm
@@ -36,7 +39,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _HERE)
 
-from data_gen import GlobalAnchorCovGen, GlobalFixedNets, IsotropicModulatedKernel, KernelCovGen, generate_episode
+from data_gen import GlobalAnchorCovGen, GlobalFixedNets, IsotropicModulatedKernel, KernelCovGen, TabICLFeatureKernel, generate_episode
 from pit import load_tabicl, run_pit_batched
 
 # ---------------------------------------------------------------------------
@@ -97,6 +100,15 @@ def _auto_dataset_name(cfg) -> str:
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
+    # ---- Seed (top-level cfg.seed; use 0 as default so generation is reproducible) ----
+    seed = int(cfg.get("seed", 0))
+    _random.seed(seed)
+    _np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    print(f"Seed : {seed}")
+
     # ---- Device ----
     device = cfg.training.device
     if device == "auto":
@@ -202,6 +214,25 @@ def main(cfg: DictConfig) -> None:
             print(
                 f"IsotropicModulatedKernel: kernel={iso_kernel_type}, "
                 f"nugget={iso_kernel_nugget}"
+            )
+        elif cov_type == "tabicl_kernel":
+            tabicl_kernel_type = str(cfg.data.get("tabicl_kernel_type", "random"))
+            tabicl_kernel_nugget = float(cfg.data.get("tabicl_kernel_nugget", 1e-4))
+            tabicl_embed_dim = int(cfg.data.get("tabicl_embed_dim", 4))
+            tabicl_max_feats = int(cfg.data.get("tabicl_max_feats", 3))
+            tabicl_ls_lo = float(cfg.data.get("tabicl_lengthscale_lo", 0.1))
+            tabicl_ls_hi = float(cfg.data.get("tabicl_lengthscale_hi", 10.0))
+            kernel_cov_gen = TabICLFeatureKernel(
+                kernel_type=tabicl_kernel_type,
+                nugget=tabicl_kernel_nugget,
+                embed_dim=tabicl_embed_dim,
+                max_feats=tabicl_max_feats,
+                lengthscale_lo=tabicl_ls_lo,
+                lengthscale_hi=tabicl_ls_hi,
+            )
+            print(
+                f"TabICLFeatureKernel: kernel={tabicl_kernel_type}, "
+                f"embed_dim={tabicl_embed_dim}, max_feats={tabicl_max_feats}"
             )
         else:
             fixed_nets = GlobalFixedNets(r=r_data, hidden=mlp_hidden, device=device)
