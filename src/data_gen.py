@@ -1235,15 +1235,16 @@ def generate_episode(
 
         elif kernel_cov_gen is not None:
             # Kernel-based: full x-dependent distribution.
-            # IsotropicModulatedKernel sets is_copula_gen=True, meaning V_x is
-            # the Cholesky of a correlation matrix (diagonal = 1) — no extra
-            # diagonal noise should be added so the copula structure is preserved.
+            # Copula generators (is_copula_gen=True) return V_x as the Cholesky of
+            # a correlation matrix.  We still add diag_alpha_t so that oracle_D > 0
+            # and the oracle correlation matrix stays well-conditioned across all
+            # dataset types.
             mu_net = BatchedRandomMLP(
                 B, p_in=p, p_out=d, hidden=mlp_hidden, device=device
             )
             mu_x = mu_net(X)  # (B, T, d)
             if getattr(kernel_cov_gen, "is_copula_gen", False):
-                diag_x = torch.zeros(B, T, d, device=device, dtype=X.dtype)
+                diag_x = torch.ones(B, T, d, device=device, dtype=X.dtype) * diag_alpha_t
             else:
                 diag_net = BatchedRandomMLP(
                     B, p_in=p, p_out=d, hidden=mlp_hidden, device=device

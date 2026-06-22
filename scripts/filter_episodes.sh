@@ -1,6 +1,6 @@
 #!/bin/bash
 #OAR -n TabICL_Filter
-#OAR -l gpu=0,walltime=4:00:00
+#OAR -l gpu=1,walltime=6:00:00
 
 set -e
 
@@ -24,6 +24,7 @@ N_TREES="${N_TREES:-64}"
 MIN_NBHD="${MIN_NBHD:-32}"
 SEED="${SEED:-0}"
 SPLIT="${SPLIT:-train}"
+DEVICE="${DEVICE:-cuda}"         # cuda | cpu  (cuda uses GPU-batched kNN path)
 
 echo "======================================================="
 echo " filter_episodes"
@@ -31,7 +32,7 @@ echo "   input  : $INPUT_DIR"
 echo "   output : $OUTPUT_DIR"
 echo "   manifest: $MANIFEST"
 echo "   keep   : $KEEP_FRACTION"
-echo "   workers: $WORKERS  K=$K  B=$B_BOOTSTRAP  trees=$N_TREES"
+echo "   workers: $WORKERS  K=$K  B=$B_BOOTSTRAP  trees=$N_TREES  device=$DEVICE"
 echo " (Job ID: ${OAR_JOB_ID:-local})"
 echo "======================================================="
 
@@ -53,6 +54,7 @@ MANIFEST       = Path("$MANIFEST")
 KEEP_FRACTION  = float("$KEEP_FRACTION")
 WORKERS        = int("$WORKERS")
 SPLIT          = "$SPLIT"
+DEVICE         = "$DEVICE"
 
 config = FilterConfig(
     K=$K,
@@ -72,7 +74,7 @@ log.info("Found %d episode files", len(episode_files))
 
 def _filter_one(path):
     try:
-        return str(path), filter_episode_file(str(path), config, split=SPLIT)
+        return str(path), filter_episode_file(str(path), config, split=SPLIT, device=DEVICE)
     except Exception as e:
         log.warning("Skipping %s: %s", path, e)
         return str(path), []
