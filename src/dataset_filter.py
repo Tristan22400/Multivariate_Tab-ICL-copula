@@ -333,13 +333,10 @@ def select_for_pretraining(
     results: List[FilterResult],
     *,
     target_keep_fraction: float = 0.65,
-    retain_simple_fraction: float = 0.12,
     seed: int = 0,
 ) -> List[bool]:
     """
-    Calibrate a score threshold to keep ~target_keep_fraction of datasets, then
-    deliberately retain retain_simple_fraction * n datasets from the rejected pool,
-    spread across the score range, so constant-R structure stays in the prior.
+    Calibrate a score threshold to keep ~target_keep_fraction of datasets by score rank.
 
     Returns a list[bool] aligned with results (True = include in pretraining).
     """
@@ -354,40 +351,9 @@ def select_for_pretraining(
     keep_mask[order[:k_target]] = True
     n_kept = int(keep_mask.sum())
 
-    # Identify rejected datasets
-    reject_idx = np.where(~keep_mask)[0]
-    n_retain_simple = max(0, int(round(retain_simple_fraction * n)))
-    n_retain_simple = min(n_retain_simple, len(reject_idx))
-
-    n_retained = 0
-    if n_retain_simple > 0 and len(reject_idx) > 0:
-        rng = np.random.default_rng(seed)
-        reject_scores = scores[reject_idx]
-
-        # Sample spread across the score range of rejected datasets
-        percentiles = np.linspace(0, 100, n_retain_simple + 2)[1:-1]
-        score_targets = np.percentile(reject_scores, percentiles)
-
-        chosen: list = []
-        for st in score_targets:
-            nearest = int(reject_idx[np.argmin(np.abs(reject_scores - st))])
-            if nearest not in chosen:
-                chosen.append(nearest)
-
-        # Top-up with random draws if percentile approach gave fewer than needed
-        remaining = [int(i) for i in reject_idx if i not in chosen]
-        while len(chosen) < n_retain_simple and remaining:
-            idx = int(rng.integers(len(remaining)))
-            chosen.append(remaining.pop(idx))
-
-        for i in chosen:
-            keep_mask[i] = True
-        n_retained = len(chosen)
-
     logger.info(
-        "select_for_pretraining: kept %d/%d (%.1f%%), retained %d simple datasets "
-        "(target retain_simple_fraction=%.2f)",
-        n_kept, n, 100.0 * n_kept / n, n_retained, retain_simple_fraction,
+        "select_for_pretraining: kept %d/%d (%.1f%%)",
+        n_kept, n, 100.0 * n_kept / n,
     )
 
     return list(keep_mask.tolist())

@@ -433,7 +433,6 @@ def _run_realworld_dataset(
     for kern in ("rbf", "epanechnikov", "laplace"):
         nw_nll[kern] = copula_nll_full(Z_test, nw_corr(X_train, Z_train, X_test, kernel=kern)).item()
 
-    # ICL model — ICLCorrNetV2 handles d < d_max by padding Z_sup internally
     with torch.no_grad():
         X_all = torch.cat([X_train, X_test], dim=0).unsqueeze(0)
         Z_all = torch.cat([Z_train, torch.zeros_like(Z_test)], dim=0).unsqueeze(0)

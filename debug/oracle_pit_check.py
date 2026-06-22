@@ -88,7 +88,7 @@ def true_pit_z(Y: torch.Tensor, oracle_mu: torch.Tensor,
 
 
 def load_model(ckpt_path: str, device: str):
-    from model import build_copula_tabicl_v2, build_copula_tabicl_v3, build_icl_corr_net_v2
+    from model import build_copula_tabicl_v2, build_copula_tabicl_v3
     from omegaconf import OmegaConf
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg = ckpt["cfg"]
@@ -102,8 +102,6 @@ def load_model(ckpt_path: str, device: str):
     model_type = str(model_cfg.get("name", model_cfg.get("type", "copula_tabicl_v2")))
     if "v3" in model_type:
         model = build_copula_tabicl_v3(cfg_for_build)
-    elif "icl_corr_net" in model_type:
-        model = build_icl_corr_net_v2(cfg_for_build)
     else:
         model = build_copula_tabicl_v2(cfg_for_build)
 

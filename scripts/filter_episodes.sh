@@ -17,7 +17,6 @@ INPUT_DIR="${INPUT_DIR:-data/pit_episodes}"
 OUTPUT_DIR="${OUTPUT_DIR:-data/pit_episodes_filtered}"
 MANIFEST="${MANIFEST:-data/filter_manifest.json}"
 KEEP_FRACTION="${KEEP_FRACTION:-0.65}"
-SIMPLE_FRACTION="${SIMPLE_FRACTION:-0.12}"
 WORKERS="${WORKERS:-4}"
 K="${K:-5}"
 B_BOOTSTRAP="${B_BOOTSTRAP:-200}"
@@ -31,7 +30,7 @@ echo " filter_episodes"
 echo "   input  : $INPUT_DIR"
 echo "   output : $OUTPUT_DIR"
 echo "   manifest: $MANIFEST"
-echo "   keep   : $KEEP_FRACTION  simple: $SIMPLE_FRACTION"
+echo "   keep   : $KEEP_FRACTION"
 echo "   workers: $WORKERS  K=$K  B=$B_BOOTSTRAP  trees=$N_TREES"
 echo " (Job ID: ${OAR_JOB_ID:-local})"
 echo "======================================================="
@@ -52,7 +51,6 @@ INPUT_DIR      = Path("$INPUT_DIR")
 OUTPUT_DIR     = Path("$OUTPUT_DIR")
 MANIFEST       = Path("$MANIFEST")
 KEEP_FRACTION  = float("$KEEP_FRACTION")
-SIMPLE_FRACTION= float("$SIMPLE_FRACTION")
 WORKERS        = int("$WORKERS")
 SPLIT          = "$SPLIT"
 
@@ -113,7 +111,6 @@ log.info("Calibrating global threshold over %d datasets …", len(flat_results))
 global_keep = select_for_pretraining(
     flat_results,
     target_keep_fraction=KEEP_FRACTION,
-    retain_simple_fraction=SIMPLE_FRACTION,
     seed=$SEED,
 )
 
@@ -160,7 +157,7 @@ manifest = {
     "config": {
         "K": $K, "B_bootstrap": $B_BOOTSTRAP,
         "n_trees": $N_TREES, "min_neighborhood_size": $MIN_NBHD,
-        "keep_fraction": KEEP_FRACTION, "simple_fraction": SIMPLE_FRACTION,
+        "keep_fraction": KEEP_FRACTION,
     },
     "episodes": {
         Path(p).name: {

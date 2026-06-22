@@ -123,9 +123,6 @@ class SwiGLUFFN(nn.Module):
         return self.dropout(self.w3(F.silu(self.w1(x)) * self.w2(x)))
 
 
-# ---------------------------------------------------------------------------
-# ICLCorrNetV2 — joint pre-norm transformer with masked instance attention
-# ---------------------------------------------------------------------------
 
 
 class MaskedSelfAttnBlock(nn.Module):
@@ -155,200 +152,6 @@ class MaskedSelfAttnBlock(nn.Module):
         x   = x + self.attn(x_n, x_n, x_n, attn_mask=attn_mask, need_weights=False)[0]
         x   = x + self.ffn(self.norm2(x))
         return x
-
-
-class ICLCorrNetV2(nn.Module):
-    """ICLCorrNetV2 — joint masked transformer with pre-norm support encoding.
-
-    All N instances (support + query) are embedded into a single sequence and
-    processed by a stack of pre-norm masked self-attention blocks.  The mask
-    blocks query positions from acting as keys, so:
-
-      • Support tokens attend to all other support tokens (dataset-level context).
-      • Query tokens attend to all support tokens (but not to other query tokens).
-
-    This collapses the separate "support self-attn → cross-attn" pipeline into
-    one unified transformer, avoiding the artificial split between stages.
-
-    **Embedding**:
-      • All tokens start from ``enc_x(X_all_padded)`` (X-only, shared encoder).
-      • Support tokens additionally receive ``enc_z(vech(Z_sup ⊗ Z_sup))``, which
-        injects per-instance pairwise covariance signal before the first block.
-        Query tokens get no Z injection (their Z is unobserved at inference time).
-
-    **Readout**: query token positions after the final block → Woodbury MLP.
-
-    Interface: mu_Z, d_Z, V_Z = model(X_all, Z_all, n_support=N)
-
-    Args:
-        p_max    : maximum number of input feature columns.
-        d_max    : maximum number of target dimensions.
-        d_hidden : hidden dimension for all layers.
-        n_heads  : attention heads (must divide d_hidden).
-        n_layers : number of stacked MaskedSelfAttnBlock blocks.
-        rank     : Woodbury low-rank factor size r.
-        dropout  : dropout probability (default 0.0).
-    """
-
-    def __init__(
-        self,
-        p_max:    int,
-        d_max:    int,
-        d_hidden: int   = 256,
-        n_heads:  int   = 8,
-        n_layers: int   = 6,
-        rank:     int   = 8,
-        dropout:  float = 0.0,
-    ) -> None:
-        super().__init__()
-        self.p_max    = p_max
-        self.d_max    = d_max
-        self.d_hidden = d_hidden
-        self.rank_max = rank
-
-        d_vech = d_max * (d_max + 1) // 2
-
-        # X encoder shared across all instances
-        self.enc_x = nn.Sequential(
-            nn.Linear(p_max, d_hidden), RMSNorm(d_hidden), nn.GELU(),
-            nn.Linear(d_hidden, d_hidden),
-        )
-
-        # Z-covariance encoder for support tokens only.
-        # Input is [Z_sup, vech(Z⊗Z)] so the model sees both raw Z values
-        # (preserving sign) and pairwise products.  bias=True because the
-        # diagonal of vech has non-zero mean (~1 for standard-normal Z).
-        self.enc_z        = nn.Linear(d_max + d_vech, d_hidden, bias=True)
-        self.z_gate       = nn.Parameter(torch.tensor(-1.0))   # sigmoid≈0.27 at init
-        self.sup_emb_norm  = RMSNorm(d_hidden)
-        self.query_emb_norm = RMSNorm(d_hidden)
-
-        # Joint masked transformer
-        self.blocks = nn.ModuleList([
-            MaskedSelfAttnBlock(d_hidden, n_heads, dropout)
-            for _ in range(n_layers)
-        ])
-        self.out_norm = RMSNorm(d_hidden)
-
-        # Readout: query_tok → d_max × rank
-        self.readout_U = nn.Sequential(
-            nn.Linear(d_hidden, d_hidden), nn.GELU(),
-            nn.Linear(d_hidden, d_max * rank),
-        )
-
-        ti, tj = torch.tril_indices(d_max, d_max)
-        self.register_buffer("ti", ti)
-        self.register_buffer("tj", tj)
-
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        nn.init.normal_(self.readout_U[-1].weight, std=0.1)
-        nn.init.zeros_(self.readout_U[-1].bias)
-
-    def forward(
-        self,
-        X_all:     torch.Tensor,
-        Z_all:     torch.Tensor,
-        n_support: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            X_all     : (B, N, p) — all instances (support + query).
-            Z_all     : (B, N, d) — only rows 0..n_support-1 are used.
-            n_support : number of support instances.
-
-        Returns:
-            mu_Z : (B, n_query, d)    — zero (copula mean fixed at 0).
-            d_Z  : (B, n_query, d)    — diagonal of the correlation matrix.
-            V_Z  : (B, n_query, d, r) — low-rank factor W.  R_ii = 1.
-        """
-        B, N, p = X_all.shape
-        d       = Z_all.shape[-1]
-        n_query = N - n_support
-
-        # Pad / truncate X to p_max
-        if p < self.p_max:
-            X_in = F.pad(X_all, (0, self.p_max - p))
-        elif p > self.p_max:
-            X_in = X_all[..., : self.p_max]
-        else:
-            X_in = X_all
-
-        # [Z_sup, vech(Z_sup ⊗ Z_sup)] — raw Z (preserves sign) + pairwise products
-        Z_sup = Z_all[:, :n_support]
-        if d < self.d_max:
-            Z_sup_pad = F.pad(Z_sup, (0, self.d_max - d))
-        else:
-            Z_sup_pad = Z_sup[..., : self.d_max]
-        outer  = Z_sup_pad.unsqueeze(-1) * Z_sup_pad.unsqueeze(-2)  # (B,n_sup,d_max,d_max)
-        vech   = outer[:, :, self.ti, self.tj]                       # (B,n_sup,d_vech)
-        z_in   = torch.cat([Z_sup_pad, vech], dim=-1)                # (B,n_sup,d_max+d_vech)
-
-        # Embed all instances from X; inject Z signal into support tokens.
-        # Use cat instead of in-place writes — two consecutive in-place ops on tok
-        # cause autograd version-counter errors during backward.
-        raw = self.enc_x(X_in)                                        # (B, N, d_hidden)
-        z_emb = self.enc_z(z_in)                                      # (B, n_sup, d_hidden)
-        sup_tok = self.sup_emb_norm(
-            raw[:, :n_support] + torch.sigmoid(self.z_gate) * z_emb
-        )                                                              # (B, n_sup, d_hidden)
-        qry_tok = self.query_emb_norm(raw[:, n_support:])             # (B, n_qry, d_hidden)
-        tok = torch.cat([sup_tok, qry_tok], dim=1)                    # (B, N, d_hidden)
-
-        # Causal mask: block query positions from acting as keys.
-        # Shape (N, N); broadcast over B by nn.MultiheadAttention automatically.
-        mask = torch.zeros(N, N, dtype=tok.dtype, device=tok.device)
-        if n_query > 0:
-            mask[:, n_support:] = float("-inf")
-
-        # Joint masked transformer over all N instance tokens
-        for block in self.blocks:
-            tok = block(tok, attn_mask=mask)
-
-        tok = self.out_norm(tok)
-
-        # Readout from query positions
-        query_tok = tok[:, n_support:]                               # (B, n_query, d_hidden)
-        U_flat = self.readout_U(query_tok)
-        U      = U_flat.reshape(B, n_query, self.d_max, self.rank_max)
-        U      = U[..., :d, :]
-
-        # Woodbury reparameterisation: R_ii = C_diag_i + ||W_i||² = 1
-        U_sq_norm = (U ** 2).sum(dim=-1)
-        C_diag    = 1.0 / (1.0 + U_sq_norm)
-        W         = U / (1.0 + U_sq_norm.unsqueeze(-1)).sqrt()
-
-        mu_Z = torch.zeros(B, n_query, d, dtype=X_all.dtype, device=X_all.device)
-        return mu_Z, C_diag, W
-
-
-def build_icl_corr_net_v2(cfg) -> ICLCorrNetV2:
-    """Instantiate an ICLCorrNetV2 from a Hydra DictConfig.
-
-    Expected config keys under ``cfg.model``:
-      d_hidden, n_heads, n_layers, p_max, d_max, rank, dropout (optional).
-    """
-    mcfg    = cfg.model
-    dropout = float(getattr(mcfg, "dropout", 0.0))
-
-    model = ICLCorrNetV2(
-        p_max    = int(mcfg.p_max),
-        d_max    = int(mcfg.d_max),
-        d_hidden = int(mcfg.d_hidden),
-        n_heads  = int(mcfg.n_heads),
-        n_layers = int(mcfg.n_layers),
-        rank     = int(mcfg.rank),
-        dropout  = dropout,
-    )
-
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(
-        f"[ICLCorrNetV2]  d_hidden={mcfg.d_hidden}  n_heads={mcfg.n_heads}  "
-        f"n_layers={mcfg.n_layers}  p_max={mcfg.p_max}  d_max={mcfg.d_max}  "
-        f"rank={mcfg.rank}  dropout={dropout}  |  params={n_params:,}"
-    )
-    return model
 
 
 # ---------------------------------------------------------------------------
@@ -1158,18 +961,14 @@ def build_copula_tabicl(cfg) -> _CopulaTabICLWrapper:
 
 
 _BUILD_DISPATCH = {
-    "icl_corr_net_v2":    build_icl_corr_net_v2,
     "copula_tabicl_v2":   build_copula_tabicl_v2,
     "tabicl-archi":       build_copula_tabicl,
 }
 
 
 def build_copula_transformer(cfg):
-    """Dispatch to the correct builder based on cfg.model.name.
-
-    Falls back to build_icl_corr_net_v2 when name is absent (legacy checkpoints).
-    """
-    name = getattr(cfg.model, "name", "icl_corr_net_v2")
+    """Dispatch to the correct builder based on cfg.model.name."""
+    name = getattr(cfg.model, "name", "copula_tabicl_v2")
     builder = _BUILD_DISPATCH.get(name)
     if builder is None:
         raise ValueError(

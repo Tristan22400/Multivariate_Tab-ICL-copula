@@ -58,7 +58,7 @@ from sklearn.covariance import OAS
 from data_gen import select_group_representative_indices
 from dataset import infinite_episode_iter, make_episode_loader, split_episode_files
 from loss import indep_normal_nll, woodbury_nll
-from model import build_copula_tabicl, build_copula_tabicl_v2, build_icl_corr_net_v2
+from model import build_copula_tabicl, build_copula_tabicl_v2
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -683,14 +683,12 @@ def main(cfg: DictConfig) -> None:
     _model_name = getattr(cfg.model, "name", "copula_tabicl_v2")
     if _model_name == "copula_tabicl_v2":
         model: nn.Module = build_copula_tabicl_v2(cfg).to(device)
-    elif _model_name == "icl_corr_net_v2":
-        model: nn.Module = build_icl_corr_net_v2(cfg).to(device)
     elif _model_name == "tabicl-archi":
         model: nn.Module = build_copula_tabicl(cfg).to(device)
     else:
         raise ValueError(
             f"Unknown model.name={_model_name!r}. "
-            "Use 'copula_tabicl_v2', 'icl_corr_net_v2', or 'tabicl-archi'."
+            "Use 'copula_tabicl_v2' or 'tabicl-archi'."
         )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters : {n_params:,}")
