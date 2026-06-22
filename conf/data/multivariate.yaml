@@ -59,6 +59,20 @@ kernel_nugget: 1.0e-4 # jitter added to diagonal for strict PD
 iso_kernel_type: rbf
 iso_kernel_nugget: 1.0e-4
 
+# TabICL feature-kernel covariance (used when cov_type: tabicl_kernel)
+# Per output dim m, build an instance-dependent q-dim embedding W_m(x) by sampling
+# 1..tabicl_max_feats input features and applying random TabICLv2-style functions +
+# aggregation (concat or separate+{sum,product,max,logsumexp}); then
+#   Sigma_mn(x) = k( ||W_m(x) - W_n(x)||, l_b )
+# where l_b ~ LogU(lo, hi) is fixed per dataset.  Copula generator (unit diagonal).
+# Function pool: linear, mlp, quadratic, product, nn_discretize, tree_ensemble, rff_gp, plateau
+tabicl_kernel_type: random      # rbf | matern12 | matern32 | matern52 | random
+tabicl_kernel_nugget: 1.0e-4
+tabicl_embed_dim: 4             # q: embedding dim for each W_m(x)
+tabicl_max_feats: 3             # max input features sampled per output dim (>=1)
+tabicl_lengthscale_lo: 0.1      # per-dataset lengthscale ~ LogU(lo, hi)
+tabicl_lengthscale_hi: 10.0
+
 # Hyperplane-bimodal debug mode: two random PSD matrices per dataset separated by a
 # random hyperplane in X-space.  Group assignment is ~50/50 (per-dataset median split).
 # Activate with: data.hyperplane_bimodal=true

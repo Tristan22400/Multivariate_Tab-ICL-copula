@@ -23,7 +23,7 @@ training:
   val_every: 500
   plot_every: 500
   save_every: 5000
-  ckpt_dir: ./checkpoints/pit_hyperplane_multimodal-tabicl-nll # directory for saving checkpoints; auto-detected if resuming from ckpt_dir
+  ckpt_dir: null # directory for saving checkpoints; auto-detected if resuming from ckpt_dir
   resume_from: null  # direct checkpoint path; takes priority over ckpt_dir auto-detection
   reset_icl_gate: false  # set true when resuming from a checkpoint where icl_gate is stuck near -3.0
   dataset_dir: ./data/pit_hyperplane_multimodal # path to pre-computed PIT episodes; required for training
@@ -48,7 +48,7 @@ tabicl:
   pit_eps: 1.0e-6        # fixed probit clamping epsilon
 
 comparison:
-  n_datasets: 50         # number of episodes used for ICL vs per-dataset model comparison
+  n_datasets: 1          # number of episodes used for ICL vs per-dataset model comparison
 
 attn_copula:
   m: 64                  # hidden dim for feature/row encoders and attention

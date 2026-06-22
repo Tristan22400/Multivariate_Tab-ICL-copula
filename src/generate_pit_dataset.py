@@ -39,7 +39,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _HERE)
 
-from data_gen import GlobalAnchorCovGen, GlobalFixedNets, IsotropicModulatedKernel, KernelCovGen, TabICLFeatureKernel, generate_episode
+from data_gen import GlobalAnchorCovGen, GlobalFixedNets, IsotropicModulatedKernel, KernelCovGen, SimpleAggKernel, TabICLFeatureKernel, generate_episode
 from pit import load_tabicl, run_pit_batched
 
 # ---------------------------------------------------------------------------
@@ -66,6 +66,10 @@ def _auto_dataset_name(cfg) -> str:
             mode = f"kernel_{data.get('kernel_type', 'random')}"
         elif cov_type == "anchor":
             mode = f"anchor{data.get('num_anchors', 2)}"
+        elif cov_type == "simple_agg":
+            mode = f"simple_agg_{data.get('simple_agg_kernel_type', 'cosine')}"
+        elif cov_type == "tabicl_kernel":
+            mode = f"tabicl_{data.get('tabicl_kernel_type', 'random')}"
         else:
             mode = "mlp"
 
@@ -233,6 +237,25 @@ def main(cfg: DictConfig) -> None:
             print(
                 f"TabICLFeatureKernel: kernel={tabicl_kernel_type}, "
                 f"embed_dim={tabicl_embed_dim}, max_feats={tabicl_max_feats}"
+            )
+        elif cov_type == "simple_agg":
+            sa_kernel_type = str(cfg.data.get("simple_agg_kernel_type", "cosine"))
+            sa_nugget      = float(cfg.data.get("simple_agg_nugget",      1e-4))
+            sa_max_feats   = int(cfg.data.get("simple_agg_max_feats",    3))
+            sa_embed_dim   = int(cfg.data.get("simple_agg_embed_dim",    4))
+            sa_ls_lo       = float(cfg.data.get("simple_agg_lengthscale_lo", 0.1))
+            sa_ls_hi       = float(cfg.data.get("simple_agg_lengthscale_hi", 10.0))
+            kernel_cov_gen = SimpleAggKernel(
+                kernel_type=sa_kernel_type,
+                nugget=sa_nugget,
+                max_feats=sa_max_feats,
+                embed_dim=sa_embed_dim,
+                lengthscale_lo=sa_ls_lo,
+                lengthscale_hi=sa_ls_hi,
+            )
+            print(
+                f"SimpleAggKernel: kernel={sa_kernel_type}, "
+                f"embed_dim={sa_embed_dim}, max_feats={sa_max_feats}"
             )
         else:
             fixed_nets = GlobalFixedNets(r=r_data, hidden=mlp_hidden, device=device)

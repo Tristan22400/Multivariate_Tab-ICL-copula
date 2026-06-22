@@ -621,6 +621,135 @@ class TabICLFeatureKernel:
         return L
 
 
+_SIMPLE_AGG_OPS: list[str] = ["sum", "product", "max", "min", "mean", "logsumexp"]
+_SIMPLE_AGG_KERNEL_NAMES: list[str] = _ISO_KERNEL_NAMES + ["cosine"]
+
+
+class SimpleAggKernel:
+    """Per-instance d×d covariance via direct feature aggregation and PSD kernels.
+
+    Simplified version of TabICLFeatureKernel: replaces all random function
+    transforms (MLP, RFF-GP, trees, …) with direct element-wise aggregations.
+
+    W construction (per output dim m, per embedding component j ∈ {0..q-1}):
+      1. Sample n_feat ~ U{1..max_feats} feature indices (per batch element).
+      2. Gather selected features: Xsel ∈ (B, T, n_feat).
+      3. Aggregate element-wise: w = agg_op(Xsel, dim=-1) → (B, T).
+         agg_op drawn from {sum, product, max, min, mean, logsumexp}.
+         If n_feat == 1, w is just that feature directly.
+      4. W[:,:,m,j] = w.  Result: W ∈ (B, T, d, q).
+
+    Kernel types:
+      "cosine"  — K[b,t,m,n] = (W_m · W_n) / (‖W_m‖ ‖W_n‖).
+                  Gram matrix of unit-norm vectors → always PSD, values in [−1, 1].
+      Distance-based (rbf, matern12, matern32, matern52) — same path as
+                  TabICLFeatureKernel; values in [0, 1].
+      "random"  — drawn uniformly from all available kernel names.
+    """
+
+    KERNELS: list[str] = _SIMPLE_AGG_KERNEL_NAMES
+    is_copula_gen: bool = True
+
+    def __init__(
+        self,
+        kernel_type: str = "cosine",
+        nugget: float = 1e-4,
+        embed_dim: int = 4,
+        max_feats: int = 3,
+        lengthscale_lo: float = 0.1,
+        lengthscale_hi: float = 10.0,
+    ) -> None:
+        if kernel_type not in self.KERNELS + ["random"]:
+            raise ValueError(
+                f"Unknown kernel_type {kernel_type!r}. "
+                f"Choose from {self.KERNELS + ['random']}"
+            )
+        self.kernel_type = kernel_type
+        self.nugget = nugget
+        self.embed_dim = max(1, embed_dim)
+        self.max_feats = max(1, max_feats)
+        self.lengthscale_lo = lengthscale_lo
+        self.lengthscale_hi = lengthscale_hi
+
+    def __call__(self, X: torch.Tensor, d: int) -> torch.Tensor:
+        """Build per-instance Cholesky factors L(x_i) of the covariance matrix.
+
+        Args:
+            X: (B, T, p) — z-normalised input features
+            d: target output dimension
+        Returns:
+            L: (B, T, d, d) — lower-triangular Cholesky factor
+        """
+        B, T, p = X.shape
+        device = X.device
+        q = self.embed_dim
+        eps = self.nugget
+
+        kernel_name = (
+            _SIMPLE_AGG_KERNEL_NAMES[
+                torch.randint(len(_SIMPLE_AGG_KERNEL_NAMES), (1,)).item()
+            ]
+            if self.kernel_type == "random"
+            else self.kernel_type
+        )
+
+        # Build W ∈ (B, T, d, q): q independent scalar aggregations per output dim
+        W = torch.zeros(B, T, d, q, device=device)
+        for m in range(d):
+            for j in range(q):
+                n_feat = int(torch.randint(1, self.max_feats + 1, (1,)).item())
+                feat_idx = torch.stack(
+                    [torch.randperm(p, device=device)[:n_feat] for _ in range(B)]
+                )  # (B, n_feat)
+                Xsel = X.gather(2, feat_idx.unsqueeze(1).expand(B, T, n_feat))
+
+                if n_feat == 1:
+                    w = Xsel.squeeze(-1)
+                else:
+                    agg_op = _SIMPLE_AGG_OPS[
+                        torch.randint(len(_SIMPLE_AGG_OPS), (1,)).item()
+                    ]
+                    if agg_op == "sum":
+                        w = Xsel.sum(-1)
+                    elif agg_op == "product":
+                        w = Xsel.prod(-1)
+                    elif agg_op == "max":
+                        w = Xsel.max(-1).values
+                    elif agg_op == "min":
+                        w = Xsel.min(-1).values
+                    elif agg_op == "mean":
+                        w = Xsel.mean(-1)
+                    else:  # logsumexp
+                        w = Xsel.logsumexp(-1)
+                W[:, :, m, j] = w
+
+        # Standardize W over T per (b, m, j)
+        W_mean = W.mean(dim=1, keepdim=True)
+        W_std = W.std(dim=1, keepdim=True).clamp(min=1e-6)
+        W = (W - W_mean) / W_std  # (B, T, d, q)
+
+        if kernel_name == "cosine":
+            # Gram matrix of unit-norm vectors — always PSD, diagonal = 1, values in [-1,1]
+            W_normed = W / W.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            K = torch.einsum("btmq,btnq->btmn", W_normed, W_normed)  # (B, T, d, d)
+        else:
+            # Distance-based stationary kernel (same path as TabICLFeatureKernel)
+            log_lo = math.log(self.lengthscale_lo)
+            log_hi = math.log(self.lengthscale_hi)
+            l_b = torch.empty(B, device=device).uniform_(log_lo, log_hi).exp()
+            l = l_b.view(B, 1, 1, 1)
+            kernel_fn = _STATIONARY_KERNEL_FNS[kernel_name]
+            diff = W.unsqueeze(3) - W.unsqueeze(2)  # (B, T, d, d, q)
+            r = (diff ** 2).sum(-1).clamp(min=0).sqrt()
+            K = kernel_fn(r, l)
+
+        I_d = torch.eye(d, device=device).view(1, 1, d, d)
+        C = (1.0 - eps) * K + eps * I_d  # (B, T, d, d)
+
+        L = torch.linalg.cholesky(C.reshape(B * T, d, d)).reshape(B, T, d, d)
+        return L
+
+
 class KernelCovGen:
     """Per-instance x-dependent covariance via MLP-parameterized GP kernels.
 
