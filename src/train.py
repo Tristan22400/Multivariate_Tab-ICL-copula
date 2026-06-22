@@ -136,6 +136,61 @@ def _energy_score_batched(
 _MAX_PLOT_INSTANCES = 16
 
 
+def _select_unique_oracle_indices(
+    R_ora_b: np.ndarray,  # (n_test, d, d)
+    max_n: int,
+    atol: float = 1e-4,
+) -> list[int]:
+    """Return up to max_n indices with mutually distinct oracle correlation matrices.
+
+    Pass 1: pick instances whose upper-triangle MSE differs from every already-selected
+    oracle by more than atol.  Pass 2: fill remaining slots in order from unused indices.
+    """
+    n_test, d, _ = R_ora_b.shape
+    ri, ci = np.triu_indices(d, k=1)
+
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    selected_vecs: list[np.ndarray] = []
+
+    for idx in range(n_test):
+        vec = R_ora_b[idx, ri, ci]
+        if not any(np.mean((vec - sv) ** 2) <= atol for sv in selected_vecs):
+            selected.append(idx)
+            selected_set.add(idx)
+            selected_vecs.append(vec)
+        if len(selected) >= max_n:
+            break
+
+    if len(selected) < max_n:
+        for idx in range(n_test):
+            if idx not in selected_set:
+                selected.append(idx)
+                selected_set.add(idx)
+            if len(selected) >= max_n:
+                break
+
+    return selected[:max_n]
+
+
+def _pick_diverse_plot_episodes(val_episodes: list[dict]) -> list[int]:
+    """Return indices into val_episodes — one per distinct K, sorted ascending by K.
+
+    K is inferred by counting distinct oracle_V rows for dataset b=0 (rounded to
+    5 decimal places).  Selection is deterministic: the first episode found for each
+    K value is kept, so the same episodes are always used across training runs.
+    """
+    k_to_idx: dict[int, int] = {}
+    for i, ep in enumerate(val_episodes):
+        V = ep["oracle_V"]          # (B, n_test, d, r)
+        n_test = V.shape[1]
+        v0 = V[0].reshape(n_test, -1).float().numpy()
+        k = int(len(np.unique(v0.round(5), axis=0)))
+        if k not in k_to_idx:
+            k_to_idx[k] = i
+    return [idx for _, idx in sorted(k_to_idx.items())]
+
+
 def _corr_all_instances_fig(
     R_pred_np: np.ndarray,  # (n_plot, d, d) — pre-computed, already sliced
     R_ora_np: np.ndarray,   # (n_plot, d, d)
@@ -221,6 +276,7 @@ def run_val_pit(
     amp_dtype: torch.dtype = torch.bfloat16,
     use_amp: bool = False,
     n_think: int = 0,
+    plot_ep_indices: list[int] | None = None,
 ) -> dict[str, float]:
     """Validate on held-out PIT episodes.  All NLL metrics are in copula-NLL units.
 
@@ -263,6 +319,7 @@ def run_val_pit(
         "val/energy_score": [],
     }
     plot_episodes: list[dict] = []
+    _plot_set: set[int] = set(plot_ep_indices) if plot_ep_indices is not None else set()
     all_off_pred: list[np.ndarray] = []  # off-diag predicted values, for scatter
     all_off_ora:  list[np.ndarray] = []  # off-diag oracle values,    for scatter
 
@@ -497,24 +554,20 @@ def run_val_pit(
                 all_off_pred.append(R_pp[..., ri_p, ci_p].float().cpu().numpy().flatten())
                 all_off_ora.append(R_oo[..., ri_p, ci_p].float().cpu().numpy().flatten())
 
-                # Store up to 2 episodes for the all-instances grid plot.
+                # Store pre-selected episodes for the all-instances grid plot.
                 # R_pp / R_oo are already computed above — reuse them directly
                 # so _corr_all_instances_fig doesn't redo Sigma/std/matmul work.
-                if len(plot_episodes) < 2:
-                    groups_raw = ep.get("oracle_groups", None)  # (B, n_test) or None
-                    R_pred_list, R_ora_list = [], []
-                    for b in range(R_pp.shape[0]):
-                        groups_b = groups_raw[b] if groups_raw is not None else None
-                        idxs = select_group_representative_indices(
-                            groups_b, _MAX_PLOT_INSTANCES, n_total=R_pp.shape[1]
-                        )
-                        R_pred_list.append(R_pp[b, idxs].float().cpu().numpy())
-                        R_ora_list.append(R_oo[b, idxs].float().cpu().numpy())
+                if i_ep in _plot_set:
+                    # Infer K from oracle_V of dataset b=0 for the plot label.
+                    v0 = ep["oracle_V"][0].reshape(ep["oracle_V"].shape[1], -1).float().numpy()
+                    k_ep = int(len(np.unique(v0.round(5), axis=0)))
+                    R_ora_b0 = R_oo[0].float().cpu().numpy()
+                    idxs = _select_unique_oracle_indices(R_ora_b0, _MAX_PLOT_INSTANCES)
                     plot_episodes.append(
                         {
-                            "key": f"pit_ep{i_ep}",
-                            "R_pred": np.stack(R_pred_list),  # (B, n_p, d, d)
-                            "R_ora": np.stack(R_ora_list),
+                            "key": f"K={k_ep} ep{i_ep}",
+                            "R_pred": R_pp[0, idxs].float().cpu().numpy(),  # (n_p, d, d)
+                            "R_ora": R_ora_b0[idxs],
                         }
                     )
 
@@ -537,16 +590,14 @@ def run_val_pit(
 
     plot_figs = []
     if do_plot and wandb_run is not None:
-        # — All-instances correlation grids (one per stored episode, up to 2 batch elems each) —
-        for ep in plot_episodes:
-            B_ep = ep["R_pred"].shape[0]
-            for b_idx in range(min(2, B_ep)):
-                fig, _ = _corr_all_instances_fig(
-                    ep["R_pred"][b_idx],
-                    ep["R_ora"][b_idx],
-                    label=f"{ep['key']} b={b_idx}",
-                )
-                plot_figs.append(fig)
+        # — All-instances correlation grids (one plot per pre-selected episode / K value) —
+        for ep in sorted(plot_episodes, key=lambda e: e["key"]):
+            fig, _ = _corr_all_instances_fig(
+                ep["R_pred"],
+                ep["R_ora"],
+                label=ep["key"],
+            )
+            plot_figs.append(fig)
 
         # — Off-diagonal scatter: predicted vs oracle across all episodes —
         if all_off_pred and all_off_ora:
@@ -808,7 +859,8 @@ def main(cfg: DictConfig) -> None:
     # ---- Validation episodes (pre-loaded, held-out PIT episodes) ----
     print(f"Loading {len(val_files)} validation episodes …")
     val_episodes = [torch.load(f, weights_only=True) for f in val_files]
-    print("Validation episodes loaded.")
+    plot_ep_indices = _pick_diverse_plot_episodes(val_episodes)
+    print(f"Validation episodes loaded. Plot episodes (one per K): indices {plot_ep_indices}")
 
     # ---- Training loop ----
     model.train()
@@ -990,6 +1042,7 @@ def main(cfg: DictConfig) -> None:
                 amp_dtype=amp_dtype,
                 use_amp=use_amp,
                 n_think=int(cfg.training.get("n_think", 0)),
+                plot_ep_indices=plot_ep_indices,
             )
             model.train()
 
@@ -1021,6 +1074,7 @@ def main(cfg: DictConfig) -> None:
         amp_dtype=amp_dtype,
         use_amp=use_amp,
         n_think=int(cfg.training.get("n_think", 0)),
+        plot_ep_indices=plot_ep_indices,
     )
 
     if wandb_run is not None:

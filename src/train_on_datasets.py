@@ -1072,6 +1072,46 @@ def _run_dataset(
 
 
 # ---------------------------------------------------------------------------
+# Plot-episode selection helpers
+# ---------------------------------------------------------------------------
+
+
+def _pick_diverse_episode_ds_indices(
+    episode_indices: list[int],
+    dataset_dir: str,
+) -> dict[int, int]:
+    """Pre-scan episode files and return {K: local_ds_idx} — one per distinct K.
+
+    K is inferred from oracle_V uniqueness (b=0, rounded to 5 decimal places).
+    local_ds_idx is the index into episode_indices (the ds_idx used in the loop).
+    Selection is deterministic: the first occurrence of each K wins.
+    """
+    k_to_ds_idx: dict[int, int] = {}
+    for local_i, ep_i in enumerate(episode_indices):
+        ep_path = os.path.join(dataset_dir, f"episode_{ep_i:06d}.pt")
+        ep = torch.load(ep_path, map_location="cpu", weights_only=True)
+        V = ep["oracle_V"]          # (B, n_test, d, r)
+        n_test = V.shape[1]
+        v0 = V[0].reshape(n_test, -1).float().numpy()
+        k = int(len(np.unique(v0.round(5), axis=0)))
+        if k not in k_to_ds_idx:
+            k_to_ds_idx[k] = local_i
+    return {k: idx for k, idx in sorted(k_to_ds_idx.items())}
+
+
+def _infer_groups_from_oracle_V(oracle_V_b0: torch.Tensor) -> np.ndarray:
+    """Infer group labels (0..K-1) for each test instance from oracle_V uniqueness.
+
+    oracle_V_b0: (n_test, d, r)
+    Returns: (n_test,) int array of group indices in [0, K-1].
+    """
+    n_test = oracle_V_b0.shape[0]
+    v = oracle_V_b0.reshape(n_test, -1).float().numpy().round(5)
+    _, inverse = np.unique(v, axis=0, return_inverse=True)
+    return inverse
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1187,8 +1227,15 @@ def main() -> None:
     # Parallel training and evaluation across datasets
     # ====================================================================
     episode_indices = list(range(args.episode_idx, args.episode_idx + n_comparison_datasets))
+
+    # Pre-scan to select one episode per distinct K (deterministic, first-wins).
+    print("Pre-scanning episodes to select one per K value for plotting...")
+    k_to_ds_idx = _pick_diverse_episode_ds_indices(episode_indices, dataset_dir)
+    ds_idx_to_k = {v: k for k, v in k_to_ds_idx.items()}
+    print(f"  Plot episodes (ds_idx → K): { {v: k for k, v in k_to_ds_idx.items()} }")
+
     all_metrics: list[dict[str, float]] = [{}] * n_comparison_datasets
-    plot_artifacts = None  # kept only from dataset 0
+    plot_artifacts_by_k: dict[int, tuple] = {}  # K → artifacts
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {
             pool.submit(
@@ -1216,8 +1263,8 @@ def main() -> None:
                 continue
 
             all_metrics[ds_idx] = metrics
-            if ds_idx == 0:
-                plot_artifacts = artifacts
+            if ds_idx in ds_idx_to_k:
+                plot_artifacts_by_k[ds_idx_to_k[ds_idx]] = artifacts
             completed += 1
 
             # Log per-dataset metrics to W&B
@@ -1306,70 +1353,77 @@ def main() -> None:
         traceback.print_exc()
 
     # ====================================================================
-    # Phase 5 — Covariance plots (dataset 0 only)
+    # Phase 5 — Covariance plots (one per distinct K value)
     # ====================================================================
-    if not args.no_plots and plot_artifacts is not None:
+    if not args.no_plots and plot_artifacts_by_k:
         import matplotlib.pyplot as plt
         from sklearn.covariance import OAS
 
-        print("\n--- Generating covariance plots (dataset 0) ---")
-        ep, R_mom_full, R_shrunk, nw_R, R_attn, R_oracle, \
-            mu_ICL, d_ICL, V_ICL, R_ICL, Z_train, X_train = plot_artifacts
+        print(f"\n--- Generating covariance plots (K values: {sorted(plot_artifacts_by_k)}) ---")
+        wandb_images: dict[str, object] = {}
 
-        # All estimators in ablation order
-        estimators = {
-            "Moment":      R_mom_full,            # (d, d) — broadcast
-            "ShrunkMom":   R_shrunk,              # (d, d) — broadcast
-            "NW-RBF":      nw_R["rbf"],           # (n_te, d, d)
-            "NW-Epan":     nw_R["epanechnikov"],  # (n_te, d, d)
-            "NW-Lap":      nw_R["laplace"],       # (n_te, d, d)
-            "Attention":   R_attn,                # (n_te, d, d)
-            "ICL model":   R_ICL,                 # (n_te, d, d)
-        }
+        for k_val, artifacts in sorted(plot_artifacts_by_k.items()):
+            ep, R_mom_full, R_shrunk, nw_R, R_attn, R_oracle, \
+                mu_ICL, d_ICL, V_ICL, R_ICL, Z_train, X_train = artifacts
 
-        n_test = R_attn.shape[0]
-        fig_grid = plot_corr_grid(
-            estimators=estimators,
-            oracle_R=R_oracle,
-            title=f"Correlation estimator comparison — episode {args.episode_idx}",
-        )
+            ep_i = episode_indices[k_to_ds_idx[k_val]]
+            n_test = R_attn.shape[0]
 
-        # Also keep the detailed ICL Woodbury plot for reference
-        oas_z = OAS().fit(Z_train.cpu().numpy())
-        oracle_groups_raw = ep.get("oracle_groups", None)  # (B, n_test) or None
-        groups_b0 = oracle_groups_raw[0] if oracle_groups_raw is not None else None
-        ICL_instance_indices = select_group_representative_indices(
-            groups_b0, max_n=3, n_total=n_test
-        )
-        oracle_mu = ep["oracle_mu"][0].to(device)
-        oracle_D  = ep["oracle_D"][0].to(device)
-        oracle_V  = ep["oracle_V"][0].to(device)
-        fig_ICL = plot_prediction_comparison(
-            mu_pred=mu_ICL.unsqueeze(0),
-            D_pred=d_ICL.unsqueeze(0),
-            V_pred=V_ICL.unsqueeze(0),
-            mu_true=oracle_mu.unsqueeze(0),
-            D_true=oracle_D.unsqueeze(0),
-            V_true=oracle_V.unsqueeze(0),
-            sigma_oas=oas_z.covariance_,
-            dataset_label="ICL model — predicted vs oracle (Z-space)",
-            instance_indices=ICL_instance_indices,
-        )
+            estimators = {
+                "Moment":      R_mom_full,
+                "ShrunkMom":   R_shrunk,
+                "NW-RBF":      nw_R["rbf"],
+                "NW-Epan":     nw_R["epanechnikov"],
+                "NW-Lap":      nw_R["laplace"],
+                "Attention":   R_attn,
+                "ICL model":   R_ICL,
+            }
+            fig_grid = plot_corr_grid(
+                estimators=estimators,
+                oracle_R=R_oracle,
+                title=f"Correlation estimator comparison — episode {ep_i} (K={k_val})",
+            )
+
+            # Infer groups from oracle_V so select_group_representative_indices
+            # picks one instance per covariance group rather than indices [0,1,2].
+            oracle_groups_raw = ep.get("oracle_groups", None)
+            if oracle_groups_raw is not None:
+                groups_b0 = oracle_groups_raw[0]
+            else:
+                groups_b0 = _infer_groups_from_oracle_V(ep["oracle_V"][0])
+            ICL_instance_indices = select_group_representative_indices(
+                groups_b0, max_n=min(k_val, 3), n_total=n_test
+            )
+
+            oas_z = OAS().fit(Z_train.cpu().numpy())
+            oracle_mu = ep["oracle_mu"][0].to(device)
+            oracle_D  = ep["oracle_D"][0].to(device)
+            oracle_V  = ep["oracle_V"][0].to(device)
+            fig_ICL = plot_prediction_comparison(
+                mu_pred=mu_ICL.unsqueeze(0),
+                D_pred=d_ICL.unsqueeze(0),
+                V_pred=V_ICL.unsqueeze(0),
+                mu_true=oracle_mu.unsqueeze(0),
+                D_true=oracle_D.unsqueeze(0),
+                V_true=oracle_V.unsqueeze(0),
+                sigma_oas=oas_z.covariance_,
+                dataset_label=f"ICL model — predicted vs oracle (Z-space, K={k_val})",
+                instance_indices=ICL_instance_indices,
+            )
+
+            wandb_images[f"eval/corr_grid_K{k_val}"]  = fig_grid
+            wandb_images[f"eval/ICL_detail_K{k_val}"] = fig_ICL
 
         if wandb_run is not None:
             import wandb as wandb_mod
-
             wandb_run.log(
-                {
-                    "eval/corr_grid":  wandb_mod.Image(fig_grid),
-                    "eval/ICL_detail": wandb_mod.Image(fig_ICL),
-                },
+                {k: wandb_mod.Image(f) for k, f in wandb_images.items()},
                 step=n_comparison_datasets,
             )
             print("Covariance plots logged to W&B.")
 
-        plt.close(fig_grid)
-        plt.close(fig_ICL)
+        for fig in wandb_images.values():
+            plt.close(fig)
 
     if wandb_run is not None:
         wandb_run.finish()
