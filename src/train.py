@@ -173,12 +173,13 @@ def _select_unique_oracle_indices(
     return selected[:max_n]
 
 
-def _pick_diverse_plot_episodes(val_episodes: list[dict]) -> list[int]:
-    """Return indices into val_episodes — one per distinct K, sorted ascending by K.
+def _pick_diverse_plot_episodes(val_episodes: list[dict], min_plots: int = 3) -> list[int]:
+    """Return indices into val_episodes — one per distinct K, at least min_plots total.
 
     K is inferred by counting distinct oracle_V rows for dataset b=0 (rounded to
     5 decimal places).  Selection is deterministic: the first episode found for each
-    K value is kept, so the same episodes are always used across training runs.
+    K value is kept.  If fewer than min_plots distinct K values exist, additional
+    episodes are appended in episode order until min_plots is reached.
     """
     k_to_idx: dict[int, int] = {}
     for i, ep in enumerate(val_episodes):
@@ -188,7 +189,15 @@ def _pick_diverse_plot_episodes(val_episodes: list[dict]) -> list[int]:
         k = int(len(np.unique(v0.round(5), axis=0)))
         if k not in k_to_idx:
             k_to_idx[k] = i
-    return [idx for _, idx in sorted(k_to_idx.items())]
+    selected = [idx for _, idx in sorted(k_to_idx.items())]
+    selected_set = set(selected)
+    for i in range(len(val_episodes)):
+        if len(selected) >= min_plots:
+            break
+        if i not in selected_set:
+            selected.append(i)
+            selected_set.add(i)
+    return selected
 
 
 def _corr_all_instances_fig(
@@ -222,17 +231,26 @@ def _corr_all_instances_fig(
     W = n_cols * d + max(n_cols - 1, 0) * sep
     composite = np.full((H, W), np.nan)
 
+    # Zero out the diagonal so it doesn't dominate the colour scale
+    diag_idx = np.arange(d)
+    R_pred_plot = R_pred_np.copy()
+    R_ora_plot = R_ora_np.copy()
+    R_pred_plot[:, diag_idx, diag_idx] = np.nan
+    R_ora_plot[:, diag_idx, diag_idx] = np.nan
+
     for i in range(n_cols):
         x0 = i * (d + sep)
         for grp in range(2):
             inst = i + grp * half
             if inst >= n_plot:
                 continue
-            composite[row_starts[grp * 2]:row_starts[grp * 2] + d, x0:x0 + d] = R_ora_np[inst]
-            composite[row_starts[grp * 2 + 1]:row_starts[grp * 2 + 1] + d, x0:x0 + d] = R_pred_np[inst]
+            composite[row_starts[grp * 2]:row_starts[grp * 2] + d, x0:x0 + d] = R_ora_plot[inst]
+            composite[row_starts[grp * 2 + 1]:row_starts[grp * 2 + 1] + d, x0:x0 + d] = R_pred_plot[inst]
 
     fig, ax = plt.subplots(figsize=(max(n_cols * 0.9, 3), 4))
-    im = ax.imshow(composite, vmin=-1, vmax=1, cmap="RdBu_r",
+    cmap = plt.get_cmap("RdBu_r").copy()
+    cmap.set_bad(color="lightgrey")
+    im = ax.imshow(composite, cmap=cmap,
                    interpolation="nearest", aspect="auto")
 
     for i in range(n_cols):
@@ -860,7 +878,7 @@ def main(cfg: DictConfig) -> None:
     print(f"Loading {len(val_files)} validation episodes …")
     val_episodes = [torch.load(f, weights_only=True) for f in val_files]
     plot_ep_indices = _pick_diverse_plot_episodes(val_episodes)
-    print(f"Validation episodes loaded. Plot episodes (one per K): indices {plot_ep_indices}")
+    print(f"Validation episodes loaded. Plot episodes (≥3, one per K): indices {plot_ep_indices}")
 
     # ---- Training loop ----
     model.train()

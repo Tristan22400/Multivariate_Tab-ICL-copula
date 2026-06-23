@@ -10,8 +10,6 @@ The head outputs (W_tilde, D_tilde) parametrising a unit-diagonal correlation ma
 
 from __future__ import annotations
 
-import os
-import sys
 import types
 from typing import Optional, Tuple
 
@@ -20,12 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_TABICL_SRC = os.path.join(_HERE, "..", "tabicl_upstream", "src")
-if _TABICL_SRC not in sys.path:
-    sys.path.insert(0, _TABICL_SRC)
-
-from tabicl.model.tabicl import TabICL  # noqa: E402
+from tabicl.model.tabicl import TabICL
 
 
 class _ZEncoder(nn.Module):

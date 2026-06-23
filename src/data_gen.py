@@ -554,12 +554,6 @@ class TabICLFeatureKernel:
         )
         kernel_fn = _STATIONARY_KERNEL_FNS[kernel_name]
 
-        # Per-batch lengthscale: l_b ~ LogU(lo, hi),  shape (B, 1, 1, 1)
-        log_lo = math.log(self.lengthscale_lo)
-        log_hi = math.log(self.lengthscale_hi)
-        l_b = torch.empty(B, device=device).uniform_(log_lo, log_hi).exp()
-        l = l_b.view(B, 1, 1, 1)   # broadcast over (T, d, d)
-
         _AGG_OPS = ["sum", "product", "max", "logsumexp"]
         pool = self.func_pool
 
@@ -610,7 +604,11 @@ class TabICLFeatureKernel:
         diff = W.unsqueeze(3) - W.unsqueeze(2)          # (B, T, d, d, q)
         r = (diff ** 2).sum(-1).clamp(min=0).sqrt()     # (B, T, d, d)
 
-        # Kernel evaluation — l broadcasts over (T, d, d)
+        # Kernel evaluation — lengthscale only sampled for distance-based kernels.
+        log_lo = math.log(self.lengthscale_lo)
+        log_hi = math.log(self.lengthscale_hi)
+        l_b = torch.empty(B, device=device).uniform_(log_lo, log_hi).exp()
+        l = l_b.view(B, 1, 1, 1)   # broadcast over (T, d, d)
         K = kernel_fn(r, l)                              # (B, T, d, d)
 
         # Nugget → exact unit diagonal (k(0)=1 by construction of stationary kernels)
@@ -622,7 +620,7 @@ class TabICLFeatureKernel:
 
 
 _SIMPLE_AGG_OPS: list[str] = ["sum", "product", "max", "min", "mean", "logsumexp"]
-_SIMPLE_AGG_KERNEL_NAMES: list[str] = _ISO_KERNEL_NAMES + ["cosine"]
+_SIMPLE_AGG_KERNEL_NAMES: list[str] = _ISO_KERNEL_NAMES + ["cosine", "dot_product"]
 
 
 class SimpleAggKernel:
@@ -640,11 +638,17 @@ class SimpleAggKernel:
       4. W[:,:,m,j] = w.  Result: W ∈ (B, T, d, q).
 
     Kernel types:
-      "cosine"  — K[b,t,m,n] = (W_m · W_n) / (‖W_m‖ ‖W_n‖).
-                  Gram matrix of unit-norm vectors → always PSD, values in [−1, 1].
+      "cosine"     — K[b,t,m,n] = (W_m · W_n) / (‖W_m‖ ‖W_n‖).
+                     Gram matrix of unit-norm vectors → always PSD, values in [−1, 1].
+                     No lengthscale needed.
+      "dot_product" — K[b,t,m,n] = W_m · W_n / q.
+                     Raw inner-product Gram matrix, normalised by embed_dim so that
+                     the diagonal ≈ 1 after T-standardisation. Always PSD.
+                     No lengthscale needed.
       Distance-based (rbf, matern12, matern32, matern52) — same path as
-                  TabICLFeatureKernel; values in [0, 1].
-      "random"  — drawn uniformly from all available kernel names.
+                     TabICLFeatureKernel; values in [0, 1]. Lengthscale sampled from
+                     LogUniform(lengthscale_lo, lengthscale_hi).
+      "random"     — drawn uniformly from all available kernel names.
     """
 
     KERNELS: list[str] = _SIMPLE_AGG_KERNEL_NAMES
@@ -732,8 +736,12 @@ class SimpleAggKernel:
             # Gram matrix of unit-norm vectors — always PSD, diagonal = 1, values in [-1,1]
             W_normed = W / W.norm(dim=-1, keepdim=True).clamp(min=1e-6)
             K = torch.einsum("btmq,btnq->btmn", W_normed, W_normed)  # (B, T, d, d)
+        elif kernel_name == "dot_product":
+            # Raw inner-product Gram matrix normalised by embed_dim — always PSD.
+            # After T-standardisation each W component has unit variance, so diagonal ≈ 1.
+            K = torch.einsum("btmq,btnq->btmn", W, W) / q              # (B, T, d, d)
         else:
-            # Distance-based stationary kernel (same path as TabICLFeatureKernel)
+            # Distance-based stationary kernel — lengthscale only sampled when needed.
             log_lo = math.log(self.lengthscale_lo)
             log_hi = math.log(self.lengthscale_hi)
             l_b = torch.empty(B, device=device).uniform_(log_lo, log_hi).exp()

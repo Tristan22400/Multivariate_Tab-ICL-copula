@@ -229,6 +229,125 @@ def nw_corr(
     return R
 
 
+def _nw_loocv_bandwidth(
+    X_ctx: torch.Tensor,
+    Z_ctx: torch.Tensor,
+    isotropic: bool = False,
+    n_steps: int = 200,
+    lr: float = 0.05,
+    delta: float = 1e-6,
+) -> torch.Tensor:
+    """Optimize NW RBF lengthscales via LOOCV Gaussian copula NLL.
+
+    Args:
+        X_ctx    : (n, p) context features (should be z-normalised)
+        Z_ctx    : (n, d) context PIT z-scores
+        isotropic: if True, learn a single shared log-lengthscale (1,)
+                   instead of one per feature (p,)
+        n_steps  : Adam optimisation steps
+        lr       : Adam learning rate
+        delta    : jitter added before correlation normalisation
+
+    Returns:
+        log_ls : (p,) [ARD] or (1,) [isotropic] — detached, on same device as X_ctx
+    """
+    n, p = X_ctx.shape
+    device, dtype = X_ctx.device, X_ctx.dtype
+
+    # Initialise from per-feature std (≈ 1 after z-norm, so log_ls ≈ 0)
+    if isotropic:
+        h0 = torch.pdist(X_ctx).median().clamp(min=1e-6)
+        log_ls = nn.Parameter(h0.log().unsqueeze(0).to(dtype))  # (1,)
+    else:
+        stds = X_ctx.std(dim=0).clamp(min=1e-6)  # (p,)
+        log_ls = nn.Parameter(stds.log().to(dtype))  # (p,)
+
+    # Pre-compute pairwise diffs and outer products (fixed across steps)
+    diff_ctx = X_ctx.unsqueeze(1) - X_ctx.unsqueeze(0)  # (n, n, p)
+    outer = Z_ctx.unsqueeze(-1) * Z_ctx.unsqueeze(-2)    # (n, d, d)
+    I = torch.eye(Z_ctx.shape[1], dtype=dtype, device=device)
+    loocv_mask = (1.0 - torch.eye(n, dtype=dtype, device=device)) * 0.0  # zeros
+    # We'll add -1e9 to diagonal of log_w inside the loop
+
+    opt = torch.optim.Adam([log_ls], lr=lr)
+
+    for _ in range(n_steps):
+        opt.zero_grad()
+        ls = log_ls.clamp(-6.0, 6.0).exp()          # (p,) or (1,)
+        sq_dist = (diff_ctx / ls).pow(2).sum(-1)     # (n, n)
+
+        # LOOCV: exclude self by zeroing diagonal weight
+        log_w = -0.5 * sq_dist
+        log_w = log_w - torch.diag(torch.full((n,), 1e9, dtype=dtype, device=device))
+        w = F.softmax(log_w, dim=-1)                 # (n, n)
+
+        R = torch.einsum("ij,jkl->ikl", w, outer)   # (n, d, d)
+        R = R + delta * I
+        std = R.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+        R = R / (std.unsqueeze(-1) * std.unsqueeze(-2))
+
+        loss = copula_nll_full(Z_ctx, R)
+        loss.backward()
+        opt.step()
+
+    with torch.no_grad():
+        log_ls.clamp_(-6.0, 6.0)
+
+    return log_ls.detach()
+
+
+def nw_corr_ard(
+    X_ctx: torch.Tensor,
+    Z_ctx: torch.Tensor,
+    X_qry: torch.Tensor,
+    isotropic: bool = False,
+    n_steps: int = 200,
+    lr: float = 0.05,
+    delta: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Nadaraya-Watson correlation estimator with LOOCV-optimised ARD RBF kernel.
+
+    Bandwidth selection is done by minimising the LOOCV Gaussian copula NLL
+    on the context set, then the optimised lengthscales are applied to predict
+    at query points (no LOOCV masking needed there).
+
+    Args:
+        X_ctx    : (n, p)
+        Z_ctx    : (n, d)
+        X_qry    : (m, p)
+        isotropic: if True, single shared lengthscale; otherwise one per feature
+        n_steps  : Adam steps for bandwidth optimisation
+        lr       : Adam learning rate
+        delta    : jitter for correlation normalisation
+
+    Returns:
+        R      : (m, d, d) per-query correlation matrices
+        log_ls : (p,) or (1,) optimised log-lengthscales
+    """
+    log_ls = _nw_loocv_bandwidth(X_ctx, Z_ctx, isotropic=isotropic,
+                                  n_steps=n_steps, lr=lr, delta=delta)
+
+    n, d = Z_ctx.shape
+    m = X_qry.shape[0]
+    dtype, device = X_ctx.dtype, X_ctx.device
+
+    with torch.no_grad():
+        ls = log_ls.exp()                                          # (p,) or (1,)
+        diff_qry = X_qry.unsqueeze(1) - X_ctx.unsqueeze(0)        # (m, n, p)
+        sq_dist_qry = (diff_qry / ls).pow(2).sum(-1)              # (m, n)
+        w = F.softmax(-0.5 * sq_dist_qry, dim=-1)                 # (m, n)
+
+        outer = Z_ctx.unsqueeze(-1) * Z_ctx.unsqueeze(-2)         # (n, d, d)
+        R = torch.einsum("mn,nij->mij", w, outer)                 # (m, d, d)
+
+        I = torch.eye(d, dtype=dtype, device=device).unsqueeze(0)
+        R = R + delta * I
+        std = R.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+        R = R / (std.unsqueeze(-1) * std.unsqueeze(-2))
+
+    return R, log_ls
+
+
 # ---------------------------------------------------------------------------
 # UCI real-world dataset loaders
 # ---------------------------------------------------------------------------
@@ -260,6 +379,13 @@ def _to_f32(arr, device: torch.device) -> torch.Tensor:
     return torch.tensor(arr, dtype=torch.float32, device=device)
 
 
+def _normalize_Y(y_tr: np.ndarray, y_te: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Standardize Y using training mean/std so TabICL doesn't see extreme values."""
+    mu = y_tr.mean(0, keepdims=True)
+    sigma = y_tr.std(0, keepdims=True).clip(1e-9)
+    return (y_tr - mu) / sigma, (y_te - mu) / sigma
+
+
 def _load_enb(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
@@ -272,6 +398,7 @@ def _load_enb(
     y = ds.data.targets.values.astype(np.float32)
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
     X_tr, X_te = _normalize_X_cols(X_tr, X_te)
+    y_tr, y_te = _normalize_Y(y_tr, y_te)
     return _to_f32(X_tr, device), _to_f32(y_tr, device), _to_f32(X_te, device), _to_f32(y_te, device), False
 
 
@@ -289,13 +416,14 @@ def _load_student(
     valid = ~(X_df.isnull().any(axis=1) | y_df.isnull().any(axis=1))
     X_df = X_df[valid].reset_index(drop=True)
     y_df = y_df[valid].reset_index(drop=True)
-    cat_names = X_df.select_dtypes(include=["object", "category"]).columns.tolist()
+    cat_names = X_df.select_dtypes(include=["object", "category", "string"]).columns.tolist()
     X_df = pd.get_dummies(X_df, columns=cat_names, drop_first=False).astype(np.float32)
     X = X_df.values
     y = y_df.values.astype(np.float32)
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
     ohe_cols = [j for j in range(X_tr.shape[1]) if set(np.unique(X_tr[:, j])).issubset({0.0, 1.0})]
     X_tr, X_te = _normalize_X_cols(X_tr, X_te, cat_cols=ohe_cols)
+    y_tr, y_te = _normalize_Y(y_tr, y_te)
     return _to_f32(X_tr, device), _to_f32(y_tr, device), _to_f32(X_te, device), _to_f32(y_te, device), True
 
 
@@ -317,6 +445,7 @@ def _load_comms_crime(
     y = y_df.values.astype(np.float32)
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
     X_tr, X_te = _normalize_X_cols(X_tr, X_te)
+    y_tr, y_te = _normalize_Y(y_tr, y_te)
     return _to_f32(X_tr, device), _to_f32(y_tr, device), _to_f32(X_te, device), _to_f32(y_te, device), False
 
 
@@ -432,6 +561,8 @@ def _run_realworld_dataset(
     nw_nll: dict[str, float] = {}
     for kern in ("rbf", "epanechnikov", "laplace"):
         nw_nll[kern] = copula_nll_full(Z_test, nw_corr(X_train, Z_train, X_test, kernel=kern)).item()
+    R_nw_ard_rw, _ = nw_corr_ard(X_train, Z_train, X_test)
+    nw_nll["rbf_ard"] = copula_nll_full(Z_test, R_nw_ard_rw).item()
 
     with torch.no_grad():
         X_all = torch.cat([X_train, X_test], dim=0).unsqueeze(0)
@@ -449,6 +580,7 @@ def _run_realworld_dataset(
         "copula_nll/nw_rbf":        nw_nll["rbf"],
         "copula_nll/nw_epan":       nw_nll["epanechnikov"],
         "copula_nll/nw_laplace":    nw_nll["laplace"],
+        "copula_nll/nw_rbf_ard":    nw_nll["rbf_ard"],
         "copula_nll/attn":          attn_nll,
         "copula_nll/ICL":           ICL_nll,
     }
@@ -462,6 +594,7 @@ def _print_realworld_table(results: dict[str, dict[str, float]]) -> None:
         ("nw_rbf",        "NW-RBF"),
         ("nw_epan",       "NW-Epan"),
         ("nw_laplace",    "NW-Lap"),
+        ("nw_rbf_ard",    "NW-ARD"),
         ("attn",          "Attention"),
         ("ICL",           "ICL model"),
     ]
@@ -891,6 +1024,11 @@ def _run_dataset(
         nw_nll[kern] = copula_nll_full(Z_test, R_nw).item()
         nw_R[kern] = R_nw
 
+    # NW-ARD: LOOCV-optimised anisotropic RBF kernel
+    R_nw_ard, log_ls_ard = nw_corr_ard(X_train, Z_train, X_test)
+    nw_nll["rbf_ard"] = copula_nll_full(Z_test, R_nw_ard).item()
+    nw_R["rbf_ard"] = R_nw_ard
+
     # ====================================================================
     # Phase 3 — Pretrained ICL model
     # ====================================================================
@@ -990,6 +1128,7 @@ def _run_dataset(
         "eval/nw_rbf_copula_nll": nw_nll["rbf"],
         "eval/nw_epan_copula_nll": nw_nll["epanechnikov"],
         "eval/nw_laplace_copula_nll": nw_nll["laplace"],
+        "eval/nw_rbf_ard_copula_nll": nw_nll["rbf_ard"],
         "eval/attn_copula_nll": attn_nll,
         "eval/ICL_copula_nll": nll_ICL_z,
         # corr(Σ_Y) Gaussian copula on PIT-Z — NOT a hard lower bound (see note above).
@@ -1000,6 +1139,7 @@ def _run_dataset(
         "eval/nw_rbf_joint_nll_y": nw_nll["rbf"] + marginal_nll_te,
         "eval/nw_epan_joint_nll_y": nw_nll["epanechnikov"] + marginal_nll_te,
         "eval/nw_laplace_joint_nll_y": nw_nll["laplace"] + marginal_nll_te,
+        "eval/nw_rbf_ard_joint_nll_y": nw_nll["rbf_ard"] + marginal_nll_te,
         "eval/attn_joint_nll_y": attn_nll + marginal_nll_te,
         "eval/ICL_joint_nll_y": nll_ICL_y,
         # Sklar route: biased by TabICL's marginal density (log_p_test) — not tight.
@@ -1045,6 +1185,7 @@ def _run_dataset(
         "nw_rbf":     nw_R["rbf"],
         "nw_epan":    nw_R["epanechnikov"],
         "nw_laplace": nw_R["laplace"],
+        "nw_ard":     nw_R["rbf_ard"],
         "attn":       R_attn,
         "ICL":        R_ICL,
         "oracle":     R_oracle,
@@ -1067,7 +1208,7 @@ def _run_dataset(
 
     return ds_idx, eval_metrics, (
         ep, R_mom_full, R_shrunk, nw_R, R_attn, R_oracle,
-        mu_ICL, d_ICL, V_ICL, R_ICL, Z_train, X_train,
+        mu_ICL, d_ICL, V_ICL, R_ICL, Z_train, X_train, log_ls_ard,
     )
 
 
@@ -1332,6 +1473,7 @@ def main() -> None:
                 pit_batch_size=int(cfg.tabicl.pit_batch_size),
                 eps=float(cfg.tabicl.pit_eps),
                 dequantize=dequantize,
+                n_splits=int(cfg.tabicl.get("pit_n_splits", 5)),
             )
             print(f"  [{ds_name}] training AttentionCopulaEstimator and evaluating...")
             rw_results[ds_name] = _run_realworld_dataset(
@@ -1364,7 +1506,7 @@ def main() -> None:
 
         for k_val, artifacts in sorted(plot_artifacts_by_k.items()):
             ep, R_mom_full, R_shrunk, nw_R, R_attn, R_oracle, \
-                mu_ICL, d_ICL, V_ICL, R_ICL, Z_train, X_train = artifacts
+                mu_ICL, d_ICL, V_ICL, R_ICL, Z_train, X_train, log_ls_ard = artifacts
 
             ep_i = episode_indices[k_to_ds_idx[k_val]]
             n_test = R_attn.shape[0]
@@ -1375,6 +1517,7 @@ def main() -> None:
                 "NW-RBF":      nw_R["rbf"],
                 "NW-Epan":     nw_R["epanechnikov"],
                 "NW-Lap":      nw_R["laplace"],
+                "NW-ARD":      nw_R["rbf_ard"],
                 "Attention":   R_attn,
                 "ICL model":   R_ICL,
             }
