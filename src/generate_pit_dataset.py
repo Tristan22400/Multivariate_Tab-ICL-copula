@@ -39,7 +39,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _HERE)
 
-from data_gen import GlobalAnchorCovGen, GlobalFixedNets, IsotropicModulatedKernel, KernelCovGen, SimpleAggKernel, TabICLFeatureKernel, generate_episode
+from data_gen import GlobalAnchorCovGen, GlobalFixedNets, IsotropicModulatedKernel, KernelCovGen, LinearProjKernel, SimpleAggKernel, TabICLFeatureKernel, generate_episode
 from pit import load_tabicl, run_pit_batched
 
 # ---------------------------------------------------------------------------
@@ -66,6 +66,8 @@ def _auto_dataset_name(cfg) -> str:
             mode = f"kernel_{data.get('kernel_type', 'random')}"
         elif cov_type == "anchor":
             mode = f"anchor{data.get('num_anchors', 2)}"
+        elif cov_type == "linear_proj":
+            mode = f"linear_proj_q{data.get('linear_proj_embed_dim', 4)}"
         elif cov_type == "simple_agg":
             mode = f"simple_agg_{data.get('simple_agg_kernel_type', 'cosine')}"
         elif cov_type == "tabicl_kernel":
@@ -237,6 +239,19 @@ def main(cfg: DictConfig) -> None:
             print(
                 f"TabICLFeatureKernel: kernel={tabicl_kernel_type}, "
                 f"embed_dim={tabicl_embed_dim}, max_feats={tabicl_max_feats}"
+            )
+        elif cov_type == "linear_proj":
+            lp_nugget    = float(cfg.data.get("linear_proj_nugget",    1e-4))
+            lp_embed_dim = int(cfg.data.get("linear_proj_embed_dim",  4))
+            lp_max_feats = int(cfg.data.get("linear_proj_max_feats",  3))
+            kernel_cov_gen = LinearProjKernel(
+                nugget=lp_nugget,
+                embed_dim=lp_embed_dim,
+                max_feats=lp_max_feats,
+            )
+            print(
+                f"LinearProjKernel: embed_dim={lp_embed_dim}, max_feats={lp_max_feats}, "
+                f"nugget={lp_nugget}"
             )
         elif cov_type == "simple_agg":
             sa_kernel_type = str(cfg.data.get("simple_agg_kernel_type", "cosine"))

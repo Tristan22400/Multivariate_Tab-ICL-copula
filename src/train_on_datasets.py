@@ -33,8 +33,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import OmegaConf
-from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from muon import Muon
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
@@ -498,7 +498,14 @@ def _run_realworld_dataset(
         include_outer=bool(acfg.include_outer),
     ).to(device)
 
-    optimizer = Adam(model.parameters(), lr=float(acfg.lr), weight_decay=float(acfg.weight_decay))
+    _muon_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
+    _adam_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
+    optimizer = Muon(
+        [{"params": _muon_params, "use_muon": True},
+         {"params": _adam_params, "use_muon": False}],
+        lr=float(acfg.lr),
+        weight_decay=float(acfg.weight_decay),
+    )
     warmup_steps = int(acfg.get("warmup_steps", 0))
     cosine_steps = max(n_steps - warmup_steps, 1)
     _cosine = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=float(acfg.lr_min))
@@ -925,8 +932,11 @@ def _run_dataset(
         include_outer=bool(acfg.include_outer),
     ).to(device)
 
-    optimizer = Adam(
-        model.parameters(),
+    _muon_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
+    _adam_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
+    optimizer = Muon(
+        [{"params": _muon_params, "use_muon": True},
+         {"params": _adam_params, "use_muon": False}],
         lr=float(acfg.lr),
         weight_decay=float(acfg.weight_decay),
     )

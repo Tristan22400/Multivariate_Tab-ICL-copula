@@ -43,8 +43,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
-from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from muon import Muon
 
 # ---------------------------------------------------------------------------
 # Path setup — must happen before local imports
@@ -624,6 +624,9 @@ def run_val_pit(
             lo = min(float(off_o.min()), float(off_p.min()))
             hi = max(float(off_o.max()), float(off_p.max()))
 
+            off_diag_mse = float(np.mean((off_p - off_o) ** 2))
+            metrics["val/off_diag_corr_mse"] = off_diag_mse
+
             # — 2D histogram (density) of off-diagonal correlations —
             fig_den, ax_den = plt.subplots(figsize=(5, 5))
             hb = ax_den.hexbin(off_o, off_p, gridsize=60, cmap="YlOrRd", mincnt=1, bins="log")
@@ -631,7 +634,10 @@ def run_val_pit(
             ax_den.plot([lo, hi], [lo, hi], "b--", lw=1)
             ax_den.set_xlabel("Oracle off-diag corr")
             ax_den.set_ylabel("Predicted off-diag corr")
-            ax_den.set_title(f"step {step} — density ({len(off_p):,} values)")
+            ax_den.set_title(
+                f"step {step} — density ({len(off_p):,} values)\n"
+                f"off-diag corr MSE = {off_diag_mse:.5f}"
+            )
             fig_den.tight_layout()
             plot_figs.append(fig_den)
 
@@ -763,8 +769,11 @@ def main(cfg: DictConfig) -> None:
     print(f"Model parameters : {n_params:,}")
 
     # ---- Optimizer & scheduler ----
-    optimizer = AdamW(
-        model.parameters(),
+    _muon_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
+    _adam_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
+    optimizer = Muon(
+        [{"params": _muon_params, "use_muon": True},
+         {"params": _adam_params, "use_muon": False}],
         lr=float(cfg.training.lr),
         weight_decay=float(cfg.training.weight_decay),
     )
@@ -853,10 +862,14 @@ def main(cfg: DictConfig) -> None:
         print("No resume_from specified, training from scratch.")
 
     # ---- torch.compile (optional, ~60 s one-time compilation cost) ----
+    # Use dynamic=True so the same compiled graph handles both training (N=512) and
+    # validation (varying n_support).  mode="reduce-overhead" avoids the CUDA graph
+    # issues that plagued mode="default" with bfloat16 Woodbury NLL (the loss is
+    # computed outside the compiled graph so that path is unaffected).
     if cfg.training.get("compile", False) and device == "cuda":
-        model = torch.compile(model, mode="default", dynamic=False)
+        model = torch.compile(model, mode="default", dynamic=True)
         print(
-            "torch.compile enabled (mode=default) — first forward will trigger JIT compilation."
+            "torch.compile enabled (mode=default, dynamic=True) — first forward will trigger JIT compilation."
         )
 
     # ---- Data loader (training episodes only — val episodes held out) ----
@@ -886,27 +899,31 @@ def main(cfg: DictConfig) -> None:
     accum_steps = int(cfg.training.get("gradient_accumulation_steps", 1))
     optimizer.zero_grad()
 
+    # Cache triu indices once — d is fixed across all episodes
+    _d_fixed = int(cfg.model.d_max)
+    _ri_fixed, _ci_fixed = torch.triu_indices(_d_fixed, _d_fixed, offset=1, device=device)
+
     for step in range(start_step, int(cfg.training.steps)):
         episode = next(episode_iter)
 
-        X_train = episode["X_train"].to(device)  # (B, N, p)
-        Z_train = episode["Z_train"].to(device)  # (B, N, d)
-        X_test_ep = episode["X_test"].to(device)  # (B, n_test, p)
-        Z_test_ep = episode["Z_test"].to(device)  # (B, n_test, d)
-        oracle_D_ep = episode["oracle_D"].to(device)  # (B, n_test, d)
-        oracle_V_ep = episode["oracle_V"].to(device)  # (B, n_test, d, r)
+        X_train = episode["X_train"].to(device, non_blocking=True)  # (B, N, p)
+        Z_train = episode["Z_train"].to(device, non_blocking=True)  # (B, N, d)
+        X_test_ep = episode["X_test"].to(device, non_blocking=True)  # (B, n_test, p)
+        Z_test_ep = episode["Z_test"].to(device, non_blocking=True)  # (B, n_test, d)
+        oracle_D_ep = episode["oracle_D"].to(device, non_blocking=True)  # (B, n_test, d)
+        oracle_V_ep = episode["oracle_V"].to(device, non_blocking=True)  # (B, n_test, d, r)
 
         if cfg.training.get("use_oracle_z", False):
-            oracle_mu_ep = episode["oracle_mu"].to(device)
-            Y_test_ep = episode["Y_test"].to(device)
+            oracle_mu_ep = episode["oracle_mu"].to(device, non_blocking=True)
+            Y_test_ep = episode["Y_test"].to(device, non_blocking=True)
             sigma_ora = (oracle_D_ep + oracle_V_ep.pow(2).sum(-1)).sqrt()
             Z_test_ep = (Y_test_ep - oracle_mu_ep) / sigma_ora
 
             if "oracle_mu_train" in episode:
-                oracle_mu_tr = episode["oracle_mu_train"].to(device)
-                oracle_D_tr = episode["oracle_D_train"].to(device)
-                oracle_V_tr = episode["oracle_V_train"].to(device)
-                Y_train_ep = episode["Y_train"].to(device)
+                oracle_mu_tr = episode["oracle_mu_train"].to(device, non_blocking=True)
+                oracle_D_tr = episode["oracle_D_train"].to(device, non_blocking=True)
+                oracle_V_tr = episode["oracle_V_train"].to(device, non_blocking=True)
+                Y_train_ep = episode["Y_train"].to(device, non_blocking=True)
                 sigma_ora_tr = (oracle_D_tr + oracle_V_tr.pow(2).sum(-1)).sqrt()
                 Z_train = (Y_train_ep - oracle_mu_tr) / sigma_ora_tr
 
@@ -962,8 +979,7 @@ def main(cfg: DictConfig) -> None:
             # Predicted correlation matrix (diag=1 by Woodbury construction)
             Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-1, -2)
 
-            ri, ci = torch.triu_indices(d, d, offset=1, device=device)
-            loss_mse = F.mse_loss(Sigma_pred[..., ri, ci], R_ora[..., ri, ci])
+            loss_mse = F.mse_loss(Sigma_pred[..., _ri_fixed, _ci_fixed], R_ora[..., _ri_fixed, _ci_fixed])
             if alpha > 0.0:
                 loss = loss + alpha * loss_mse
 
@@ -1001,15 +1017,13 @@ def main(cfg: DictConfig) -> None:
                 ).item()
 
                 Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-1, -2)
-                d_dim = Sigma_pred.shape[-1]
-                ri, ci = torch.triu_indices(d_dim, d_dim, offset=1, device=device)
-                off_diag_pred = Sigma_pred[..., ri, ci]
+                off_diag_pred = Sigma_pred[..., _ri_fixed, _ci_fixed]
                 pred_off_diag_var = off_diag_pred.var(dim=1).mean().item()
 
                 Sigma_oracle = torch.diag_embed(
                     oracle_D_ep
                 ) + oracle_V_ep @ oracle_V_ep.transpose(-1, -2)
-                off_diag_oracle = Sigma_oracle[..., ri, ci]
+                off_diag_oracle = Sigma_oracle[..., _ri_fixed, _ci_fixed]
                 oracle_off_diag_var = off_diag_oracle.var(dim=1).mean().item()
 
             lr_now = scheduler.get_last_lr()[0]

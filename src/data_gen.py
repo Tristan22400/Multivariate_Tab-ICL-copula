@@ -758,6 +758,86 @@ class SimpleAggKernel:
         return L
 
 
+class LinearProjKernel:
+    """Per-instance d×d correlation matrices via per-dim random linear projections.
+
+    Simplified alternative to SimpleAggKernel: replaces the d×q nested loop of
+    independent scalar programs with d independent linear maps R^{n_feat} → R^q.
+
+    W construction (per output dim m):
+      1. Sample n_feat ~ U{1..max_feats} feature indices (per batch element).
+      2. Gather selected features: Xsel ∈ (B, T, n_feat).
+      3. Apply one random linear map A_m ∈ R^{B, n_feat, q}:
+             W_m(x_i) = Xsel[b, i, :] @ A_m[b]   →  (B, T, q)
+      4. W[:, :, m, :] = W_m.   Result: W ∈ (B, T, d, q).
+
+    Standardise W over the T axis per (b, m, q).
+
+    Correlation matrix (cosine Gram):
+      W_norm_m = W_m / ‖W_m‖₂         (unit-normalise over q)
+      C_mn(x_i) = W_norm_m(x_i) · W_norm_n(x_i)   ∈ [-1, 1]
+      C has unit diagonal and is PSD by construction.
+
+    Nugget → strict PD, then Cholesky.
+
+    Compared to SimpleAggKernel this reduces the number of independent random
+    programs from d*q to d and replaces nonlinear aggregations with a single
+    linear map, making the correlation structure bilinear in x and far easier
+    for the model to discover from context co-movement patterns.
+    """
+
+    is_copula_gen: bool = True
+
+    def __init__(
+        self,
+        nugget: float = 1e-4,
+        embed_dim: int = 4,
+        max_feats: int = 3,
+    ) -> None:
+        self.nugget = nugget
+        self.embed_dim = max(1, embed_dim)
+        self.max_feats = max(1, max_feats)
+
+    def __call__(self, X: torch.Tensor, d: int) -> torch.Tensor:
+        """Build per-instance Cholesky factors L(x_i) of the correlation matrix.
+
+        Args:
+            X: (B, T, p) — z-normalised input features
+            d: target output dimension
+        Returns:
+            L: (B, T, d, d) — lower-triangular Cholesky factor
+        """
+        B, T, p = X.shape
+        device = X.device
+        q = self.embed_dim
+        eps = self.nugget
+
+        W = torch.zeros(B, T, d, q, device=device)
+        for m in range(d):
+            n_feat = int(torch.randint(1, self.max_feats + 1, (1,)).item())
+            feat_idx = torch.stack(
+                [torch.randperm(p, device=device)[:n_feat] for _ in range(B)]
+            )  # (B, n_feat)
+            Xsel = X.gather(2, feat_idx.unsqueeze(1).expand(B, T, n_feat))  # (B, T, n_feat)
+            A = torch.randn(B, n_feat, q, device=device) / math.sqrt(n_feat)
+            W[:, :, m, :] = torch.bmm(Xsel, A)  # (B, T, q)
+
+        # Standardize over T per (b, m, q)
+        W_mean = W.mean(dim=1, keepdim=True)
+        W_std = W.std(dim=1, keepdim=True).clamp(min=1e-6)
+        W = (W - W_mean) / W_std  # (B, T, d, q)
+
+        # Cosine Gram matrix — always PSD, diagonal = 1, values in [-1, 1]
+        W_normed = W / W.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        K = torch.einsum("btmq,btnq->btmn", W_normed, W_normed)  # (B, T, d, d)
+
+        I_d = torch.eye(d, device=device).view(1, 1, d, d)
+        C = (1.0 - eps) * K + eps * I_d  # (B, T, d, d)
+
+        L = torch.linalg.cholesky(C.reshape(B * T, d, d)).reshape(B, T, d, d)
+        return L
+
+
 class KernelCovGen:
     """Per-instance x-dependent covariance via MLP-parameterized GP kernels.
 
