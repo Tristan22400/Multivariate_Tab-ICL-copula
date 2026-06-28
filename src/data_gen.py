@@ -737,9 +737,12 @@ class SimpleAggKernel:
             W_normed = W / W.norm(dim=-1, keepdim=True).clamp(min=1e-6)
             K = torch.einsum("btmq,btnq->btmn", W_normed, W_normed)  # (B, T, d, d)
         elif kernel_name == "dot_product":
-            # Raw inner-product Gram matrix normalised by embed_dim — always PSD.
-            # After T-standardisation each W component has unit variance, so diagonal ≈ 1.
-            K = torch.einsum("btmq,btnq->btmn", W, W) / q              # (B, T, d, d)
+            # Inner-product Gram matrix normalised to unit diagonal (Pearson correlation).
+            # W @ W^T / q has diagonal = ||W_m||²/q ~ chi²(q)/q which is ≠ 1 per instance,
+            # so we divide by sqrt(diag_m * diag_n) to guarantee a proper correlation matrix.
+            G = torch.einsum("btmq,btnq->btmn", W, W) / q              # (B, T, d, d)
+            diag = G.diagonal(dim1=-2, dim2=-1).clamp(min=1e-12)        # (B, T, d)
+            K = G / (diag.unsqueeze(-1) * diag.unsqueeze(-2)).sqrt()    # (B, T, d, d)
         else:
             # Distance-based stationary kernel — lengthscale only sampled when needed.
             log_lo = math.log(self.lengthscale_lo)

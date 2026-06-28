@@ -900,7 +900,7 @@ def main(cfg: DictConfig) -> None:
     optimizer.zero_grad()
 
     # Cache triu indices once — d is fixed across all episodes
-    _d_fixed = int(cfg.model.d_max)
+    _d_fixed = int(cfg.model.get("d_max", cfg.data.d_range[-1]))
     _ri_fixed, _ci_fixed = torch.triu_indices(_d_fixed, _d_fixed, offset=1, device=device)
 
     for step in range(start_step, int(cfg.training.steps)):
@@ -957,7 +957,11 @@ def main(cfg: DictConfig) -> None:
             # With bfloat16 the Cholesky can produce NaN; 0.0 * NaN = NaN which
             # would corrupt the MSE auxiliary loss even when nll_weight=0.
             if nll_weight > 0.0:
-                loss_nll = woodbury_nll(Z_query, mu_Z, d_Z, V_Z)
+                # Cast to float32: D can collapse to ~1e-7 in bfloat16, making M
+                # ill-conditioned (elements ~1e13) and causing Cholesky to fail.
+                loss_nll = woodbury_nll(
+                    Z_query.float(), mu_Z.float(), d_Z.float(), V_Z.float()
+                )
                 loss = nll_weight * loss_nll
             else:
                 loss_nll = torch.zeros(1, device=device)
@@ -983,6 +987,14 @@ def main(cfg: DictConfig) -> None:
             if alpha > 0.0:
                 loss = loss + alpha * loss_mse
 
+            # U-norm regularizer: (1/D - 1) == ||U||² per dim.
+            # Gradient w.r.t. U_jk = 2*U_jk (grows with ‖U‖), counteracting
+            # the Muon optimizer's tendency to blow up U when all other gradients vanish.
+            u_reg_weight = float(cfg.training.get("u_reg_weight", 0.0))
+            if u_reg_weight > 0.0:
+                loss_u_reg = (1.0 / d_Z.clamp(min=1e-8) - 1.0).mean()
+                loss = loss + u_reg_weight * loss_u_reg
+
         # ---- Backward ----
         scaler.scale(loss / accum_steps).backward()
         if (step + 1) % accum_steps == 0:
@@ -1003,7 +1015,9 @@ def main(cfg: DictConfig) -> None:
                 if nll_weight > 0.0:
                     wnll = loss_nll.item()
                 else:
-                    wnll = woodbury_nll(Z_query, mu_Z, d_Z, V_Z).item()
+                    wnll = woodbury_nll(
+                        Z_query.float(), mu_Z.float(), d_Z.float(), V_Z.float()
+                    ).item()
                 indep_z_train = indep_normal_nll(Z_query).item()
                 cnll_train = wnll - indep_z_train  # copula NLL
                 copula_gain = (

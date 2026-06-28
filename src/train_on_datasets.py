@@ -40,6 +40,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
 from data_gen import select_group_representative_indices
+from dataset import split_episode_files
 from loss import woodbury_nll
 from model import build_copula_tabicl_v2, build_copula_transformer
 from pit import load_tabicl, run_pit
@@ -498,11 +499,8 @@ def _run_realworld_dataset(
         include_outer=bool(acfg.include_outer),
     ).to(device)
 
-    _muon_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
-    _adam_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
-    optimizer = Muon(
-        [{"params": _muon_params, "use_muon": True},
-         {"params": _adam_params, "use_muon": False}],
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
         lr=float(acfg.lr),
         weight_decay=float(acfg.weight_decay),
     )
@@ -932,11 +930,8 @@ def _run_dataset(
         include_outer=bool(acfg.include_outer),
     ).to(device)
 
-    _muon_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
-    _adam_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
-    optimizer = Muon(
-        [{"params": _muon_params, "use_muon": True},
-         {"params": _adam_params, "use_muon": False}],
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
         lr=float(acfg.lr),
         weight_decay=float(acfg.weight_decay),
     )
@@ -1274,7 +1269,11 @@ def main() -> None:
     parser.add_argument("--config", default="conf/config.yaml")
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--episode_idx", type=int, default=0,
-                        help="Starting episode index; comparison.n_datasets episodes are used")
+                        help="Starting offset within the val set (0 = first val episode)")
+    parser.add_argument(
+        "--val_n_episodes", type=int, default=None,
+        help="Number of episodes held out from ICL training (default: cfg.training.val_n_episodes or 50)",
+    )
     parser.add_argument(
         "--steps", type=int, default=None, help="Override attn_copula.steps"
     )
@@ -1314,6 +1313,27 @@ def main() -> None:
     else:
         n_workers = os.cpu_count() or 4
 
+    # ---- Resolve val episodes (held out from ICL training) -----------------
+    val_n_ep = (
+        args.val_n_episodes
+        if args.val_n_episodes is not None
+        else int(cfg.training.get("val_n_episodes", 50))
+    )
+    _, val_files = split_episode_files(dataset_dir, val_n_ep)
+    val_episode_indices = [
+        int(os.path.splitext(os.path.basename(f))[0].split("_")[1]) for f in val_files
+    ]
+    print(
+        f"Val episodes (not seen during ICL training): {len(val_episode_indices)} total "
+        f"(indices {val_episode_indices[0]}…{val_episode_indices[-1]})"
+    )
+    if args.episode_idx + n_comparison_datasets > len(val_episode_indices):
+        print(
+            f"Warning: only {len(val_episode_indices) - args.episode_idx} val episodes "
+            f"available from offset {args.episode_idx}; capping n_comparison_datasets."
+        )
+        n_comparison_datasets = max(0, len(val_episode_indices) - args.episode_idx)
+
     print(f"Comparing {n_comparison_datasets} datasets | {n_workers} concurrent threads on {device}")
 
     # ---- Load ICL model once (shared read-only across threads) -------------
@@ -1339,7 +1359,7 @@ def main() -> None:
         torch.linalg.cond(_dummy)
         del _dummy
     _ep0 = torch.load(
-        os.path.join(cfg.training.dataset_dir, f"episode_{args.episode_idx:06d}.pt"),
+        val_files[args.episode_idx],
         map_location=device, weights_only=True,
     )
     with torch.no_grad():
@@ -1377,7 +1397,7 @@ def main() -> None:
     # ====================================================================
     # Parallel training and evaluation across datasets
     # ====================================================================
-    episode_indices = list(range(args.episode_idx, args.episode_idx + n_comparison_datasets))
+    episode_indices = val_episode_indices[args.episode_idx : args.episode_idx + n_comparison_datasets]
 
     # Pre-scan to select one episode per distinct K (deterministic, first-wins).
     print("Pre-scanning episodes to select one per K value for plotting...")

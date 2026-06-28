@@ -73,6 +73,15 @@ tabicl_max_feats: 3             # max input features sampled per output dim (>=1
 tabicl_lengthscale_lo: 0.1      # per-dataset lengthscale ~ LogU(lo, hi)
 tabicl_lengthscale_hi: 10.0
 
+# LinearProjKernel (used when cov_type: linear_proj)
+# Per output dim m, one random linear map R^{n_feat} → R^q applied to a random
+# feature subset, then cosine Gram matrix → correlation matrix.
+# Easier to synthesize than SimpleAggKernel: d (not d*q) independent programs,
+# linear structure, single fixed kernel (cosine).
+linear_proj_embed_dim: 4    # q: output dimension of each per-dim linear projection
+linear_proj_max_feats: 3    # max number of input features sampled per output dim
+linear_proj_nugget: 1.0e-4  # jitter added to diagonal for strict PD
+
 # Hyperplane-bimodal debug mode: two random PSD matrices per dataset separated by a
 # random hyperplane in X-space.  Group assignment is ~50/50 (per-dataset median split).
 # Activate with: data.hyperplane_bimodal=true

@@ -1,5 +1,5 @@
 defaults:
-  - model: tabicl-archi
+  - model: copula_tabicl_v2
   - data: multivariate
   - _self_
 
@@ -9,28 +9,29 @@ seed: 42  # test edit
 training:
   device: auto
   batch_size: 16          # B datasets per step (unused if dataset_dir is set; stored in episode)
-  steps: 100000
-  lr: 3.0e-4              # 3e-4 matches the working debug scripts (icl_corr_net3_pit / icl_corr_net_z)
+  steps: 500000
+  lr: 8.0e-3              # Muon base lr (paper: 8e-4 for stage 1, vs 1e-4 for AdamW in TabICL)
   lr_min: 1.0e-6
   warmup_steps: 200         # linear LR warmup before cosine decay (reduced proportionally from 1000)
-  weight_decay: 1.0e-4    # 1e-4 matches debug (was 0.0)
-  clip_grad_norm: 1.0     # 1.0 matches debug (was 0.1 — too restrictive)
+  weight_decay: 0.01      # Muon weight decay (paper: 0.01)
+  clip_grad_norm: 10.0    # Muon: paper increases clip from 1 to 10
   gradient_accumulation_steps: 1   # 1 matches debug — more frequent optimizer updates (was 16)
-  nll_weight: 0.0            # 0.0: use MSE-only like the working debug scripts (was 1.0 NLL-dominated)
+  nll_weight: 0.0            # re-enabled: NLL breaks the V@V^T bilinear gradient collapse
   aux_mse_weight: 1.0        # peak weight for off-diagonal MSE auxiliary loss; set 0 to disable
   aux_mse_anneal_frac: 10.0  # prevent MSE from being annealed to 0 (was 0.7 which killed the loss at 70% of training)
   log_every: 100
-  val_every: 500
-  plot_every: 500
+  val_every: 2000
+  plot_every: 2000
   save_every: 5000
   ckpt_dir: null # directory for saving checkpoints; auto-detected if resuming from ckpt_dir
   resume_from: null  # direct checkpoint path; takes priority over ckpt_dir auto-detection
   reset_icl_gate: false  # set true when resuming from a checkpoint where icl_gate is stuck near -3.0
   dataset_dir: ./data/pit_hyperplane_multimodal # path to pre-computed PIT episodes; required for training
   val_n_episodes: 50       # number of held-out episodes reserved for validation (never used in training)
-  compile: false         # disabled: torch.compile can cause issues with bfloat16 Woodbury NLL
-  n_think: 8             # thinking rows prepended to support set (attention sinks / extra compute)
+  compile: false         # disabled: PyTorch Inductor tiling_utils assertion bug in current env; re-enable when PyTorch is upgraded
+  n_think: 0             # thinking rows prepended to support set (attention sinks / extra compute)
   use_oracle_z: true    # replace Z_test with oracle PIT z*=(y-mu*)/sigma* during training; Z_train stays as TabICL z
+  sub_batch_size: null   # chunk size over the B dimension; null = auto-detect from GPU memory at startup
 
 
 dataset:
@@ -46,25 +47,26 @@ tabicl:
   ckpt: tabicl-regressor-v2-20260212.ckpt
   pit_batch_size: 256     # LOO chunk size (reduce if OOM during Phase 1)
   pit_eps: 1.0e-6        # fixed probit clamping epsilon
+  pit_n_splits: 5        # K-folds for train PIT (0 or 1 = LOO)
 
 comparison:
-  n_datasets: 1          # number of episodes used for ICL vs per-dataset model comparison
+  n_datasets: 50         # number of episodes used for ICL vs per-dataset model comparison
 
 attn_copula:
   m: 64                  # hidden dim for feature/row encoders and attention
   n_heads: 4
   n_layers: 2            # self-attention depth
   dropout: 0.15
-  weight_decay: 5.0e-3
+  weight_decay: 0.01      # Muon weight decay (paper: 0.01)
   alpha: 3.0             # tanh scale for Cholesky off-diag entries
   lambda_min: 1.0e-4
   lambda_max: 0.9
   include_outer: true    # include vech(z z^T) in row encoder input
   steps: 5000
-  lr: 1.0e-3
+  lr: 8.0e-4              # Muon base lr
   lr_min: 1.0e-6
   warmup_steps: 200         # linear LR warmup before cosine decay
-  clip_grad: 1.0
+  clip_grad: 10.0         # Muon: paper increases clip from 1 to 10
   val_every: 100         # evaluate on held-out val set every N steps
   patience: 1000          # early stopping: stop if no improvement for N steps
 
