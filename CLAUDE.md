@@ -7,4 +7,7 @@
   python src/evaluate.py --ckpt ./checkpoints/copula_transformer/step_0029999_final.pt
 
 
-Use the conda environment 'multivariate_ICL' to run some test locally. 
+Always use the conda environment 'multivariate-icl' for Python commands in this repo.
+For example: conda run -n multivariate-icl python src/train.py
+python src/train_on_datasets.py --config conf/config.yaml --ckpt ./checkpoints/copula-tabicl/
+ 

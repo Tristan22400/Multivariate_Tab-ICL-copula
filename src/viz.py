@@ -12,20 +12,19 @@ import torch
 def plot_corr_grid(
     estimators: dict[str, torch.Tensor],
     oracle_R: torch.Tensor,
-    n_instances: int = 3,
+    n_instances: int | None = None,
     title: str = "",
 ) -> plt.Figure:
     """Compare correlation matrices from multiple estimators against the oracle.
 
-    Layout: one column per estimator (plus one oracle column), n_instances rows.
-    Each cell shows the (d×d) correlation heatmap.
-    A second block of rows shows the absolute error |R* - R_hat| per estimator.
+    Layout: one column per estimator (plus one oracle column), one row per test
+    instance.  Each cell shows the (d×d) correlation heatmap.
 
     Args:
         estimators : dict mapping estimator name → R tensor of shape (d, d) or
                      (n_qry, d, d).  A (d, d) tensor is broadcast to all instances.
         oracle_R   : (n_qry, d, d) or (d, d) — oracle correlation matrices.
-        n_instances: number of query instances (rows) to plot.
+        n_instances: number of query instances (rows) to plot.  Defaults to all.
         title      : figure suptitle.
 
     Returns:
@@ -40,9 +39,11 @@ def plot_corr_grid(
     if oracle_R.dim() == 2:
         oracle_R = oracle_R.unsqueeze(0)
     n_qry = oracle_R.shape[0]
-    n_instances = min(n_instances, n_qry)
-    d = oracle_R.shape[-1]
-    indices = np.linspace(0, n_qry - 1, n_instances, dtype=int)
+    if n_instances is None:
+        n_instances = n_qry
+    else:
+        n_instances = min(n_instances, n_qry)
+    indices = list(range(n_instances))
 
     # Normalise each estimator to (n_qry, d, d)
     est_tensors: dict[str, np.ndarray] = {}
@@ -55,9 +56,8 @@ def plot_corr_grid(
     names = list(est_tensors.keys())
     n_est = len(names)
 
-    # Layout: 2 * n_instances rows (predicted | error), n_est+1 columns (oracle + estimators)
     n_cols = n_est + 1
-    n_rows = 2 * n_instances
+    n_rows = n_instances
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.0 * n_cols, 3.0 * n_rows))
     if title:
         fig.suptitle(title, fontsize=13, fontweight="bold", y=1.01)
@@ -87,37 +87,17 @@ def plot_corr_grid(
         R_oracle = oracle_np[inst_idx]  # (d, d)
         cov_max = max(abs(R_oracle).max(), 1.0)
 
-        # --- Top half: predicted correlation matrices ---
-        pred_row = row_i * 2
-
         # Oracle column (col 0)
-        ax = axes[pred_row, 0]
+        ax = axes[row_i, 0]
         _heatmap(ax, R_oracle, -cov_max, cov_max)
         ax.set_title(f"Oracle R* (i={inst_idx})", fontsize=8)
-        if row_i == 0:
-            axes[pred_row, 0].set_ylabel("Predicted", fontsize=8)
 
         # Estimator columns
         for col_i, name in enumerate(names):
             R_est = est_tensors[name][inst_idx]
-            ax = axes[pred_row, col_i + 1]
+            ax = axes[row_i, col_i + 1]
             _heatmap(ax, R_est, -cov_max, cov_max)
             ax.set_title(name, fontsize=8)
-
-        # --- Bottom half: absolute error |R* - R_hat| ---
-        err_row = row_i * 2 + 1
-
-        # Empty oracle column for the error row (just blank)
-        axes[err_row, 0].axis("off")
-        if row_i == 0:
-            axes[err_row, 0].set_ylabel("|R* − R̂|", fontsize=8)
-
-        for col_i, name in enumerate(names):
-            R_est = est_tensors[name][inst_idx]
-            err = np.abs(R_oracle - R_est)
-            ax = axes[err_row, col_i + 1]
-            _heatmap(ax, err, 0, err.max().clip(min=1e-6), cmap="Reds")
-            ax.set_title(f"|R*−{name}|", fontsize=8)
 
     fig.tight_layout(rect=[0, 0, 1, 0.97] if title else None)
     return fig
@@ -137,6 +117,7 @@ def plot_prediction_comparison(
     sigma_oas: np.ndarray | None = None,
     fig: plt.Figure | None = None,
     dataset_label: str = "",
+    instance_indices: list[int] | None = None,
 ) -> plt.Figure:
     """Compare predicted vs oracle covariance for multiple query instances.
 
@@ -177,7 +158,11 @@ def plot_prediction_comparison(
 
     N = D_pred.shape[1]
     n_instances = min(n_instances, N)
-    indices = np.linspace(0, N - 1, n_instances, dtype=int)
+    if instance_indices is not None:
+        indices = np.array(instance_indices, dtype=int)
+        n_instances = len(indices)
+    else:
+        indices = np.linspace(0, N - 1, n_instances, dtype=int)
 
     # ------------------------------------------------------------------ #
     # Pre-collect correlation matrices for the off-diagonal scatter.

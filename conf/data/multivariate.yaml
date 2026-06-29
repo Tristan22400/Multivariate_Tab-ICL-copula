@@ -11,8 +11,8 @@ p_range: [20, 20]
 d_range: [8,8]
 
 # Context (train) and query (test) sizes
-n_train_range: [256,256]
-n_test_range: [16, 16]
+n_train_range: [512,512]
+n_test_range: [64, 64]
 
 # Low-rank factor r used in DATA generation (ground truth covariance rank)
 # This is independent of model.rank (the readout's approximation rank)
@@ -21,11 +21,11 @@ r_data: 8
 # Hidden width of the three random MLPs used to parameterise f, d_net, V_net
 mlp_hidden: 64
 
-# Constant diagonal added to the ground-truth covariance in every episode.
-# Sigma(x) = diag(diag_alpha) + V(x) @ V(x)^T
-# Setting diag_alpha > 0 ensures D_oracle > 0, preventing the model from
-# collapsing to V≈0 (the saddle point where ∂NLL/∂V = 0 when D >> D_oracle).
-diag_alpha: 0.5
+# Range for the diagonal variance sampled independently for each episode.
+# Sigma(x) = diag(diag_alpha_episode) + V(x) @ V(x)^T
+# Keeping this positive ensures D_oracle > 0, while varying it prevents the
+# model from overfitting to a single diagonal noise level.
+diag_alpha_range: [0.05, 2.0]
 
 # Per-dataset fixed covariance: sample a piecewise-constant mean (fixed_cov_n_anchors Voronoi                                                                                
 # regions) and a random Sigma = diag(D) + V @ V^T independently for each of the B datasets.                                                                                  
@@ -41,14 +41,56 @@ fixed_cov_n_anchors: 4   # K Voronoi regions for the piecewise-constant mean (fi
 #            The kernel hyperparameters l(x) and σ²(x) come from frozen MLPs; a fresh set of
 #            latent embeddings E ∈ R^(d × kernel_latent_dim) is sampled per episode so each
 #            episode presents a distinct x→Σ mapping for the in-context learner to recover.
-cov_type: kernel
+cov_type: iso_kernel
 num_anchors: 2        # K: number of anchor covariance prototypes (cov_type=anchor)
 anchor_temp: 1.0      # τ: softmax temperature for x-to-anchor similarity (cov_type=anchor)
 
 # Kernel covariance settings (used when cov_type: kernel)
 # kernel_type: rbf | exponential | matern32 | rational_quadratic | periodic | random
 #   random picks one kernel per episode uniformly.
-kernel_type: random
+kernel_type: rbf
 kernel_latent_dim: 1  # dimension of latent embeddings e_j for each output dim
 kernel_nugget: 1.0e-4 # jitter added to diagonal for strict PD
 
+# Isotropic Modulated Kernel — Dataset 1 (used when cov_type: iso_kernel)
+# Maps x_i to a correlation matrix (Elliptope) via a 1-D linear projection
+# and a stationary isotropic kernel.  diag_alpha is ignored (zeroed internally).
+# kernel: rbf | matern12 | matern32 | matern52 | random
+iso_kernel_type: rbf
+iso_kernel_nugget: 1.0e-4
+
+# TabICL feature-kernel covariance (used when cov_type: tabicl_kernel)
+# Per output dim m, build an instance-dependent q-dim embedding W_m(x) by sampling
+# 1..tabicl_max_feats input features and applying random TabICLv2-style functions +
+# aggregation (concat or separate+{sum,product,max,logsumexp}); then
+#   Sigma_mn(x) = k( ||W_m(x) - W_n(x)||, l_b )
+# where l_b ~ LogU(lo, hi) is fixed per dataset.  Copula generator (unit diagonal).
+# Function pool: linear, mlp, quadratic, product, nn_discretize, tree_ensemble, rff_gp, plateau
+tabicl_kernel_type: random      # rbf | matern12 | matern32 | matern52 | random
+tabicl_kernel_nugget: 1.0e-4
+tabicl_embed_dim: 4             # q: embedding dim for each W_m(x)
+tabicl_max_feats: 3             # max input features sampled per output dim (>=1)
+tabicl_lengthscale_lo: 0.1      # per-dataset lengthscale ~ LogU(lo, hi)
+tabicl_lengthscale_hi: 10.0
+
+# LinearProjKernel (used when cov_type: linear_proj)
+# Per output dim m, one random linear map R^{n_feat} → R^q applied to a random
+# feature subset, then cosine Gram matrix → correlation matrix.
+# Easier to synthesize than SimpleAggKernel: d (not d*q) independent programs,
+# linear structure, single fixed kernel (cosine).
+linear_proj_embed_dim: 4    # q: output dimension of each per-dim linear projection
+linear_proj_max_feats: 3    # max number of input features sampled per output dim
+linear_proj_nugget: 1.0e-4  # jitter added to diagonal for strict PD
+
+# Hyperplane-bimodal debug mode: two random PSD matrices per dataset separated by a
+# random hyperplane in X-space.  Group assignment is ~50/50 (per-dataset median split).
+# Activate with: data.hyperplane_bimodal=true
+# V scale for group 1 (weak correlations, near-independent)
+hyperplane_multimodal: true
+hyperplane_multimodal_scale_lo: 0.1
+# V scale for group 2 (strong correlations, highly structured)
+hyperplane_multimodal_scale_hi: 6.0
+# Fix number of groups (null = random in {2..6})
+hyperplane_multimodal_n_groups: null
+# Add a per-group piecewise-constant mean (false = zero mean)
+hyperplane_multimodal_use_mean: false

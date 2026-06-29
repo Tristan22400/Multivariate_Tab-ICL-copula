@@ -30,17 +30,6 @@ import torch
 import torch.nn as nn
 
 # ---------------------------------------------------------------------------
-# Path setup — find tabicl_upstream regardless of working directory
-# ---------------------------------------------------------------------------
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_TABICL_SRC = os.path.join(_REPO_ROOT, "tabicl_upstream", "src")
-if _TABICL_SRC not in sys.path:
-    sys.path.insert(0, _TABICL_SRC)
-
-
-# ---------------------------------------------------------------------------
 # TabICL loader
 # ---------------------------------------------------------------------------
 
@@ -56,7 +45,7 @@ def load_tabicl(ckpt_name: str, device: str) -> nn.Module:
         base : TabICL module in eval() mode with all parameters frozen.
     """
     from huggingface_hub import hf_hub_download
-    from tabicl._model.tabicl import TabICL  # type: ignore[import]
+    from tabicl.model.tabicl import TabICL
 
     ckpt_path = hf_hub_download(repo_id="jingang/TabICL", filename=ckpt_name)
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -147,6 +136,7 @@ def run_pit(
     pit_batch_size: int = 64,
     eps: float = 1e-6,
     dequantize: bool = False,
+    n_splits: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Map raw targets Y → standard-normal latents Z via TabICL's quantile CDF.
 
@@ -155,9 +145,14 @@ def run_pit(
         u_{i,j} = F̂_j(y_{i,j} | x_i, context_i)
         z_{i,j} = Φ⁻¹(u_{i,j})
 
-    For training instances a batched LOO scheme ensures each u_{i,j} is
-    computed without instance i in its own context.  Test instances use the
-    full training set as context (standard ICL).
+    For training instances, two schemes are supported:
+      - LOO (n_splits <= 1): each point's context is all other N-1 points,
+        processed in parallel chunks of pit_batch_size — tensors are
+        (chunk, N, p) which is expensive for large N.
+      - K-folds (n_splits >= 2): training data is split into K folds; for
+        fold k the context is the remaining K-1 folds, yielding K forward
+        passes of shape (1, N, p) — much lower peak memory.
+    Test instances always use the full training set as context (standard ICL).
 
     Args:
         tabicl        : frozen TabICL model (from `load_tabicl`)
@@ -165,12 +160,13 @@ def run_pit(
         Y_train       : (N_train, d)  training targets
         X_test        : (N_test,  p)  test features
         Y_test        : (N_test,  d)  test targets
-        pit_batch_size: max chunk size for the batched LOO forward pass
+        pit_batch_size: chunk size for the batched LOO forward pass (LOO only)
         eps           : clamping epsilon before probit (guards against ±∞)
         dequantize    : if True, add Uniform(0,1) noise to Y before CDF
                         evaluation — corrects for discrete/ordinal targets
                         (e.g. integer grades) where the tabular CDF has
                         probability mass rather than density
+        n_splits      : number of folds for K-folds PIT (0 or 1 = LOO)
 
     Returns:
         Z_train    : (N_train, d)  standard-normal latents for training set
@@ -204,26 +200,51 @@ def run_pit(
         u_test_j = dist_test.cdf(y_test_j_eval)  # (N_test,)
         lp_test_j = dist_test.log_prob(y_test_j_eval)  # (N_test,)
 
-        # ---- B) Training instances: batched LOO ---------------------------
+        # ---- B) Training instances ----------------------------------------
         u_train_j = torch.empty(N_train, device=device, dtype=y_train_j.dtype)
 
-        for chunk_start in range(0, N_train, pit_batch_size):
-            chunk_end = min(chunk_start + pit_batch_size, N_train)
+        if n_splits >= 2:
+            # K-folds: K passes of shape (1, N_train, p) — low peak memory
+            fold_size = (N_train + n_splits - 1) // n_splits
+            for k in range(n_splits):
+                qry_start = k * fold_size
+                qry_end = min(qry_start + fold_size, N_train)
+                qry_idx = torch.arange(qry_start, qry_end, device=device)
+                ctx_idx = torch.cat([
+                    torch.arange(0, qry_start, device=device),
+                    torch.arange(qry_end, N_train, device=device),
+                ])
 
-            X_loo, y_loo = _build_loo_chunk(X_train, y_train_j, chunk_start, chunk_end)
-            # X_loo : (chunk, N_train, p) — context N_train-1 rows + query at end
-            # y_loo : (chunk, N_train-1)  — context labels
+                # (1, N_train, p): context rows first, then query rows
+                X_fold = torch.cat([X_train[ctx_idx], X_train[qry_idx]], dim=0).unsqueeze(0)
+                y_ctx = y_train_j[ctx_idx].unsqueeze(0)  # (1, N_train - fold_size)
 
-            logits_loo = tabicl(X_loo, y_loo)  # (chunk, 1, Q)
-            dist_loo = tabicl.quantile_dist(
-                logits_loo[:, 0, :]
-            )  # batch_shape = (chunk,)
+                logits_fold = tabicl(X_fold, y_ctx)  # (1, fold_size, Q)
+                dist_fold = tabicl.quantile_dist(logits_fold[0])  # batch_shape = (fold_size,)
 
-            y_chunk_j = y_train_j[chunk_start:chunk_end]
-            if dequantize:
-                y_chunk_j = y_chunk_j + torch.rand_like(y_chunk_j)
+                y_qry_j = y_train_j[qry_idx]
+                if dequantize:
+                    y_qry_j = y_qry_j + torch.rand_like(y_qry_j)
+                u_train_j[qry_idx] = dist_fold.cdf(y_qry_j)
+        else:
+            # LOO: ceil(N/pit_batch_size) passes of shape (chunk, N_train, p)
+            for chunk_start in range(0, N_train, pit_batch_size):
+                chunk_end = min(chunk_start + pit_batch_size, N_train)
 
-            u_train_j[chunk_start:chunk_end] = dist_loo.cdf(y_chunk_j)  # (chunk,)
+                X_loo, y_loo = _build_loo_chunk(X_train, y_train_j, chunk_start, chunk_end)
+                # X_loo : (chunk, N_train, p) — context N_train-1 rows + query at end
+                # y_loo : (chunk, N_train-1)  — context labels
+
+                logits_loo = tabicl(X_loo, y_loo)  # (chunk, 1, Q)
+                dist_loo = tabicl.quantile_dist(
+                    logits_loo[:, 0, :]
+                )  # batch_shape = (chunk,)
+
+                y_chunk_j = y_train_j[chunk_start:chunk_end]
+                if dequantize:
+                    y_chunk_j = y_chunk_j + torch.rand_like(y_chunk_j)
+
+                u_train_j[chunk_start:chunk_end] = dist_loo.cdf(y_chunk_j)  # (chunk,)
 
         # ---- C) Clamp + probit --------------------------------------------
         z_train_j = _probit(u_train_j, eps)
@@ -305,7 +326,7 @@ def run_pit_batched(
     Q = logits_test.shape[-1]
     dist_test = tabicl.quantile_dist(logits_test.reshape(B * d * N_test, Q))
 
-    y_test_fused = Y_test.permute(0, 2, 1).reshape(B * d * N_test)
+    y_test_fused = Y_test.permute(0, 2, 1).reshape(B * d * N_test).to(device)
     if dequantize:
         y_test_fused = y_test_fused + torch.rand_like(y_test_fused)
     u_test = dist_test.cdf(y_test_fused).reshape(B, d, N_test).permute(0, 2, 1)
@@ -346,9 +367,9 @@ def run_pit_batched(
             _sync(device)
             fold_times.append(time.perf_counter() - _tf0)
 
-            dist_fold = tabicl.quantile_dist(logits_fold.reshape(-1, Q))
+            dist_fold = tabicl.quantile_dist(logits_fold.reshape(-1, Q).to(device))
 
-            y_qry = Y_train[:, fold_idx, :].permute(0, 2, 1).reshape(-1)
+            y_qry = Y_train[:, fold_idx, :].permute(0, 2, 1).reshape(-1).to(device)
             if dequantize:
                 y_qry = y_qry + torch.rand_like(y_qry)
 
@@ -384,8 +405,8 @@ def run_pit_batched(
             _sync(device)
             fold_times.append(time.perf_counter() - _tf0)
 
-            dist_loo = tabicl.quantile_dist(logits_loo[:, 0, :])
-            y_chunk = Y_train[:, chunk_start:chunk_end, :].reshape(B * chunk * d)
+            dist_loo = tabicl.quantile_dist(logits_loo[:, 0, :].to(device))
+            y_chunk = Y_train[:, chunk_start:chunk_end, :].reshape(B * chunk * d).to(device)
             if dequantize:
                 y_chunk = y_chunk + torch.rand_like(y_chunk)
             u_train[:, chunk_start:chunk_end, :] = dist_loo.cdf(y_chunk).reshape(

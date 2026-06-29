@@ -148,7 +148,7 @@ def load_student(device: str):
     y_df = y_df[valid].reset_index(drop=True)
 
     # One-hot encode categorical columns
-    cat_col_names = X_df.select_dtypes(include=["object", "category"]).columns.tolist()
+    cat_col_names = X_df.select_dtypes(include=["object", "category", "string"]).columns.tolist()
     X_df = pd.get_dummies(X_df, columns=cat_col_names, drop_first=False)
     X_df = X_df.astype(np.float32)
 

@@ -24,7 +24,10 @@ import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 
+import random as _random
+
 import hydra
+import numpy as _np
 import torch
 from omegaconf import DictConfig
 from tqdm import tqdm
@@ -36,8 +39,65 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _HERE)
 
-from data_gen import GlobalAnchorCovGen, GlobalFixedNets, KernelCovGen, generate_episode
+from data_gen import GlobalAnchorCovGen, GlobalFixedNets, IsotropicModulatedKernel, KernelCovGen, LinearProjKernel, SimpleAggKernel, TabICLFeatureKernel, generate_episode
 from pit import load_tabicl, run_pit_batched
+
+# ---------------------------------------------------------------------------
+# Auto dataset name
+# ---------------------------------------------------------------------------
+
+
+def _auto_dataset_name(cfg) -> str:
+    """Build a human-readable dataset folder name from config parameters."""
+    data, ds = cfg.data, cfg.dataset
+    hyp_mm = bool(data.get("hyperplane_multimodal", False))
+    fixed   = bool(data.get("fixed_cov", False))
+
+    if hyp_mm:
+        mode = "hyp_mm"
+    elif fixed:
+        n_anch = int(data.get("fixed_cov_n_anchors", 4))
+        mode = f"fixed_cov{n_anch}"
+    else:
+        cov_type = str(data.get("cov_type", "mlp"))
+        if cov_type == "iso_kernel":
+            mode = f"iso_{data.get('iso_kernel_type', 'rbf')}"
+        elif cov_type == "kernel":
+            mode = f"kernel_{data.get('kernel_type', 'random')}"
+        elif cov_type == "anchor":
+            mode = f"anchor{data.get('num_anchors', 2)}"
+        elif cov_type == "linear_proj":
+            mode = f"linear_proj_q{data.get('linear_proj_embed_dim', 4)}"
+        elif cov_type == "simple_agg":
+            mode = f"simple_agg_{data.get('simple_agg_kernel_type', 'cosine')}"
+        elif cov_type == "tabicl_kernel":
+            mode = f"tabicl_{data.get('tabicl_kernel_type', 'random')}"
+        else:
+            mode = "mlp"
+
+    def rng(lo, hi):
+        return str(lo) if lo == hi else f"{lo}-{hi}"
+
+    p_lo, p_hi   = int(data.p_range[0]),      int(data.p_range[1])
+    d_lo, d_hi   = int(data.d_range[0]),       int(data.d_range[1])
+    pt_lo, pt_hi = int(data.n_train_range[0]), int(data.n_train_range[1])
+    nt_lo, nt_hi = int(data.n_test_range[0]),  int(data.n_test_range[1])
+    r_data       = int(data.r_data)
+    B            = int(ds.batch_size)
+    k_folds      = ds.get("k_folds", None)
+
+    name = (
+        f"pit_{mode}"
+        f"_p{rng(p_lo, p_hi)}"
+        f"_d{rng(d_lo, d_hi)}"
+        f"_nt{rng(pt_lo, pt_hi)}"
+        f"_ntest{rng(nt_lo, nt_hi)}"
+        f"_r{r_data}_B{B}"
+    )
+    if k_folds:
+        name += f"_K{int(k_folds)}"
+    return name
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -46,6 +106,15 @@ from pit import load_tabicl, run_pit_batched
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
+    # ---- Seed (top-level cfg.seed; use 0 as default so generation is reproducible) ----
+    seed = int(cfg.get("seed", 0))
+    _random.seed(seed)
+    _np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    print(f"Seed : {seed}")
+
     # ---- Device ----
     device = cfg.training.device
     if device == "auto":
@@ -53,7 +122,12 @@ def main(cfg: DictConfig) -> None:
     print(f"Device : {device}")
 
     # ---- Output directory ----
-    out_dir = cfg.dataset.output_dir
+    out_dir = cfg.dataset.get("output_dir", None)
+    if out_dir is None or str(out_dir).strip().lower() in ("null", "none", "auto", ""):
+        dataset_name = _auto_dataset_name(cfg)
+        out_dir = os.path.join("./data", dataset_name)
+        print(f"Auto-generated output dir : {out_dir}")
+        print(f"  → set training.dataset_dir={out_dir}  when training on this dataset")
     os.makedirs(out_dir, exist_ok=True)
     n_episodes = int(cfg.dataset.n_episodes)
     resume = bool(cfg.dataset.resume)
@@ -89,16 +163,31 @@ def main(cfg: DictConfig) -> None:
     nt_lo, nt_hi = int(cfg.data.n_test_range[0]), int(cfg.data.n_test_range[1])
     r_data = int(cfg.data.r_data)
     mlp_hidden = int(cfg.data.mlp_hidden)
+    diag_alpha_range = cfg.data.get("diag_alpha_range", [0.05, 2.0])
+    diag_alpha_lo = float(diag_alpha_range[0])
+    diag_alpha_hi = float(diag_alpha_range[1])
+    if not (0.0 < diag_alpha_lo <= diag_alpha_hi):
+        raise ValueError(
+            "data.diag_alpha_range must be positive and ordered as [lo, hi]"
+        )
+    hyperplane_multimodal = bool(cfg.data.get("hyperplane_multimodal", False))
+    hyperplane_multimodal_scale_lo = float(
+        cfg.data.get("hyperplane_multimodal_scale_lo", 0.1)
+    )
+    hyperplane_multimodal_scale_hi = float(
+        cfg.data.get("hyperplane_multimodal_scale_hi", 6.0)
+    )
+    _n_groups_cfg = cfg.data.get("hyperplane_multimodal_n_groups", None)
+    hyperplane_multimodal_n_groups = int(_n_groups_cfg) if _n_groups_cfg is not None else None
+    hyperplane_multimodal_use_mean = bool(cfg.data.get("hyperplane_multimodal_use_mean", False))
     fixed_cov = bool(cfg.data.get("fixed_cov", False))
-    fixed_cov_rho = float(cfg.data.get("fixed_cov_rho", 0.8))
     fixed_cov_n_anchors = int(cfg.data.get("fixed_cov_n_anchors", 4))
-    diag_alpha = float(cfg.data.get("diag_alpha", 0.0))
 
     # ---- Covariance generator (persistent across episodes for stability) ----
     fixed_nets: GlobalFixedNets | None = None
     anchor_gen: GlobalAnchorCovGen | None = None
     kernel_cov_gen: KernelCovGen | None = None
-    if not fixed_cov:
+    if not hyperplane_multimodal:
         cov_type = str(cfg.data.get("cov_type", "mlp"))
         if cov_type == "anchor":
             num_anchors = int(cfg.data.get("num_anchors", 8))
@@ -121,6 +210,68 @@ def main(cfg: DictConfig) -> None:
                 f"KernelCovGen: kernel={kernel_type}, latent_dim={kernel_latent_dim}, "
                 f"nugget={kernel_nugget}"
             )
+        elif cov_type == "iso_kernel":
+            iso_kernel_type = str(cfg.data.get("iso_kernel_type", "rbf"))
+            iso_kernel_nugget = float(cfg.data.get("iso_kernel_nugget", 1e-4))
+            kernel_cov_gen = IsotropicModulatedKernel(
+                kernel_type=iso_kernel_type,
+                nugget=iso_kernel_nugget,
+            )
+            print(
+                f"IsotropicModulatedKernel: kernel={iso_kernel_type}, "
+                f"nugget={iso_kernel_nugget}"
+            )
+        elif cov_type == "tabicl_kernel":
+            tabicl_kernel_type = str(cfg.data.get("tabicl_kernel_type", "random"))
+            tabicl_kernel_nugget = float(cfg.data.get("tabicl_kernel_nugget", 1e-4))
+            tabicl_embed_dim = int(cfg.data.get("tabicl_embed_dim", 4))
+            tabicl_max_feats = int(cfg.data.get("tabicl_max_feats", 3))
+            tabicl_ls_lo = float(cfg.data.get("tabicl_lengthscale_lo", 0.1))
+            tabicl_ls_hi = float(cfg.data.get("tabicl_lengthscale_hi", 10.0))
+            kernel_cov_gen = TabICLFeatureKernel(
+                kernel_type=tabicl_kernel_type,
+                nugget=tabicl_kernel_nugget,
+                embed_dim=tabicl_embed_dim,
+                max_feats=tabicl_max_feats,
+                lengthscale_lo=tabicl_ls_lo,
+                lengthscale_hi=tabicl_ls_hi,
+            )
+            print(
+                f"TabICLFeatureKernel: kernel={tabicl_kernel_type}, "
+                f"embed_dim={tabicl_embed_dim}, max_feats={tabicl_max_feats}"
+            )
+        elif cov_type == "linear_proj":
+            lp_nugget    = float(cfg.data.get("linear_proj_nugget",    1e-4))
+            lp_embed_dim = int(cfg.data.get("linear_proj_embed_dim",  4))
+            lp_max_feats = int(cfg.data.get("linear_proj_max_feats",  3))
+            kernel_cov_gen = LinearProjKernel(
+                nugget=lp_nugget,
+                embed_dim=lp_embed_dim,
+                max_feats=lp_max_feats,
+            )
+            print(
+                f"LinearProjKernel: embed_dim={lp_embed_dim}, max_feats={lp_max_feats}, "
+                f"nugget={lp_nugget}"
+            )
+        elif cov_type == "simple_agg":
+            sa_kernel_type = str(cfg.data.get("simple_agg_kernel_type", "cosine"))
+            sa_nugget      = float(cfg.data.get("simple_agg_nugget",      1e-4))
+            sa_max_feats   = int(cfg.data.get("simple_agg_max_feats",    3))
+            sa_embed_dim   = int(cfg.data.get("simple_agg_embed_dim",    4))
+            sa_ls_lo       = float(cfg.data.get("simple_agg_lengthscale_lo", 0.1))
+            sa_ls_hi       = float(cfg.data.get("simple_agg_lengthscale_hi", 10.0))
+            kernel_cov_gen = SimpleAggKernel(
+                kernel_type=sa_kernel_type,
+                nugget=sa_nugget,
+                max_feats=sa_max_feats,
+                embed_dim=sa_embed_dim,
+                lengthscale_lo=sa_ls_lo,
+                lengthscale_hi=sa_ls_hi,
+            )
+            print(
+                f"SimpleAggKernel: kernel={sa_kernel_type}, "
+                f"embed_dim={sa_embed_dim}, max_feats={sa_max_feats}"
+            )
         else:
             fixed_nets = GlobalFixedNets(r=r_data, hidden=mlp_hidden, device=device)
             print("GlobalFixedNets: mlp covariance generator")
@@ -136,8 +287,10 @@ def main(cfg: DictConfig) -> None:
         "n_train_range": [pt_lo, pt_hi],
         "n_test_range": [nt_lo, nt_hi],
         "r_data": r_data,
+        "hyperplane_multimodal": hyperplane_multimodal,
         "fixed_cov": fixed_cov,
-        "diag_alpha": diag_alpha,
+        "fixed_cov_n_anchors": fixed_cov_n_anchors,
+        "diag_alpha_range": [diag_alpha_lo, diag_alpha_hi],
     }
 
     meta_path = os.path.join(out_dir, "meta.json")
@@ -224,6 +377,14 @@ def main(cfg: DictConfig) -> None:
             n_test = int(torch.randint(nt_lo, nt_hi + 1, ()).item())
 
             actual_K = len(step_ids)  # last step may be smaller
+            diag_alpha_episode = torch.empty(actual_K).uniform_(
+                diag_alpha_lo, diag_alpha_hi
+            )
+            diag_alpha_batch = (
+                diag_alpha_episode.repeat_interleave(B)
+                .to(device)
+                .view(B * actual_K, 1, 1)
+            )
 
             # ---- Generate B*K datasets in one shot ----
             t0 = time.perf_counter()
@@ -237,13 +398,17 @@ def main(cfg: DictConfig) -> None:
                 device,
                 mlp_hidden=mlp_hidden,
                 return_oracle=True,
-                fixed_cov=fixed_cov,
-                fixed_cov_rho=fixed_cov_rho,
-                fixed_cov_n_anchors=fixed_cov_n_anchors,
                 fixed_nets=fixed_nets,
                 anchor_gen=anchor_gen,
                 kernel_cov_gen=kernel_cov_gen,
-                diag_alpha=diag_alpha,
+                diag_alpha=diag_alpha_batch,
+                hyperplane_multimodal=hyperplane_multimodal,
+                hyperplane_multimodal_scale_lo=hyperplane_multimodal_scale_lo,
+                hyperplane_multimodal_scale_hi=hyperplane_multimodal_scale_hi,
+                hyperplane_multimodal_n_groups=hyperplane_multimodal_n_groups,
+                hyperplane_multimodal_use_mean=hyperplane_multimodal_use_mean,
+                fixed_cov=fixed_cov,
+                fixed_cov_n_anchors=fixed_cov_n_anchors,
             )
             t1 = time.perf_counter()
             prof["t_datagen"].append(t1 - t0)
@@ -307,10 +472,15 @@ def main(cfg: DictConfig) -> None:
                             "oracle_mu": oracle["mu"][sl].cpu(),
                             "oracle_D": oracle["D"][sl].cpu(),
                             "oracle_V": oracle["V"][sl].cpu(),
+                            "oracle_mu_train": oracle["mu_train"][sl].cpu(),
+                            "oracle_D_train": oracle["D_train"][sl].cpu(),
+                            "oracle_V_train": oracle["V_train"][sl].cpu(),
+                            **({"oracle_groups": oracle["groups"][sl].cpu()} if "groups" in oracle else {}),
                             "p": p,
                             "d": d,
                             "n_train": n_train,
                             "n_test": n_test,
+                            "diag_alpha": float(diag_alpha_episode[k].item()),
                         },
                         fpath,
                     )

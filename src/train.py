@@ -43,8 +43,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from muon import Muon
 
 # ---------------------------------------------------------------------------
 # Path setup — must happen before local imports
@@ -55,10 +55,10 @@ sys.path.insert(0, _HERE)
 
 from sklearn.covariance import OAS
 
+from data_gen import select_group_representative_indices
 from dataset import infinite_episode_iter, make_episode_loader, split_episode_files
 from loss import indep_normal_nll, woodbury_nll
-from model import build_copula_tabicl_v2
-from viz import plot_prediction_comparison
+from model import build_copula_tabicl, build_copula_tabicl_v2
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -72,6 +72,9 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    # Warn (don't error) when a non-deterministic op is used, so training
+    # stays functional but we can detect remaining sources of variance.
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +129,157 @@ def _energy_score_batched(
 
 
 # ---------------------------------------------------------------------------
+# Validation plot helpers
+# ---------------------------------------------------------------------------
+
+
+_MAX_PLOT_INSTANCES = 16
+
+
+def _select_unique_oracle_indices(
+    R_ora_b: np.ndarray,  # (n_test, d, d)
+    max_n: int,
+    atol: float = 1e-4,
+) -> list[int]:
+    """Return up to max_n indices with mutually distinct oracle correlation matrices.
+
+    Pass 1: pick instances whose upper-triangle MSE differs from every already-selected
+    oracle by more than atol.  Pass 2: fill remaining slots in order from unused indices.
+    """
+    n_test, d, _ = R_ora_b.shape
+    ri, ci = np.triu_indices(d, k=1)
+
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    selected_vecs: list[np.ndarray] = []
+
+    for idx in range(n_test):
+        vec = R_ora_b[idx, ri, ci]
+        if not any(np.mean((vec - sv) ** 2) <= atol for sv in selected_vecs):
+            selected.append(idx)
+            selected_set.add(idx)
+            selected_vecs.append(vec)
+        if len(selected) >= max_n:
+            break
+
+    if len(selected) < max_n:
+        for idx in range(n_test):
+            if idx not in selected_set:
+                selected.append(idx)
+                selected_set.add(idx)
+            if len(selected) >= max_n:
+                break
+
+    return selected[:max_n]
+
+
+def _pick_diverse_plot_episodes(val_episodes: list[dict], min_plots: int = 3) -> list[int]:
+    """Return indices into val_episodes — one per distinct K, at least min_plots total.
+
+    K is inferred by counting distinct oracle_V rows for dataset b=0 (rounded to
+    5 decimal places).  Selection is deterministic: the first episode found for each
+    K value is kept.  If fewer than min_plots distinct K values exist, additional
+    episodes are appended in episode order until min_plots is reached.
+    """
+    k_to_idx: dict[int, int] = {}
+    for i, ep in enumerate(val_episodes):
+        V = ep["oracle_V"]          # (B, n_test, d, r)
+        n_test = V.shape[1]
+        v0 = V[0].reshape(n_test, -1).float().numpy()
+        k = int(len(np.unique(v0.round(5), axis=0)))
+        if k not in k_to_idx:
+            k_to_idx[k] = i
+    selected = [idx for _, idx in sorted(k_to_idx.items())]
+    selected_set = set(selected)
+    for i in range(len(val_episodes)):
+        if len(selected) >= min_plots:
+            break
+        if i not in selected_set:
+            selected.append(i)
+            selected_set.add(i)
+    return selected
+
+
+def _corr_all_instances_fig(
+    R_pred_np: np.ndarray,  # (n_plot, d, d) — pre-computed, already sliced
+    R_ora_np: np.ndarray,   # (n_plot, d, d)
+    label: str = "",
+) -> tuple[plt.Figure, float]:
+    """Grid of oracle vs predicted correlation matrices for all test instances.
+
+    Renders a single composite numpy image (one imshow) instead of N×M subplots
+    for fast matplotlib rendering.
+    Returns (fig, mean_mse).
+    """
+    n_plot, d, _ = R_pred_np.shape
+    half = max(n_plot // 2, 1)
+    n_cols = half
+
+    # Batched MSE over upper triangle (vectorised — no Python loop)
+    ri, ci = np.triu_indices(d, k=1)
+    mse_per = np.mean((R_pred_np[:, ri, ci] - R_ora_np[:, ri, ci]) ** 2, axis=1)
+    mean_mse = float(mse_per.mean())
+
+    # Build single composite image: 4 block-rows × n_cols block-columns
+    #   row 0: oracle   inst 0 .. half-1
+    #   row 1: pred     inst 0 .. half-1
+    #   row 2: oracle   inst half .. n_plot-1
+    #   row 3: pred     inst half .. n_plot-1
+    sep = max(1, d // 16)
+    row_starts = [g * (d + sep) for g in range(4)]
+    H = 4 * d + 3 * sep
+    W = n_cols * d + max(n_cols - 1, 0) * sep
+    composite = np.full((H, W), np.nan)
+
+    # Zero out the diagonal so it doesn't dominate the colour scale
+    diag_idx = np.arange(d)
+    R_pred_plot = R_pred_np.copy()
+    R_ora_plot = R_ora_np.copy()
+    R_pred_plot[:, diag_idx, diag_idx] = np.nan
+    R_ora_plot[:, diag_idx, diag_idx] = np.nan
+
+    for i in range(n_cols):
+        x0 = i * (d + sep)
+        for grp in range(2):
+            inst = i + grp * half
+            if inst >= n_plot:
+                continue
+            composite[row_starts[grp * 2]:row_starts[grp * 2] + d, x0:x0 + d] = R_ora_plot[inst]
+            composite[row_starts[grp * 2 + 1]:row_starts[grp * 2 + 1] + d, x0:x0 + d] = R_pred_plot[inst]
+
+    fig, ax = plt.subplots(figsize=(max(n_cols * 0.9, 3), 4))
+    cmap = plt.get_cmap("RdBu_r").copy()
+    cmap.set_bad(color="lightgrey")
+    im = ax.imshow(composite, cmap=cmap,
+                   interpolation="nearest", aspect="auto")
+
+    for i in range(n_cols):
+        for grp in range(2):
+            inst = i + grp * half
+            if inst >= n_plot:
+                continue
+            y_c = row_starts[grp * 2 + 1] + d // 2
+            x_c = i * (d + sep) + d // 2
+            ax.text(x_c, y_c, f"{mse_per[inst]:.2f}",
+                    ha="center", va="center", fontsize=5, color="k")
+
+    ax.set_yticks([r + d // 2 for r in row_starts])
+    ax.set_yticklabels([
+        f"Oracle 0–{half-1}", f"Pred 0–{half-1}",
+        f"Oracle {half}–{n_plot-1}", f"Pred {half}–{n_plot-1}",
+    ], fontsize=7)
+    ax.set_xticks([])
+    fig.colorbar(im, ax=ax, shrink=0.5, pad=0.02)
+
+    title = f"All {n_plot} instances — mean MSE={mean_mse:.4f}"
+    if label:
+        title = f"{label}  |  {title}"
+    ax.set_title(title, fontsize=9)
+    fig.tight_layout()
+    return fig, mean_mse
+
+
+# ---------------------------------------------------------------------------
 # PIT-episode validation (Z-space — same distribution as training)
 # ---------------------------------------------------------------------------
 
@@ -139,6 +293,8 @@ def run_val_pit(
     do_plot: bool = False,
     amp_dtype: torch.dtype = torch.bfloat16,
     use_amp: bool = False,
+    n_think: int = 0,
+    plot_ep_indices: list[int] | None = None,
 ) -> dict[str, float]:
     """Validate on held-out PIT episodes.  All NLL metrics are in copula-NLL units.
 
@@ -147,7 +303,7 @@ def run_val_pit(
     holds exactly:   joint_y_nll = copula_nll + marginal_nll.
 
     Metrics:
-        val/copula_nll        — model copula NLL on Z_test (full context)
+        val/copula_nll        — model copula NLL on Z_test (70% of train as support)
         val/joint_y_nll       — copula_nll + marginal_nll = full joint NLL in Y-space
         val/train_nll         — model copula NLL on Z_train 70/30 split (overfitting check)
         val/marginal_nll      — always 0.0 (copula NLL of N(0,I); fixed by PIT construction)
@@ -181,6 +337,9 @@ def run_val_pit(
         "val/energy_score": [],
     }
     plot_episodes: list[dict] = []
+    _plot_set: set[int] = set(plot_ep_indices) if plot_ep_indices is not None else set()
+    all_off_pred: list[np.ndarray] = []  # off-diag predicted values, for scatter
+    all_off_ora:  list[np.ndarray] = []  # off-diag oracle values,    for scatter
 
     with torch.no_grad():
         for i_ep, ep in enumerate(val_episodes):
@@ -199,13 +358,57 @@ def run_val_pit(
             B, n_train, _ = Z_tr.shape
             _, n_test, d = Z_te.shape
 
-            # ---- Model: full context → Z_test ----
-            X_all = torch.cat([X_tr, X_te], dim=1)
-            Z_all = torch.cat([Z_tr, torch.zeros_like(Z_te)], dim=1)
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                mu_Z, d_Z, V_Z = model(X_all, Z_all, n_support=n_train)
-            mu_Z, d_Z, V_Z = mu_Z.float(), d_Z.float(), V_Z.float()
+            # ---- Single forward pass: 70% of X_tr as support,
+            #      query the remaining 30% of X_tr (overfitting check) and
+            #      all X_te (test eval) together. This avoids a second model
+            #      call which would overwrite the CUDAGraph output buffer.
+            n_sup = max(1, int(0.7 * n_train))
+            perm_tr = torch.randperm(n_train, device=device)
+            X_sup = X_tr[:, perm_tr[:n_sup], :]
+            Z_sup = Z_tr[:, perm_tr[:n_sup], :]
+            X_tr_qry = X_tr[:, perm_tr[n_sup:], :]
+            Z_tr_qry = Z_tr[:, perm_tr[n_sup:], :]
+            n_tr_qry = X_tr_qry.shape[1]
 
+            if n_think > 0:
+                think_X = torch.zeros(B, n_think, X_sup.shape[-1], device=device, dtype=X_sup.dtype)
+                think_Z = torch.zeros(B, n_think, Z_sup.shape[-1], device=device, dtype=Z_sup.dtype)
+                X_sup = torch.cat([think_X, X_sup], dim=1)
+                Z_sup = torch.cat([think_Z, Z_sup], dim=1)
+                n_sup = n_sup + n_think
+
+            X_fwd = torch.cat([X_sup, X_tr_qry, X_te], dim=1)
+            Z_fwd = torch.cat(
+                [Z_sup, torch.zeros_like(Z_tr_qry), torch.zeros_like(Z_te)], dim=1
+            )
+
+            torch.compiler.cudagraph_mark_step_begin()
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                mu_all, d_all, V_all = model(X_fwd, Z_fwd, n_support=n_sup)
+            mu_all = mu_all.float()
+            d_all = d_all.float()
+            V_all = V_all.float()
+
+            # Split outputs: first n_tr_qry slots → train check; rest → test
+            mu_tr, d_tr, V_tr = (
+                mu_all[:, :n_tr_qry],
+                d_all[:, :n_tr_qry],
+                V_all[:, :n_tr_qry],
+            )
+            mu_Z, d_Z, V_Z = (
+                mu_all[:, n_tr_qry:],
+                d_all[:, n_tr_qry:],
+                V_all[:, n_tr_qry:],
+            )
+
+            # ---- Overfitting check (train copula NLL) ----
+            train_copula_nll = (
+                woodbury_nll(Z_tr_qry, mu_tr, d_tr, V_tr).item()
+                - indep_normal_nll(Z_tr_qry).item()
+            )
+            agg["val/train_nll"].append(train_copula_nll)
+
+            # ---- Test metrics ----
             # I_z = indep_normal_nll(Z_te) is computed once and reused for all
             # Jacobian corrections.  copula_nll = woodbury_nll - I_z for every metric.
             indep_z = indep_normal_nll(Z_te).item()
@@ -231,28 +434,8 @@ def run_val_pit(
                 _energy_score_batched(mu_Z, d_Z, V_Z, Z_te, n_samples=50)
             )
 
-            # ---- Train copula NLL: 70/30 split (overfitting check vs val/copula_nll) ----
-            n_sup = max(1, int(0.7 * n_train))
-            perm_tr = torch.randperm(n_train, device=device)
-            X_tr_perm = X_tr[:, perm_tr, :]
-            Z_tr_perm = Z_tr[:, perm_tr, :]
-            # Mask query Z values to zeros — same convention as test evaluation
-            # (lines 181-182), so the model cannot leak query Z into its predictions.
-            Z_tr_input = Z_tr_perm.clone()
-            Z_tr_input[:, n_sup:, :] = 0.0
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                mu_tr, d_tr, V_tr = model(X_tr_perm, Z_tr_input, n_support=n_sup)
-            mu_tr, d_tr, V_tr = mu_tr.float(), d_tr.float(), V_tr.float()
-            Z_query_tr = Z_tr_perm[:, n_sup:, :]
-            train_copula_nll = (
-                woodbury_nll(Z_query_tr, mu_tr, d_tr, V_tr).item()
-                - indep_normal_nll(Z_query_tr).item()
-            )
-            agg["val/train_nll"].append(train_copula_nll)
-
             # ---- OAS + kNN5 + linear baselines ----
             oas_nlls, knn5_nlls, linear_nlls = [], [], []
-            ep_sigma_oas_list: list[np.ndarray] = []
             for b in range(B):
                 Z_tr_b_np = Z_tr[b].cpu().numpy()
                 Z_tr_b = Z_tr[b]  # (n_train, d)
@@ -280,8 +463,7 @@ def run_val_pit(
                         V_p_exp.unsqueeze(0),
                     ).item()
                 )
-                if do_plot:
-                    ep_sigma_oas_list.append(oas.covariance_.copy())
+                pass  # ep_sigma_oas_list no longer needed (replaced by corr grid)
 
                 # kNN-5: gather all neighbors at once, batch covariance, one NLL call.
                 dists = torch.cdist(X_te_b, X_tr_b)  # (n_test, n_train)
@@ -377,21 +559,35 @@ def run_val_pit(
                 (cnll - oracle_copula_z) / denom if abs(denom) > 1e-8 else float("nan")
             )
 
-            # ---- Collect up to 2 episodes for the comparison plot ----
-            if do_plot and len(plot_episodes) < 2:
-                plot_episodes.append(
-                    {
-                        "key": f"pit_ep{i_ep}",
-                        "mu_pred": mu_Z,
-                        "D_pred": d_Z,
-                        "V_pred": V_Z,
-                        "mu_true": oracle_mu,
-                        "D_true": oracle_D,
-                        "V_true": oracle_V,
-                        "sigma_oas_list": ep_sigma_oas_list,
-                        "n_test": n_test,
-                    }
-                )
+            # ---- Collect data for plots ----
+            if do_plot:
+                # Off-diagonal correlation values for the global scatter
+                Sigma_pp = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-2, -1)
+                std_pp = Sigma_pp.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+                R_pp = Sigma_pp / (std_pp.unsqueeze(-1) * std_pp.unsqueeze(-2))
+                Sigma_oo = torch.diag_embed(oracle_D) + oracle_V @ oracle_V.transpose(-2, -1)
+                std_oo = Sigma_oo.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+                R_oo = Sigma_oo / (std_oo.unsqueeze(-1) * std_oo.unsqueeze(-2))
+                ri_p, ci_p = torch.triu_indices(d, d, offset=1, device=d_Z.device)
+                all_off_pred.append(R_pp[..., ri_p, ci_p].float().cpu().numpy().flatten())
+                all_off_ora.append(R_oo[..., ri_p, ci_p].float().cpu().numpy().flatten())
+
+                # Store pre-selected episodes for the all-instances grid plot.
+                # R_pp / R_oo are already computed above — reuse them directly
+                # so _corr_all_instances_fig doesn't redo Sigma/std/matmul work.
+                if i_ep in _plot_set:
+                    # Infer K from oracle_V of dataset b=0 for the plot label.
+                    v0 = ep["oracle_V"][0].reshape(ep["oracle_V"].shape[1], -1).float().numpy()
+                    k_ep = int(len(np.unique(v0.round(5), axis=0)))
+                    R_ora_b0 = R_oo[0].float().cpu().numpy()
+                    idxs = _select_unique_oracle_indices(R_ora_b0, _MAX_PLOT_INSTANCES)
+                    plot_episodes.append(
+                        {
+                            "key": f"K={k_ep} ep{i_ep}",
+                            "R_pred": R_pp[0, idxs].float().cpu().numpy(),  # (n_p, d, d)
+                            "R_ora": R_ora_b0[idxs],
+                        }
+                    )
 
     metrics = {k: float(np.mean(v)) for k, v in agg.items()}
     metrics["step"] = step
@@ -411,59 +607,68 @@ def run_val_pit(
     )
 
     plot_figs = []
-    if do_plot and plot_episodes and wandb_run is not None:
-        n_inst = min(3, plot_episodes[0]["n_test"])
-        ep0 = plot_episodes[0]
-        B0 = ep0["mu_pred"].shape[0]
-        if len(plot_episodes) == 1 and B0 >= 2:
-            # Single episode: show two different batch elements side-by-side
-            for b_idx in range(2):
-                sigma_oas_b = (
-                    ep0["sigma_oas_list"][b_idx]
-                    if b_idx < len(ep0["sigma_oas_list"])
-                    else None
-                )
-                fig = plot_prediction_comparison(
-                    mu_pred=ep0["mu_pred"],
-                    D_pred=ep0["D_pred"],
-                    V_pred=ep0["V_pred"],
-                    mu_true=ep0["mu_true"],
-                    D_true=ep0["D_true"],
-                    V_true=ep0["V_true"],
-                    batch_idx=b_idx,
-                    n_instances=n_inst,
-                    sigma_oas=sigma_oas_b,
-                    dataset_label=f"{ep0['key']} — batch {b_idx}",
-                )
-                plot_figs.append(fig)
-        else:
-            # Multiple episodes: cycle batch index across episodes for diversity
-            for ep_idx, ep_data in enumerate(plot_episodes):
-                b_idx = ep_idx % ep_data["mu_pred"].shape[0]
-                sigma_oas_b = (
-                    ep_data["sigma_oas_list"][b_idx]
-                    if b_idx < len(ep_data["sigma_oas_list"])
-                    else None
-                )
-                fig = plot_prediction_comparison(
-                    mu_pred=ep_data["mu_pred"],
-                    D_pred=ep_data["D_pred"],
-                    V_pred=ep_data["V_pred"],
-                    mu_true=ep_data["mu_true"],
-                    D_true=ep_data["D_true"],
-                    V_true=ep_data["V_true"],
-                    batch_idx=b_idx,
-                    n_instances=n_inst,
-                    sigma_oas=sigma_oas_b,
-                    dataset_label=f"Dataset: {ep_data['key']} — batch {b_idx}",
-                )
-                plot_figs.append(fig)
+    if do_plot and wandb_run is not None:
+        # — All-instances correlation grids (one plot per pre-selected episode / K value) —
+        for ep in sorted(plot_episodes, key=lambda e: e["key"]):
+            fig, _ = _corr_all_instances_fig(
+                ep["R_pred"],
+                ep["R_ora"],
+                label=ep["key"],
+            )
+            plot_figs.append(fig)
+
+        # — Off-diagonal scatter: predicted vs oracle across all episodes —
+        if all_off_pred and all_off_ora:
+            off_p = np.concatenate(all_off_pred)
+            off_o = np.concatenate(all_off_ora)
+            lo = min(float(off_o.min()), float(off_p.min()))
+            hi = max(float(off_o.max()), float(off_p.max()))
+
+            off_diag_mse = float(np.mean((off_p - off_o) ** 2))
+            metrics["val/off_diag_corr_mse"] = off_diag_mse
+
+            # — 2D histogram (density) of off-diagonal correlations —
+            fig_den, ax_den = plt.subplots(figsize=(5, 5))
+            hb = ax_den.hexbin(off_o, off_p, gridsize=60, cmap="YlOrRd", mincnt=1, bins="log")
+            fig_den.colorbar(hb, ax=ax_den, label="log10(count)")
+            ax_den.plot([lo, hi], [lo, hi], "b--", lw=1)
+            ax_den.set_xlabel("Oracle off-diag corr")
+            ax_den.set_ylabel("Predicted off-diag corr")
+            ax_den.set_title(
+                f"step {step} — density ({len(off_p):,} values)\n"
+                f"off-diag corr MSE = {off_diag_mse:.5f}"
+            )
+            fig_den.tight_layout()
+            plot_figs.append(fig_den)
 
     if wandb_run is not None:
         if plot_figs:
+            import io
             import wandb as _wandb
+            from PIL import Image as PILImage
 
-            metrics["val/plot"] = [_wandb.Image(f) for f in plot_figs]
+            def _fig_to_pil(fig, dpi=100):
+                buf = io.BytesIO()
+                fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+                buf.seek(0)
+                return PILImage.open(buf).copy()
+
+            TARGET_W = 1200
+            pil_imgs = [_fig_to_pil(f) for f in plot_figs]
+            resized = [
+                im.resize(
+                    (TARGET_W, max(1, int(im.height * TARGET_W / im.width))),
+                    PILImage.LANCZOS,
+                )
+                for im in pil_imgs
+            ]
+            target_h = max(im.height for im in resized)
+            padded = []
+            for im in resized:
+                canvas = PILImage.new("RGB", (TARGET_W, target_h), (255, 255, 255))
+                canvas.paste(im, (0, 0))
+                padded.append(canvas)
+            metrics["val/plot"] = [_wandb.Image(im) for im in padded]
         wandb_run.log(metrics, step=step)
         for f in plot_figs:
             plt.close(f)
@@ -493,7 +698,7 @@ def _save_checkpoint(
     step: int,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: CosineAnnealingLR,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     cfg: DictConfig,
 ) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -535,6 +740,10 @@ def main(cfg: DictConfig) -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     if use_amp:
         torch.backends.cudnn.benchmark = True
+        # benchmark=True speeds up fixed-shape workloads but allows cuDNN to pick
+        # different algorithms across runs.  Set deterministic=True to override at
+        # the cost of ~10% throughput when strict reproducibility is required.
+        torch.backends.cudnn.deterministic = False
         print(f"AMP enabled  dtype={amp_dtype}  cudnn.benchmark=True")
 
     # ---- Validate required config ----
@@ -546,21 +755,42 @@ def main(cfg: DictConfig) -> None:
         )
 
     # ---- Model ----
-    model: nn.Module = build_copula_tabicl_v2(cfg).to(device)
+    _model_name = getattr(cfg.model, "name", "copula_tabicl_v2")
+    if _model_name == "copula_tabicl_v2":
+        model: nn.Module = build_copula_tabicl_v2(cfg).to(device)
+    elif _model_name == "tabicl-archi":
+        model: nn.Module = build_copula_tabicl(cfg).to(device)
+    else:
+        raise ValueError(
+            f"Unknown model.name={_model_name!r}. "
+            "Use 'copula_tabicl_v2' or 'tabicl-archi'."
+        )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters : {n_params:,}")
 
     # ---- Optimizer & scheduler ----
-    optimizer = AdamW(
-        model.parameters(),
+    _muon_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
+    _adam_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
+    optimizer = Muon(
+        [{"params": _muon_params, "use_muon": True},
+         {"params": _adam_params, "use_muon": False}],
         lr=float(cfg.training.lr),
         weight_decay=float(cfg.training.weight_decay),
     )
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=int(cfg.training.steps),
-        eta_min=float(cfg.training.lr_min),
+    warmup_steps = int(cfg.training.get("warmup_steps", 0))
+    cosine_steps = max(int(cfg.training.steps) - warmup_steps, 1)
+    _cosine = CosineAnnealingLR(
+        optimizer, T_max=cosine_steps, eta_min=float(cfg.training.lr_min)
     )
+    if warmup_steps > 0:
+        _warmup = LinearLR(
+            optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
+        )
+        scheduler = SequentialLR(
+            optimizer, schedulers=[_warmup, _cosine], milestones=[warmup_steps]
+        )
+    else:
+        scheduler = _cosine
 
     # ---- W&B (optional) ----
     wandb_run = None
@@ -570,21 +800,33 @@ def main(cfg: DictConfig) -> None:
         _data_tag = Path(cfg.training.dataset_dir).name
         _lr = cfg.training.lr
         _lr_str = f"{_lr:.0e}".replace("e-0", "e-").replace("e+0", "e")
-        _n_layers = getattr(
-            cfg.model,
-            "n_layers",
-            f"s1={getattr(cfg.model, 'n_layers_s1', '?')}"
-            f"s2={getattr(cfg.model, 'n_layers_s2', '?')}"
-            f"s3={getattr(cfg.model, 'n_layers_s3', '?')}",
-        )
+        # n_layers / d_hidden / rank key names differ across model configs
+        if _model_name == "tabicl-archi":
+            _n_layers = (
+                f"c{getattr(cfg.model, 'col_num_blocks', '?')}/"
+                f"r{getattr(cfg.model, 'row_num_blocks', '?')}/"
+                f"i{getattr(cfg.model, 'icl_num_blocks', '?')}"
+            )
+            _d_hidden = getattr(cfg.model, "embed_dim", "?")
+            _rank = getattr(cfg.model, "k", "?")
+        else:
+            _n_layers = getattr(cfg.model, "n_layers",
+                                f"{getattr(cfg.model, 'n_layers_s1', '?')}/"
+                                f"{getattr(cfg.model, 'n_layers_s2', '?')}/"
+                                f"{getattr(cfg.model, 'n_layers_s3', '?')}")
+            _d_hidden = getattr(cfg.model, "d_hidden", getattr(cfg.model, "d_model", "?"))
+            _rank = getattr(cfg.model, "rank", "?")
         _aux_w = float(cfg.training.get("aux_mse_weight", 0.0))
+        _nll_w = float(cfg.training.get("nll_weight", 1.0))
         _run_name = (
-            f"lr={_lr_str}"
+            f"{_model_name}"
+            f"_lr={_lr_str}"
             f"_steps={cfg.training.steps}"
-            f"_d={cfg.model.d_model}"
+            f"_dh={_d_hidden}"
             f"_L={_n_layers}"
-            f"_H={cfg.model.n_heads}"
-            f"_r={cfg.model.rank}"
+            f"_H={getattr(cfg.model, 'n_heads', getattr(cfg.model, 'col_nhead', '?'))}"
+            f"_r={_rank}"
+            f"_nllw={_nll_w}"
             f"_auxw={_aux_w}"
             f"_data={_data_tag}"
         )
@@ -607,7 +849,11 @@ def main(cfg: DictConfig) -> None:
             raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
         print(f"Resuming from checkpoint: {resume_from}")
         ckpt = torch.load(resume_from, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state"])
+        missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+        if missing:
+            print(f"  New parameters (default init): {missing}")
+        if unexpected:
+            print(f"  Unexpected keys ignored: {unexpected}")
         optimizer.load_state_dict(ckpt["optimizer_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
         start_step = int(ckpt["step"]) + 1
@@ -616,10 +862,14 @@ def main(cfg: DictConfig) -> None:
         print("No resume_from specified, training from scratch.")
 
     # ---- torch.compile (optional, ~60 s one-time compilation cost) ----
+    # Use dynamic=True so the same compiled graph handles both training (N=512) and
+    # validation (varying n_support).  mode="reduce-overhead" avoids the CUDA graph
+    # issues that plagued mode="default" with bfloat16 Woodbury NLL (the loss is
+    # computed outside the compiled graph so that path is unaffected).
     if cfg.training.get("compile", False) and device == "cuda":
-        model = torch.compile(model, mode="reduce-overhead", dynamic=False)
+        model = torch.compile(model, mode="default", dynamic=True)
         print(
-            "torch.compile enabled (mode=reduce-overhead) — first forward will trigger JIT compilation."
+            "torch.compile enabled (mode=default, dynamic=True) — first forward will trigger JIT compilation."
         )
 
     # ---- Data loader (training episodes only — val episodes held out) ----
@@ -633,13 +883,15 @@ def main(cfg: DictConfig) -> None:
         files=train_files,
         shuffle=True,
         num_workers=int(cfg.dataset.num_workers),
+        seed=int(cfg.seed),
     )
     episode_iter = infinite_episode_iter(loader)
 
     # ---- Validation episodes (pre-loaded, held-out PIT episodes) ----
     print(f"Loading {len(val_files)} validation episodes …")
     val_episodes = [torch.load(f, weights_only=True) for f in val_files]
-    print("Validation episodes loaded.")
+    plot_ep_indices = _pick_diverse_plot_episodes(val_episodes)
+    print(f"Validation episodes loaded. Plot episodes (≥3, one per K): indices {plot_ep_indices}")
 
     # ---- Training loop ----
     model.train()
@@ -647,32 +899,73 @@ def main(cfg: DictConfig) -> None:
     accum_steps = int(cfg.training.get("gradient_accumulation_steps", 1))
     optimizer.zero_grad()
 
+    # Cache triu indices once — d is fixed across all episodes
+    _d_fixed = int(cfg.model.get("d_max", cfg.data.d_range[-1]))
+    _ri_fixed, _ci_fixed = torch.triu_indices(_d_fixed, _d_fixed, offset=1, device=device)
+
     for step in range(start_step, int(cfg.training.steps)):
         episode = next(episode_iter)
 
-        X_train = episode["X_train"].to(device)  # (B, N, p)
-        Z_train = episode["Z_train"].to(device)  # (B, N, d)
-        X_test_ep = episode["X_test"].to(device)  # (B, n_test, p)
-        Z_test_ep = episode["Z_test"].to(device)  # (B, n_test, d)
-        oracle_D_ep = episode["oracle_D"].to(device)  # (B, n_test, d)
-        oracle_V_ep = episode["oracle_V"].to(device)  # (B, n_test, d, r)
+        X_train = episode["X_train"].to(device, non_blocking=True)  # (B, N, p)
+        Z_train = episode["Z_train"].to(device, non_blocking=True)  # (B, N, d)
+        X_test_ep = episode["X_test"].to(device, non_blocking=True)  # (B, n_test, p)
+        Z_test_ep = episode["Z_test"].to(device, non_blocking=True)  # (B, n_test, d)
+        oracle_D_ep = episode["oracle_D"].to(device, non_blocking=True)  # (B, n_test, d)
+        oracle_V_ep = episode["oracle_V"].to(device, non_blocking=True)  # (B, n_test, d, r)
+
+        if cfg.training.get("use_oracle_z", False):
+            oracle_mu_ep = episode["oracle_mu"].to(device, non_blocking=True)
+            Y_test_ep = episode["Y_test"].to(device, non_blocking=True)
+            sigma_ora = (oracle_D_ep + oracle_V_ep.pow(2).sum(-1)).sqrt()
+            Z_test_ep = (Y_test_ep - oracle_mu_ep) / sigma_ora
+
+            if "oracle_mu_train" in episode:
+                oracle_mu_tr = episode["oracle_mu_train"].to(device, non_blocking=True)
+                oracle_D_tr = episode["oracle_D_train"].to(device, non_blocking=True)
+                oracle_V_tr = episode["oracle_V_train"].to(device, non_blocking=True)
+                Y_train_ep = episode["Y_train"].to(device, non_blocking=True)
+                sigma_ora_tr = (oracle_D_tr + oracle_V_tr.pow(2).sum(-1)).sqrt()
+                Z_train = (Y_train_ep - oracle_mu_tr) / sigma_ora_tr
 
         B, N, d = Z_train.shape
+
+        n_think = int(cfg.training.get("n_think", 0))
+        if n_think > 0:
+            think_X = torch.zeros(B, n_think, X_train.shape[-1], device=device, dtype=X_train.dtype)
+            think_Z = torch.zeros(B, n_think, Z_train.shape[-1], device=device, dtype=Z_train.dtype)
+            X_train = torch.cat([think_X, X_train], dim=1)
+            Z_train = torch.cat([think_Z, Z_train], dim=1)
+            N += n_think
 
         # ---- Single forward: full X_train as support, X_test as queries ----
         X_fwd = torch.cat([X_train, X_test_ep], dim=1)  # (B, N+n_test, p)
         Z_fwd = torch.cat([Z_train, Z_test_ep], dim=1)  # (B, N+n_test, d)
 
+        torch.compiler.cudagraph_mark_step_begin()
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
             mu_Z, d_Z, V_Z = model(X_fwd, Z_fwd, n_support=N)
+
+            mu_Z, d_Z, V_Z = mu_Z.clone(), d_Z.clone(), V_Z.clone()
             # mu_Z: (B, n_test, d)
             # d_Z:  (B, n_test, d)
             # V_Z:  (B, n_test, d, r)
 
             # ---- Loss: Woodbury NLL on test queries ----
             Z_query = Z_test_ep  # (B, n_test, d)
-            loss_nll = woodbury_nll(Z_query, mu_Z, d_Z, V_Z)
-            loss = loss_nll
+            nll_weight = float(cfg.training.get("nll_weight", 1.0))
+            # Guard: only run woodbury_nll when it contributes to the loss.
+            # With bfloat16 the Cholesky can produce NaN; 0.0 * NaN = NaN which
+            # would corrupt the MSE auxiliary loss even when nll_weight=0.
+            if nll_weight > 0.0:
+                # Cast to float32: D can collapse to ~1e-7 in bfloat16, making M
+                # ill-conditioned (elements ~1e13) and causing Cholesky to fail.
+                loss_nll = woodbury_nll(
+                    Z_query.float(), mu_Z.float(), d_Z.float(), V_Z.float()
+                )
+                loss = nll_weight * loss_nll
+            else:
+                loss_nll = torch.zeros(1, device=device)
+                loss = torch.zeros(1, device=device)
 
             # ---- Auxiliary off-diagonal MSE loss ----
             aux_weight = float(cfg.training.get("aux_mse_weight", 0.0))
@@ -680,22 +973,27 @@ def main(cfg: DictConfig) -> None:
             progress = min(1.0, step / max(1, anneal_frac * int(cfg.training.steps)))
             alpha = aux_weight * (1.0 - progress)
 
+            # Oracle correlation matrix from ground-truth low-rank factors
+            Sigma_ora = torch.diag_embed(
+                oracle_D_ep
+            ) + oracle_V_ep @ oracle_V_ep.transpose(-1, -2)  # (B, n_test, d, d)
+            std_ora = Sigma_ora.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
+            R_ora = Sigma_ora / (std_ora.unsqueeze(-1) * std_ora.unsqueeze(-2))
+
+            # Predicted correlation matrix (diag=1 by Woodbury construction)
+            Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-1, -2)
+
+            loss_mse = F.mse_loss(Sigma_pred[..., _ri_fixed, _ci_fixed], R_ora[..., _ri_fixed, _ci_fixed])
             if alpha > 0.0:
-                # Oracle correlation matrix from ground-truth low-rank factors
-                Sigma_ora = torch.diag_embed(
-                    oracle_D_ep
-                ) + oracle_V_ep @ oracle_V_ep.transpose(-1, -2)  # (B, n_test, d, d)
-                std_ora = Sigma_ora.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8).sqrt()
-                R_ora = Sigma_ora / (std_ora.unsqueeze(-1) * std_ora.unsqueeze(-2))
-
-                # Predicted correlation matrix (diag=1 by Woodbury construction)
-                Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-1, -2)
-
-                ri, ci = torch.triu_indices(d, d, offset=1, device=device)
-                loss_mse = F.mse_loss(Sigma_pred[..., ri, ci], R_ora[..., ri, ci])
                 loss = loss + alpha * loss_mse
-            else:
-                loss_mse = torch.zeros(1, device=device)
+
+            # U-norm regularizer: (1/D - 1) == ||U||² per dim.
+            # Gradient w.r.t. U_jk = 2*U_jk (grows with ‖U‖), counteracting
+            # the Muon optimizer's tendency to blow up U when all other gradients vanish.
+            u_reg_weight = float(cfg.training.get("u_reg_weight", 0.0))
+            if u_reg_weight > 0.0:
+                loss_u_reg = (1.0 / d_Z.clamp(min=1e-8) - 1.0).mean()
+                loss = loss + u_reg_weight * loss_u_reg
 
         # ---- Backward ----
         scaler.scale(loss / accum_steps).backward()
@@ -712,7 +1010,14 @@ def main(cfg: DictConfig) -> None:
         # ---- Logging ----
         if step % int(cfg.training.log_every) == 0:
             with torch.no_grad():
-                wnll = loss_nll.item()
+                # loss_nll is zeroed out when nll_weight==0 to avoid bfloat16 NaN
+                # corrupting the backward pass; recompute here for accurate logging.
+                if nll_weight > 0.0:
+                    wnll = loss_nll.item()
+                else:
+                    wnll = woodbury_nll(
+                        Z_query.float(), mu_Z.float(), d_Z.float(), V_Z.float()
+                    ).item()
                 indep_z_train = indep_normal_nll(Z_query).item()
                 cnll_train = wnll - indep_z_train  # copula NLL
                 copula_gain = (
@@ -726,39 +1031,43 @@ def main(cfg: DictConfig) -> None:
                 ).item()
 
                 Sigma_pred = torch.diag_embed(d_Z) + V_Z @ V_Z.transpose(-1, -2)
-                d_dim = Sigma_pred.shape[-1]
-                ri, ci = torch.triu_indices(d_dim, d_dim, offset=1, device=device)
-                off_diag_pred = Sigma_pred[..., ri, ci]
+                off_diag_pred = Sigma_pred[..., _ri_fixed, _ci_fixed]
                 pred_off_diag_var = off_diag_pred.var(dim=1).mean().item()
 
                 Sigma_oracle = torch.diag_embed(
                     oracle_D_ep
                 ) + oracle_V_ep @ oracle_V_ep.transpose(-1, -2)
-                off_diag_oracle = Sigma_oracle[..., ri, ci]
+                off_diag_oracle = Sigma_oracle[..., _ri_fixed, _ci_fixed]
                 oracle_off_diag_var = off_diag_oracle.var(dim=1).mean().item()
 
             lr_now = scheduler.get_last_lr()[0]
             elapsed = time.perf_counter() - t0
 
             loss_mse_val = loss_mse.item()
+            div = pred_off_diag_var / max(oracle_off_diag_var, 1e-8)
             print(
-                f"[step {step:>6d}]  copula_nll={cnll_train:.4f}  "
-                f"copula_gain={copula_gain:.4f}  oracle_y={oracle_nll_y:.4f}  "
-                f"pred_var={pred_off_diag_var:.4e}  oracle_var={oracle_off_diag_var:.4e}  "
-                f"aux_mse={loss_mse_val:.4e}  alpha={alpha:.3f}  "
-                f"lr={lr_now:.2e}  elapsed={elapsed:.1f}s"
+                f"[step {step:>6d}]  "
+                f"mse={loss_mse_val:.5f}  "
+                f"div={div:.4f}  "
+                f"copula={cnll_train:.4f}  "
+                f"gain={copula_gain:.4f}  "
+                f"alpha={alpha:.3f}  "
+                f"lr={lr_now:.2e}  "
+                f"elapsed={elapsed:.1f}s"
             )
 
             if wandb_run is not None:
                 wandb_run.log(
                     {
+                        "train/mse": loss_mse_val,
+                        "train/div": div,
                         "train/copula_nll": cnll_train,
                         "train/copula_gain": copula_gain,
                         "train/oracle_nll_y": oracle_nll_y,
                         "train/pred_off_diag_var": pred_off_diag_var,
                         "train/oracle_off_diag_var": oracle_off_diag_var,
-                        "train/aux_mse": loss_mse_val,
                         "train/alpha": alpha,
+                        "train/nll_weight": nll_weight,
                         "train/lr": lr_now,
                         "step": step,
                     },
@@ -778,7 +1087,10 @@ def main(cfg: DictConfig) -> None:
                 do_plot=do_plot,
                 amp_dtype=amp_dtype,
                 use_amp=use_amp,
+                n_think=int(cfg.training.get("n_think", 0)),
+                plot_ep_indices=plot_ep_indices,
             )
+            model.train()
 
         # ---- Checkpoint ----
         if (
@@ -807,6 +1119,8 @@ def main(cfg: DictConfig) -> None:
         device,
         amp_dtype=amp_dtype,
         use_amp=use_amp,
+        n_think=int(cfg.training.get("n_think", 0)),
+        plot_ep_indices=plot_ep_indices,
     )
 
     if wandb_run is not None:
