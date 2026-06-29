@@ -367,7 +367,7 @@ def run_pit_batched(
             _sync(device)
             fold_times.append(time.perf_counter() - _tf0)
 
-            dist_fold = tabicl.quantile_dist(logits_fold.reshape(-1, Q))
+            dist_fold = tabicl.quantile_dist(logits_fold.reshape(-1, Q).to(device))
 
             y_qry = Y_train[:, fold_idx, :].permute(0, 2, 1).reshape(-1).to(device)
             if dequantize:
@@ -405,7 +405,7 @@ def run_pit_batched(
             _sync(device)
             fold_times.append(time.perf_counter() - _tf0)
 
-            dist_loo = tabicl.quantile_dist(logits_loo[:, 0, :])
+            dist_loo = tabicl.quantile_dist(logits_loo[:, 0, :].to(device))
             y_chunk = Y_train[:, chunk_start:chunk_end, :].reshape(B * chunk * d).to(device)
             if dequantize:
                 y_chunk = y_chunk + torch.rand_like(y_chunk)
